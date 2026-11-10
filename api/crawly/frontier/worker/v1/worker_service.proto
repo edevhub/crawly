@@ -1,0 +1,52 @@
+// Crawly Frontier API: worker protocol.
+//
+// Stateless spiders hold a Work stream to a frontier replica, receive assignments, extend
+// leases, add discovered tasks and report outcomes.
+
+syntax = "proto3";
+
+package crawly.frontier.worker.v1;
+
+import "crawly/frontier/worker/v1/worker.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/worker/v1;workerv1";
+
+service WorkerService {
+  // Long-lived work session. A session serves exactly one pool (Hello.pool); a worker
+  // process serving several pools opens one session per pool.
+  //
+  // The frontier handles a session's inbound messages in stream order: a DiscoverBatch
+  // is committed before any later message of the session (e.g. the parent's Complete)
+  // is handled, so a worker need not wait for DiscoverAck before completing the parent.
+  // After a reconnect, resend unacknowledged DiscoverBatches before their parent's Complete.
+  //
+  // Leases are NOT bound to the session: they live in frontier storage, so after a
+  // reconnect (to any frontier replica) the worker can still extend or complete them.
+  // A dropped session does not release leases immediately; they expire normally.
+  rpc Work(stream WorkRequest) returns (stream WorkResponse);
+}
+
+// Worker to frontier.
+message WorkRequest {
+  oneof msg {
+    Hello hello = 1;            // must be the first message of a session
+    Credit credit = 2;          // grant N more assignment slots
+    ExtendLease extend = 3;
+    DiscoverBatch discover = 4; // discovered tasks, attributed to an active lease
+    Complete complete = 5;      // terminal report for a lease
+    Goodbye goodbye = 6;        // worker is draining: stop sending assignments
+  }
+}
+
+// Frontier to worker.
+message WorkResponse {
+  oneof msg {
+    Welcome welcome = 1;
+    Assignment assignment = 2;
+    LeaseExtended extended = 3;
+    LeaseRevoked revoked = 4;
+    DiscoverAck discover_ack = 5;
+    CompleteAck complete_ack = 6;
+    Drain drain = 7;            // this replica is going away: reconnect elsewhere
+  }
+}

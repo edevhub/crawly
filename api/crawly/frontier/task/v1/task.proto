@@ -1,0 +1,134 @@
+// Crawly Frontier API: shared task types.
+//
+// The Frontier API is split into versioned packages, one per role:
+//   crawly.frontier.worker.v1  - WorkerService: spiders lease tasks, report outcomes, add discovered tasks.
+//   crawly.frontier.run.v1     - RunService: schedulers create, seed, seal, pause and cancel runs; observe them.
+//   crawly.frontier.policy.v1  - PolicyService: read-only view of the global policies and how they resolve.
+//   crawly.frontier.queue.v1   - QueueService: operators inspect and control queues.
+//   crawly.frontier.task.v1    - this package: task types shared by the worker and run APIs. No service.
+//
+// Core model:
+//   Queue  - identified by an opaque, GLOBAL key (usually a host). Owns the limiter. Shared by all runs.
+//   Run    - a bounded unit of work with its own budget, stats and policy overrides. Dedup is per run
+//            and queue. A run is a dimension on tasks, never a namespace for queues.
+//   Task   - one request to fetch, belonging to exactly one run and one queue.
+//   Lease  - one dispatch of a task to a worker (an attempt), fenced by lease id and attempt.
+
+syntax = "proto3";
+
+package crawly.frontier.task.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/task/v1;taskv1";
+
+// What happened, as classified by the spider. The spider decides retry vs. permanent
+// failure and may ask for delays; the frontier enforces max_attempts and backoff.
+message Outcome {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_SUCCESS = 1;
+    // Transient failure (timeout, 5xx, reset, 429). Retried until Behaviour.max_attempts.
+    KIND_RETRY = 2;
+    // Permanent failure (404/410, unparseable). Never retried.
+    KIND_FAILED = 3;
+  }
+  Kind kind = 1;
+  // Machine-readable code for stats and alerting, e.g. "http_404", "http_429", "captcha".
+  // Reserved codes: "no_handler" (FAILED: the worker lacks the task's handler),
+  // "panic" (RETRY: the handler crashed), "redirect" (SUCCESS: a redirect to another
+  // host was added as a task instead of followed), "lease_expired" (set by the frontier).
+  string code = 2;
+  string message = 3;
+  // RETRY only: do not retry this task before now + retry_after. Unset: policy backoff.
+  google.protobuf.Duration retry_after = 4;
+  // Any kind: block the task's whole queue (all runs) for this long, e.g. from a
+  // Retry-After header on a 429. Extends, never shortens, an existing block.
+  // Capped at 24 hours per outcome.
+  google.protobuf.Duration block_queue_for = 5;
+}
+
+message FetchInfo {
+  uint32 http_status = 1;
+  string final_url = 2;
+  google.protobuf.Duration latency = 3;
+  uint64 bytes = 4;
+  // Where the raw response was stored (object storage), for lineage and replay.
+  string response_ref = 5;
+  // Content hash, for change detection across runs.
+  string content_hash = 6;
+  // Number of items the spider emitted downstream; yield is a key health signal.
+  uint32 items_emitted = 7;
+}
+
+// What clients submit (scheduler seeds, worker discoveries).
+message TaskSpec {
+  Request request = 1;
+  // Queue the task belongs to. Empty: derived from the run's KeyRule.
+  string queue_key = 2;
+  // Dedup key. Empty: the default normalisation of request.url: scheme + host + path +
+  // query parameters sorted alphanumerically ascending, all lowercased (fragment, method,
+  // headers and body are ignored). Set it whenever a site needs special rules, e.g.
+  // case-sensitive paths, tracking parameters, or requests told apart by method or body.
+  // Dedup is scoped to the run and the queue key (the fingerprint includes the queue key).
+  // With HOST or REGISTERED_DOMAIN key rules that is the same as per run.
+  string dedup_key = 3;
+  // Spider callback that should process the response.
+  string handler = 4;
+  int32 priority = 5;
+  google.protobuf.Timestamp not_before_time = 6;
+  // Field 7 (requires) removed: tasks are routed by pool.
+  reserved 7;
+  // Opaque spider data, returned with the task (cookies, session paths, parse hints...).
+  map<string, bytes> context = 8;
+  // Field 9 reserved for per-task policy overrides once there is a use case.
+  reserved 9;
+  // Worker pool that executes the task. Empty: "default". Must match [a-z0-9_]{1,32},
+  // otherwise the task is INVALID.
+  string pool = 10;
+}
+
+// What workers receive.
+message Task {
+  string task_id = 1;
+  string run_id = 2;
+  reserved 3;
+  string queue_key = 4;
+  string fingerprint = 5;
+  Request request = 6;
+  string handler = 7;
+  // Run-scoped lineage: seeds are 0, discovered tasks are parent.depth + 1.
+  uint32 depth = 8;
+  string parent_task_id = 9;
+  map<string, bytes> context = 10;
+  // Resolved fetch timeout the worker must honour.
+  google.protobuf.Duration fetch_timeout = 11;
+  string pool = 12;
+}
+
+message Request {
+  string url = 1;
+  string method = 2;               // default GET
+  repeated Header headers = 3;     // repeated, to allow duplicate header names
+  bytes body = 4;                  // keep small; reference large payloads via context
+}
+
+message Header {
+  string name = 1;
+  string value = 2;
+}
+
+message AddResult {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_ADDED = 1;
+    STATUS_DUPLICATE = 2;      // fingerprint already known in this run and queue
+    reserved 3;
+    STATUS_OVER_BUDGET = 4;    // run budget exhausted: max_depth (exact) or max_tasks (soft)
+    STATUS_RUN_CLOSED = 5;     // run is sealed against seeds, completed or cancelled
+    STATUS_INVALID = 6;
+  }
+  Status status = 1;
+  string task_id = 2;
+}

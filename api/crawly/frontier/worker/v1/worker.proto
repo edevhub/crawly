@@ -1,0 +1,127 @@
+// Crawly Frontier API: messages of the worker protocol. The Work stream and its envelope
+// messages are in worker_service.proto.
+
+syntax = "proto3";
+
+package crawly.frontier.worker.v1;
+
+import "crawly/frontier/task/v1/task.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/worker/v1;workerv1";
+
+message Hello {
+  // Stable id of the worker process. Recorded on every attempt.
+  string worker_id = 1;
+  // Spider build version. Informational; recorded on every attempt for lineage.
+  string build_version = 2;
+  // Fields 3 (labels) and 4 (handlers) removed: routing is by pool name only.
+  reserved 3, 4;
+  // Required. The pool this session serves, e.g. "default" or "browser". A task whose
+  // handler the worker lacks is reported FAILED with code "no_handler".
+  // Pool names match [a-z0-9_]{1,32}.
+  string pool = 5;
+}
+
+message Welcome {
+  string session_id = 1;
+  // Frontier clock; workers never compute scheduling times from their own clock.
+  google.protobuf.Timestamp server_time = 2;
+}
+
+// One credit is one execution slot. Credits are additive; the frontier never holds more
+// unfinished assignments on a session than the credits granted.
+message Credit {
+  uint32 slots = 1;
+}
+
+message Goodbye {}
+
+message Drain {
+  google.protobuf.Timestamp reconnect_time = 1;
+}
+
+message Assignment {
+  Lease lease = 1;
+  crawly.frontier.task.v1.Task task = 2;
+}
+
+message Lease {
+  // Opaque; unique per dispatch and never reused, even if a dispatch is lost and the
+  // same attempt number is handed out again.
+  string lease_id = 1;
+  // Fencing token. Increments on every dispatch of the same task. Reports carrying a
+  // stale attempt are rejected, so a slow worker cannot overwrite a newer attempt.
+  uint32 attempt = 2;
+  google.protobuf.Timestamp expire_time = 3;
+  // Length of the lease from dispatch. The worker extends at half of it, measured on its
+  // own monotonic clock; it never compares expire_time with its wall clock.
+  google.protobuf.Duration duration = 4;
+}
+
+message ExtendLease {
+  string lease_id = 1;
+  uint32 attempt = 2;
+  // Requested extension from now; capped by Behaviour.max_lease_duration.
+  google.protobuf.Duration extend_by = 3;
+}
+
+message LeaseExtended {
+  string lease_id = 1;
+  google.protobuf.Timestamp expire_time = 2;
+}
+
+message LeaseRevoked {
+  string lease_id = 1;
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_EXPIRED = 1;            // extension came too late
+    REASON_FENCED = 2;             // a newer attempt exists
+    REASON_RUN_CANCELLED = 3;
+    REASON_MAX_DURATION = 4;       // Behaviour.max_lease_duration reached
+  }
+  Reason reason = 2;
+}
+
+message DiscoverBatch {
+  // Parent lease. Rejected if the lease is not active, so stale workers cannot add work.
+  // Tasks are added to the parent's run. Accepted batches are durable before the ack,
+  // and survive a later failure of the parent attempt (dedup absorbs re-adds on retry).
+  string lease_id = 1;
+  uint32 attempt = 2;
+  // Client id echoed in the ack.
+  string batch_id = 3;
+  repeated crawly.frontier.task.v1.TaskSpec tasks = 4;
+}
+
+message DiscoverAck {
+  string batch_id = 1;
+  // One result per task, same order as the batch. Empty unless status is ACCEPTED.
+  repeated crawly.frontier.task.v1.AddResult results = 2;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_ACCEPTED = 1;
+    STATUS_STALE = 2;    // the parent lease is fenced or expired; nothing was added
+    STATUS_UNKNOWN = 3;  // no such lease
+  }
+  Status status = 3;
+}
+
+message Complete {
+  string lease_id = 1;
+  uint32 attempt = 2;
+  crawly.frontier.task.v1.Outcome outcome = 3;
+  crawly.frontier.task.v1.FetchInfo fetch = 4;
+}
+
+message CompleteAck {
+  string lease_id = 1;
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_ACCEPTED = 1;
+    STATUS_STALE = 2;    // fenced or expired; the result is ignored by the frontier
+    STATUS_UNKNOWN = 3;  // no such lease
+  }
+  Status status = 2;
+}

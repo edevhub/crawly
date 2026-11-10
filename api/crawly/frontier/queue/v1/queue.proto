@@ -1,0 +1,40 @@
+// Crawly Frontier API: queues (operator API).
+//
+// A queue's limiter state is shared by every run with work on it.
+
+syntax = "proto3";
+
+package crawly.frontier.queue.v1;
+
+import "crawly/frontier/policy/v1/policy.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/queue/v1;queuev1";
+
+message Queue {
+  string key = 1;
+  crawly.frontier.policy.v1.QueueLimits effective_limits = 2;
+  LimiterState limiter = 3;
+  repeated RunBacklog backlogs = 4;
+}
+
+message LimiterState {
+  // Field 1 (current_rate_per_second) removed: politeness keeps a GCRA timestamp, not a rate.
+  reserved 1;
+  uint32 in_flight = 2;
+  // Next admission under the queue's shared limits.
+  google.protobuf.Timestamp next_eligible_time = 3;
+  // Tasks the queue's shared limits would admit now (burst headroom and concurrency).
+  uint32 admissible_now = 6;
+  google.protobuf.Timestamp unblock_time = 4;
+  string block_reason = 5;
+}
+
+message RunBacklog {
+  string run_id = 1;
+  string pool = 6;
+  uint64 pending = 2;
+  uint64 delayed = 3;
+  uint32 in_flight = 4;
+  uint32 weight = 5;
+}

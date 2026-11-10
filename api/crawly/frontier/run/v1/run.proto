@@ -1,0 +1,127 @@
+// Crawly Frontier API: runs (scheduler API).
+//
+// Run termination: a run COMPLETES when it is sealed AND it has no pending, delayed or
+// in-flight tasks.
+
+syntax = "proto3";
+
+package crawly.frontier.run.v1;
+
+import "crawly/frontier/policy/v1/policy.proto";
+import "crawly/frontier/task/v1/task.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/run/v1;runv1";
+
+message Run {
+  string run_id = 1;
+  reserved 2, 8, 10;
+  map<string, string> labels = 3;
+
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_OPEN = 1;        // accepting seeds and dispatching
+    STATE_SEALED = 2;      // no more seeds; dispatching until drained
+    STATE_COMPLETED = 3;   // sealed and drained
+    STATE_CANCELLED = 4;
+    STATE_EXPIRED = 5;     // deadline reached; remaining tasks were dropped
+  }
+  State state = 4;
+  bool paused = 5;
+
+  crawly.frontier.policy.v1.RunPolicy policy = 6;
+  RunLimits limits = 7;
+  KeyRule key_rule = 9;
+  // Field 11 (policy_version) removed: policies are static; attempts record the policy set.
+  reserved 11;
+
+  RunStats stats = 12;
+
+  google.protobuf.Timestamp create_time = 13;
+  google.protobuf.Timestamp seal_time = 14;
+  google.protobuf.Timestamp finish_time = 15;
+}
+
+message RunStats {
+  // pending: tasks of backlogs whose next eligible time has passed; delayed: the rest of the
+  // undispatched tasks. Approximate: eligibility is per (queue, run, pool) backlog and
+  // includes politeness and queue blocks as well as not_before_time and backoff.
+  uint64 pending = 1;
+  uint64 delayed = 2;
+  uint64 in_flight = 3;
+  uint64 succeeded = 4;
+  uint64 failed = 5;
+  uint64 expired = 6;     // dropped by TTL or run deadline
+  uint64 attempts = 7;
+  uint64 queue_blocks = 8;   // block_queue_for requests received
+  uint64 discovered = 9;
+  uint64 duplicates = 10;
+  uint64 over_budget = 11;
+  map<string, uint64> by_code = 12;
+  uint64 cancelled = 13;  // dropped because the run was cancelled
+}
+
+// Safety net against crawler traps and runaway discovery. Link-following rules stay in the spider.
+message RunLimits {
+  // Hard stop. Remaining tasks expire and the run ends EXPIRED.
+  google.protobuf.Timestamp deadline_time = 1;
+  // Soft: batches are rejected once reached; concurrent batches may overshoot slightly.
+  uint64 max_tasks = 2;
+  uint32 max_depth = 3;
+}
+
+message KeyRule {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_HOST = 1;          // default
+    KIND_REGISTERED_DOMAIN = 2;
+    KIND_EXPLICIT = 3;      // TaskSpec.queue_key is required
+  }
+  Kind kind = 1;
+}
+
+message RunEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_CREATED = 1;
+    TYPE_SEALED = 2;
+    TYPE_PAUSED = 3;
+    TYPE_RESUMED = 4;
+    TYPE_COMPLETED = 5;
+    TYPE_CANCELLED = 6;
+    TYPE_EXPIRED = 7;
+    TYPE_STATS = 8;
+  }
+  Type type = 1;
+  Run run = 2;
+  google.protobuf.Timestamp event_time = 3;
+}
+
+message TaskStatus {
+  crawly.frontier.task.v1.Task task = 1;
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_PENDING = 1;
+    STATE_DELAYED = 2;
+    STATE_IN_FLIGHT = 3;
+    STATE_SUCCEEDED = 4;
+    STATE_FAILED = 5;
+    STATE_EXPIRED = 6;
+    STATE_CANCELLED = 7;   // the run was cancelled before the task finished
+  }
+  State state = 2;
+  google.protobuf.Timestamp next_eligible_time = 3;
+  repeated Attempt attempts = 4;
+}
+
+message Attempt {
+  uint32 attempt = 1;
+  string worker_id = 2;
+  string worker_version = 3;
+  google.protobuf.Timestamp dispatch_time = 4;
+  google.protobuf.Timestamp finish_time = 5;
+  crawly.frontier.task.v1.Outcome outcome = 6;
+  crawly.frontier.task.v1.FetchInfo fetch = 7;
+  // Hash of the policy set of the frontier replica that dispatched this attempt.
+  string policy_set = 8;
+}

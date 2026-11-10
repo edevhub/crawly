@@ -1,0 +1,49 @@
+// Crawly Frontier API: QueueService, for operators to inspect and control queues.
+// Queue types are in queue.proto.
+
+syntax = "proto3";
+
+package crawly.frontier.queue.v1;
+
+import "crawly/frontier/queue/v1/queue.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/queue/v1;queuev1";
+
+service QueueService {
+  rpc ListQueues(ListQueuesRequest) returns (ListQueuesResponse);
+  rpc GetQueue(GetQueueRequest) returns (GetQueueResponse);
+  // Applies to every run on the queue. An unset unblock_time unblocks.
+  rpc BlockQueue(BlockQueueRequest) returns (BlockQueueResponse);
+}
+
+message ListQueuesRequest {
+  string run_id = 1;          // queues with work for this run
+  string key_prefix = 2;
+  bool only_blocked = 3;
+  int32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListQueuesResponse {
+  repeated Queue queues = 1;
+  string next_page_token = 2;
+}
+
+message GetQueueRequest {
+  string key = 1;
+}
+
+message GetQueueResponse {
+  Queue queue = 1;
+}
+
+message BlockQueueRequest {
+  string key = 1;
+  google.protobuf.Timestamp unblock_time = 2;
+  string reason = 3;
+}
+
+message BlockQueueResponse {
+  Queue queue = 1;
+}

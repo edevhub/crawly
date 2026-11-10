@@ -1,0 +1,251 @@
+// Package e2e runs a Frontier, a worker and a test site in one process.
+package e2e
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"regexp"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/edevhub/crawly/internal/testfrontier"
+	"github.com/edevhub/crawly/sdk"
+	"github.com/edevhub/crawly/sdk/run"
+	"github.com/edevhub/crawly/sdk/task"
+	"github.com/edevhub/crawly/sdk/worker"
+)
+
+var clients = map[string]*sdk.Client{}
+
+func runClient(t *testing.T, addr string) run.Client {
+	t.Helper()
+	c, err := sdk.NewClient(addr, sdk.WithInsecure())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("closing the client: %v", err)
+		}
+	})
+	clients[addr] = c
+	return c.Runs
+}
+
+func register(t *testing.T, w *worker.Worker, name string, h worker.Handler, opts ...worker.RegisterOption) {
+	t.Helper()
+	if err := w.Register(name, h, opts...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seed(t *testing.T, ctx context.Context, addr, runID string, specs ...*task.Spec) {
+	t.Helper()
+	res, err := clients[addr].Seed(ctx, runID, specs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res {
+		if r.GetStatus() != task.StatusAdded {
+			t.Fatalf("seed: %v", r.GetStatus())
+		}
+	}
+}
+
+func waitRun(t *testing.T, ctx context.Context, rc run.Client, runID string) *run.Run {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		res, err := rc.GetRun(ctx, &run.GetRunRequest{RunId: runID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.GetRun().GetState() == run.StateCompleted {
+			return res.GetRun()
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	res, _ := rc.GetRun(ctx, &run.GetRunRequest{RunId: runID})
+	t.Fatalf("run did not complete: %v", res.GetRun())
+	return nil
+}
+
+var link = regexp.MustCompile(`href="([^"]+)"`)
+
+// TestCrawl follows links over a small site: discovery, dedup, a permanent failure, a
+// retried failure and a panic, through to run completion.
+func TestCrawl(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var flaky atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = fmt.Fprint(w, `<a href="/p/1"><a href="/p/2"><a href="/p/3"><a href="/missing"><a href="/flaky"><a href="/boom">`)
+	})
+	mux.HandleFunc("/p/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `<a href="/p/1"><a href="/p/2"><a href="/">`) // only duplicates
+	})
+	mux.HandleFunc("/flaky", func(w http.ResponseWriter, _ *http.Request) {
+		if flaky.Add(1) == 1 {
+			http.Error(w, "try again", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = fmt.Fprint(w, "ok")
+	})
+	mux.HandleFunc("/boom", func(w http.ResponseWriter, _ *http.Request) { _, _ = fmt.Fprint(w, "boom") })
+	site := httptest.NewServer(mux)
+	defer site.Close()
+
+	addr := testfrontier.Start(t).Addr
+	rc := runClient(t, addr)
+
+	var mu sync.Mutex
+	seen := map[string]int{}
+	spider := worker.ParserFunc(func(_ context.Context, t *worker.Task, resp *worker.Response) (*worker.Result, error) {
+		mu.Lock()
+		seen[t.URL]++
+		mu.Unlock()
+		if string(resp.Body) == "boom" {
+			panic("spider bug")
+		}
+		res := &worker.Result{Items: 1}
+		for _, m := range link.FindAllStringSubmatch(string(resp.Body), -1) {
+			res.Tasks = append(res.Tasks, worker.NewTask{URL: site.URL + m[1]})
+		}
+		return res, nil
+	})
+	w, err := worker.New(addr, worker.WithInsecure(), worker.WithID("w1"), worker.WithBuildVersion("test"), worker.WithMaxConcurrentTasks(4),
+		worker.WithShutdownGrace(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Register("page", worker.HTTP(spider)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+
+	if _, err := rc.CreateRun(ctx, &run.CreateRunRequest{RunId: "crawl"}); err != nil {
+		t.Fatal(err)
+	}
+	seed(t, ctx, addr, "crawl", &task.Spec{Request: &task.Request{Url: site.URL + "/"}, Handler: "page"})
+	if _, err := rc.SealRun(ctx, &run.SealRunRequest{RunId: "crawl"}); err != nil {
+		t.Fatal(err)
+	}
+	st := waitRun(t, ctx, rc, "crawl").GetStats()
+	// 7 tasks: /, /p/1..3, /missing, /flaky, /boom. /missing fails (404); /boom panics
+	// on every attempt and fails after max_attempts; /flaky succeeds on its retry.
+	if st.GetSucceeded() != 5 || st.GetFailed() != 2 || st.GetDiscovered() != 6 {
+		t.Fatalf("stats: %v", st)
+	}
+	if st.GetByCode()["http_404"] != 1 || st.GetByCode()["http_503"] != 1 || st.GetByCode()["panic"] != 3 {
+		t.Fatalf("codes: %v", st.GetByCode())
+	}
+	if st.GetDuplicates() == 0 {
+		t.Fatalf("links repeated across pages must be dropped as duplicates: %v", st)
+	}
+	mu.Lock()
+	if seen[site.URL+"/p/1"] != 1 {
+		t.Fatalf("a page was parsed %d times", seen[site.URL+"/p/1"])
+	}
+	mu.Unlock()
+
+	tasks, err := rc.ListTasks(ctx, &run.ListTasksRequest{RunId: "crawl", Code: "http_404"})
+	if err != nil || len(tasks.GetTasks()) != 1 || tasks.GetTasks()[0].GetAttempts()[0].GetWorkerId() != "w1" {
+		t.Fatalf("ListTasks by code: %v %v", tasks, err)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("worker.Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not shut down")
+	}
+}
+
+// TestHandlerStrategies covers a plain Handler, pools, a missing handler, a classified
+// error with a queue block, and a lease that outlives its first duration.
+func TestHandlerStrategies(t *testing.T) {
+	ctx := t.Context()
+	addr := testfrontier.Start(t).Addr
+	rc := runClient(t, addr)
+
+	var slowRuns, blocked atomic.Int32
+	w, err := worker.New(addr, worker.WithInsecure(), worker.WithMaxConcurrentTasks(2), worker.WithShutdownGrace(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Runs longer than the 2 s lease: the SDK must keep the lease alive.
+	register(t, w, "slow", worker.HandlerFunc(func(ctx context.Context, _ *worker.Task) (*worker.Result, error) {
+		slowRuns.Add(1)
+		select {
+		case <-time.After(3 * time.Second):
+			return &worker.Result{Code: "slow_ok"}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}))
+	register(t, w, "render", worker.HandlerFunc(func(_ context.Context, _ *worker.Task) (*worker.Result, error) {
+		return &worker.Result{Code: "rendered", Items: 2}, nil
+	}), worker.InPool("browser"))
+	register(t, w, "limited", worker.HandlerFunc(func(_ context.Context, _ *worker.Task) (*worker.Result, error) {
+		if blocked.Add(1) == 1 {
+			return nil, worker.Retry("captcha", nil, worker.After(100*time.Millisecond), worker.BlockQueue(300*time.Millisecond))
+		}
+		return nil, worker.Fail("gone", nil)
+	}))
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- w.Run(ctx) }()
+	t.Cleanup(func() {
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker: %v", err)
+		}
+	})
+
+	_, err = rc.CreateRun(ctx, &run.CreateRunRequest{RunId: "mixed", Limits: &run.Limits{MaxDepth: 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Idempotent on the same request, a conflict on a different one.
+	if _, err := rc.CreateRun(ctx, &run.CreateRunRequest{RunId: "mixed", Limits: &run.Limits{MaxDepth: 3}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rc.CreateRun(ctx, &run.CreateRunRequest{RunId: "mixed"}); err == nil {
+		t.Fatal("a different spec for the same run must be rejected")
+	}
+	seed(t, ctx, addr, "mixed",
+		&task.Spec{Request: &task.Request{Url: "https://a.example/slow"}, Handler: "slow"},
+		&task.Spec{Request: &task.Request{Url: "https://b.example/page"}, Handler: "render", Pool: "browser"},
+		&task.Spec{Request: &task.Request{Url: "https://c.example/x"}, Handler: "limited"},
+		&task.Spec{Request: &task.Request{Url: "https://d.example/y"}, Handler: "unknown"},
+	)
+	if _, err := rc.SealRun(ctx, &run.SealRunRequest{RunId: "mixed"}); err != nil {
+		t.Fatal(err)
+	}
+	st := waitRun(t, ctx, rc, "mixed").GetStats()
+	codes := st.GetByCode()
+	if st.GetSucceeded() != 2 || st.GetFailed() != 2 {
+		t.Fatalf("stats: %v", st)
+	}
+	if codes["slow_ok"] != 1 || codes["rendered"] != 1 || codes["captcha"] != 1 || codes["gone"] != 1 || codes["no_handler"] != 1 {
+		t.Fatalf("codes: %v", codes)
+	}
+	if codes["lease_expired"] != 0 || slowRuns.Load() != 1 {
+		t.Fatalf("the long handler lost its lease: codes %v, runs %d", codes, slowRuns.Load())
+	}
+	if st.GetQueueBlocks() != 1 {
+		t.Fatalf("queue blocks: %d", st.GetQueueBlocks())
+	}
+}

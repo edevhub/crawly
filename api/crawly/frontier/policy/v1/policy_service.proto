@@ -1,0 +1,48 @@
+// Crawly Frontier API: PolicyService, a read-only view of the global policies loaded from
+// config and of how they resolve. Policy types are in policy.proto.
+
+syntax = "proto3";
+
+package crawly.frontier.policy.v1;
+
+import "crawly/frontier/policy/v1/policy.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/policy/v1;policyv1";
+
+service PolicyService {
+  rpc ListPolicies(ListPoliciesRequest) returns (ListPoliciesResponse);
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+  // Effective policy for a (queue, run[, task]) with the policy that set each field.
+  rpc ExplainPolicy(ExplainPolicyRequest) returns (ExplainPolicyResponse);
+}
+
+message ListPoliciesRequest {}
+
+message ListPoliciesResponse {
+  repeated Policy policies = 1;
+  // Field 2 (policy_set_version) removed.
+  reserved 2;
+  // Hash of the policy set loaded by the replica that served the call.
+  string policy_set = 3;
+}
+
+message GetPolicyRequest {
+  string name = 1;
+}
+
+message GetPolicyResponse {
+  Policy policy = 1;
+}
+
+message ExplainPolicyRequest {
+  string queue_key = 1;
+  string run_id = 2;
+  string task_id = 3;
+}
+
+message ExplainPolicyResponse {
+  QueueLimits limits = 1;
+  Behaviour behaviour = 2;
+  // Field path (e.g. "limits.rate_per_second") -> name of the policy or override that set it.
+  map<string, string> provenance = 3;
+}

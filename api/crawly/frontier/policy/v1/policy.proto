@@ -1,0 +1,97 @@
+// Crawly Frontier API: policies.
+//
+// Policies are static: global policies come from config at frontier startup, a run's policy
+// is fixed at CreateRun. Changing a global policy is a deploy.
+//
+// Sources: global policies are loaded from config when a frontier replica starts; a run's
+// RunPolicy is given at CreateRun and is immutable. There is no runtime policy change.
+//
+// Resolution: global policies (matched by queue key) < run policy < run per-queue override.
+// Most specific wins, field by field. Unset fields (proto3 optional) inherit.
+//
+// Limits are enforced at dispatch against per-queue state shared by all runs:
+//   - without run limits, a run's tasks are admitted against the queue's limits and the
+//     traffic of every run on the queue;
+//   - with run limits (RunPolicy.limits or a RunQueueOverride), they REPLACE the queue's
+//     limits for that run: the run is admitted against its own allowance and its own
+//     traffic only. Its traffic still counts towards the queue's shared state, so other
+//     runs back off while it runs and resume at most one interval after it stops;
+//   - a queue block (Outcome.block_queue_for, BlockQueue) stops every run, with or without
+//     run limits.
+//
+// Fairness is per queue: runs with work on the same queue share its admitted dispatches by
+// weight, per (queue, run, pool) backlog. There is no fleet-wide share of worker slots
+// between runs. Fairness comes before TaskSpec.priority, which orders tasks inside one
+// run's backlog only.
+
+syntax = "proto3";
+
+package crawly.frontier.policy.v1;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/policy/v1;policyv1";
+
+message Policy {
+  string name = 1;
+  // Fields 2 (source) and 3 (version) removed: all global policies come from config.
+  reserved 2, 3;
+  PolicySelector match = 4;
+  // Higher wins when two policies of equal specificity match.
+  int32 precedence = 5;
+  QueueLimits limits = 6;
+  Behaviour behaviour = 7;
+}
+
+message PolicySelector {
+  // Glob over queue keys, e.g. "*.example.com". Empty matches all queues.
+  string queue_key = 1;
+  reserved 2;
+}
+
+message QueueLimits {
+  optional uint32 max_concurrency = 1;
+  optional double rate_per_second = 2;
+  optional uint32 burst = 3;
+  google.protobuf.Duration min_delay = 4;
+  // Field 5 reserved for adaptive (AIMD) limits.
+  reserved 5;
+}
+
+message Behaviour {
+  optional uint32 max_attempts = 1;
+  Backoff backoff = 2;
+  reserved 3;
+  google.protobuf.Duration fetch_timeout = 4;
+  google.protobuf.Duration lease_duration = 5;
+  // Upper bound on a lease including extensions.
+  google.protobuf.Duration max_lease_duration = 6;
+  // Tasks not dispatched within ttl of being added expire.
+  google.protobuf.Duration task_ttl = 7;
+}
+
+message Backoff {
+  google.protobuf.Duration initial = 1;
+  optional double multiplier = 2;
+  google.protobuf.Duration max = 3;
+  optional double jitter = 4;   // 0..1
+}
+
+message RunPolicy {
+  // Share of each queue's admitted dispatches relative to other runs with work on the
+  // same queue. Default 1.
+  optional uint32 weight = 1;
+  // Applies to all queues of the run unless a RunQueueOverride matches.
+  QueueLimits limits = 4;
+  Behaviour behaviour = 2;
+  repeated RunQueueOverride overrides = 3;
+}
+
+message RunQueueOverride {
+  string queue_key = 1;           // glob
+  // Replaces the queue's limits for this run's tasks; may be tighter or looser.
+  // Bounds only this run's own traffic on matching queues.
+  QueueLimits limits = 2;
+  optional uint32 weight = 3;
+  Behaviour behaviour = 4;
+}

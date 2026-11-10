@@ -1,0 +1,153 @@
+// Crawly Frontier API: RunService, for schedulers to create, seed, seal, pause and cancel
+// runs and to observe them. Run types are in run.proto.
+
+syntax = "proto3";
+
+package crawly.frontier.run.v1;
+
+import "crawly/frontier/policy/v1/policy.proto";
+import "crawly/frontier/run/v1/run.proto";
+import "crawly/frontier/task/v1/task.proto";
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/run/v1;runv1";
+
+service RunService {
+  // Idempotent on run_id: the same request returns the existing run, a different one
+  // fails with ALREADY_EXISTS. The run's policy cannot be changed after creation.
+  rpc CreateRun(CreateRunRequest) returns (CreateRunResponse);
+  // Seeding. Accepted while the run is OPEN.
+  rpc AddTasks(stream AddTasksRequest) returns (stream AddTasksResponse);
+  // Scheduler declares seeding finished. Only a sealed run can complete; workers can
+  // still add discovered tasks to a sealed run.
+  rpc SealRun(SealRunRequest) returns (SealRunResponse);
+  rpc PauseRun(PauseRunRequest) returns (PauseRunResponse);
+  rpc ResumeRun(ResumeRunRequest) returns (ResumeRunResponse);
+  // Drops pending tasks and revokes leases.
+  // The run is CANCELLED on return; its tasks drain in the background.
+  rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+  rpc GetRun(GetRunRequest) returns (GetRunResponse);
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  // Lifecycle events and periodic stats snapshots. When run_id is set, the first
+  // message describes the run as it is now: the terminal event if it has already
+  // ended, STATS otherwise. A watcher that subscribes late therefore misses nothing.
+  rpc WatchRuns(WatchRunsRequest) returns (stream WatchRunsResponse);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+}
+
+message CreateRunRequest {
+  // Client-chosen and idempotent, e.g. "daily-refresh/2026-11-08".
+  string run_id = 1;
+  reserved 2, 6, 8;
+  // Free-form; external tools group and compare runs by labels (e.g. spider=example, kind=refresh).
+  map<string, string> labels = 3;
+  crawly.frontier.policy.v1.RunPolicy policy = 4;
+  RunLimits limits = 5;
+  KeyRule key_rule = 7;
+  bool start_paused = 9;
+}
+
+message CreateRunResponse {
+  Run run = 1;
+}
+
+message AddTasksRequest {
+  string run_id = 1;
+  string batch_id = 2;
+  repeated crawly.frontier.task.v1.TaskSpec tasks = 3;
+}
+
+message AddTasksResponse {
+  string batch_id = 1;
+  repeated crawly.frontier.task.v1.AddResult results = 2;
+}
+
+message SealRunRequest {
+  string run_id = 1;
+}
+
+message SealRunResponse {
+  Run run = 1;
+}
+
+message PauseRunRequest {
+  string run_id = 1;
+}
+
+message PauseRunResponse {
+  Run run = 1;
+}
+
+message ResumeRunRequest {
+  string run_id = 1;
+}
+
+message ResumeRunResponse {
+  Run run = 1;
+}
+
+message CancelRunRequest {
+  string run_id = 1;
+}
+
+message CancelRunResponse {
+  Run run = 1;
+}
+
+message GetRunRequest {
+  string run_id = 1;
+}
+
+message GetRunResponse {
+  Run run = 1;
+}
+
+message ListRunsRequest {
+  reserved 1;
+  repeated Run.State states = 2;
+  map<string, string> labels = 3;
+  int32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListRunsResponse {
+  repeated Run runs = 1;
+  string next_page_token = 2;
+}
+
+message WatchRunsRequest {
+  map<string, string> labels = 1;  // empty: all
+  string run_id = 2;               // empty: all
+  // Periodic stats snapshots; 0 disables them.
+  google.protobuf.Duration stats_interval = 3;
+}
+
+message WatchRunsResponse {
+  RunEvent event = 1;
+}
+
+message ListTasksRequest {
+  string run_id = 1;
+  string queue_key = 2;
+  repeated TaskStatus.State states = 3;
+  string code = 4;
+  int32 page_size = 5;
+  string page_token = 6;
+}
+
+message ListTasksResponse {
+  repeated TaskStatus tasks = 1;
+  string next_page_token = 2;
+}
+
+message GetTaskRequest {
+  string run_id = 1;
+  // One of the two.
+  string task_id = 2;
+  string url = 3;
+}
+
+message GetTaskResponse {
+  TaskStatus task = 1;
+}

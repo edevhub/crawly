@@ -1,0 +1,77 @@
+name: Release
+
+# Publishes a semantic version, only after the full test suite passes.
+#
+#   - Run it by hand and choose the bump: the next version is computed from the latest
+#     vMAJOR.MINOR.PATCH tag (v0.1.0 when there is none).
+#   - Or push a vMAJOR.MINOR.PATCH tag yourself: it is validated, tested and released.
+#
+# The Go module is consumed by its git tags, so a tag is the release.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve the version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            next="$GITHUB_REF_NAME"
+            [[ "$next" =~ $semver ]] || { echo "::error::tag $next is not vMAJOR.MINOR.PATCH"; exit 1; }
+          else
+            [ "$GITHUB_REF_NAME" = "main" ] || { echo "::error::releases are cut from main"; exit 1; }
+            last="$(git tag --list 'v*' --sort=-v:refname | grep -E "$semver" | head -n1 || true)"
+            if [ -z "$last" ]; then
+              next="v0.1.0"
+            else
+              IFS=. read -r major minor patch <<<"${last#v}"
+              case "$BUMP" in
+                major) major=$((major + 1)); minor=0; patch=0 ;;
+                minor) minor=$((minor + 1)); patch=0 ;;
+                *)     patch=$((patch + 1)) ;;
+              esac
+              next="v$major.$minor.$patch"
+            fi
+            if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+              echo "::error::tag $next already exists"; exit 1
+            fi
+          fi
+          echo "next=$next" >>"$GITHUB_OUTPUT"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          # For a hand-run release this also creates the tag, on the tested commit.
+          gh release create "$NEXT" --target "$GITHUB_SHA" --generate-notes --title "$NEXT"
