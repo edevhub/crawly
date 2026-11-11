@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/edevhub/crawly/internal/store/pgstore"
 )
 
 // Env names the environment variable that holds the URL of a PostgreSQL database
@@ -27,10 +29,18 @@ func Require(tb testing.TB) string {
 	return base
 }
 
-// Schema creates an empty schema for the test and returns a connection URL that
-// uses it. The schema is dropped when the test ends. The test is skipped when Env is
-// not set.
+// Schema creates a schema for the test, applies the migrations and returns a
+// connection URL that uses it. The schema is dropped when the test ends. The test is
+// skipped when Env is not set.
 func Schema(tb testing.TB) string {
+	tb.Helper()
+	dsn := Empty(tb)
+	Migrate(tb, dsn, "")
+	return dsn
+}
+
+// Empty is Schema without the migrations: a database nobody has set up yet.
+func Empty(tb testing.TB) string {
 	tb.Helper()
 	base := Require(tb)
 	u, err := url.Parse(base)
@@ -46,6 +56,21 @@ func Schema(tb testing.TB) string {
 	q.Set("search_path", name)
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// Migrate applies the migrations of this build, recorded in table.
+func Migrate(tb testing.TB, dsn, table string) []pgstore.Migration {
+	tb.Helper()
+	m, err := pgstore.NewMigrator(dsn, table, nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer func() { _ = m.Close() }()
+	applied, err := m.Up(context.Background())
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return applied
 }
 
 func exec(tb testing.TB, dsn, sql string) {
