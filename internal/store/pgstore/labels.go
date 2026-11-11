@@ -98,21 +98,21 @@ func countLabels(batch *pgx.Batch, queue string, run int64, column string, count
 	}
 }
 
-// countFailed counts a failed task of a label, with the code of its last attempt.
-func countFailed(batch *pgx.Batch, queue string, run int64, label, code string) {
+// countFailed counts n failed tasks of a label, with the code of their last attempt.
+func countFailed(batch *pgx.Batch, queue string, run int64, label, code string, n int64) {
 	if code == "" {
-		countLabel(batch, queue, run, label, "failed", 1)
+		countLabel(batch, queue, run, label, "failed", n)
 		return
 	}
-	if label == "" {
+	if label == "" || n == 0 {
 		return
 	}
 	batch.Queue(`INSERT INTO backlog_labels (queue_key, run_no, label, failed, failed_codes)
-		VALUES ($1, $2, $3, 1, jsonb_build_object($4::text, 1))
-		ON CONFLICT (queue_key, run_no, label) DO UPDATE SET failed = backlog_labels.failed + 1,
+		VALUES ($1, $2, $3, $5, jsonb_build_object($4::text, $5::bigint))
+		ON CONFLICT (queue_key, run_no, label) DO UPDATE SET failed = backlog_labels.failed + $5,
 			failed_codes = jsonb_set(backlog_labels.failed_codes, ARRAY[$4::text],
-				to_jsonb(coalesce((backlog_labels.failed_codes ->> $4)::bigint, 0) + 1))`,
-		queue, run, label, code)
+				to_jsonb(coalesce((backlog_labels.failed_codes ->> $4)::bigint, 0) + $5::bigint))`,
+		queue, run, label, code, n)
 }
 
 // labelStats sums the counters of a run's labels. Every registered label is listed.

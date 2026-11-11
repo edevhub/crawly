@@ -35,7 +35,7 @@ const (
 )
 
 // Wait blocks until the run has ended and returns it in its final state: completed,
-// cancelled or expired.
+// cancelled, expired or aborted (Run.AbortReason says by which rule).
 //
 // It watches the run and survives the Frontier going away: when the stream breaks, as
 // it does on every restart of a Frontier, Wait reconnects with backoff until ctx is
@@ -109,7 +109,7 @@ func (c *Client) watchOnce(ctx context.Context, runID string, w *waiter) (progre
 
 func ended(r *run.Run) bool {
 	switch r.GetState() {
-	case run.StateCompleted, run.StateCancelled, run.StateExpired:
+	case run.StateCompleted, run.StateCancelled, run.StateExpired, run.StateAborted:
 		return true
 	default:
 		return false

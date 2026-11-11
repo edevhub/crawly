@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	"google.golang.org/grpc"
@@ -37,9 +39,14 @@ func (r runService) CreateRun(ctx context.Context, req *runv1.CreateRunRequest) 
 	if err := policy.ValidateRun(req.GetPolicy()); err != nil {
 		return nil, status.Error(codes.InvalidArgument, "policy: "+err.Error())
 	}
+	if err := validateAbortRules(req.GetLimits()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "limits: "+err.Error())
+	}
 	spec := store.RunSpec{ID: store.RunID(req.GetRunId()), Labels: req.GetLabels(), Policy: req.GetPolicy(),
 		Paused: req.GetStartPaused(), Hash: specHash(req), KeyRule: store.KeyHost,
-		Limits: store.RunLimits{MaxTasks: req.GetLimits().GetMaxTasks(), MaxDepth: req.GetLimits().GetMaxDepth()}}
+		Limits: store.RunLimits{MaxTasks: req.GetLimits().GetMaxTasks(), MaxDepth: req.GetLimits().GetMaxDepth(),
+			AbortOnCodes: req.GetLimits().GetAbortOnCodes(), MaxFailed: req.GetLimits().GetMaxFailed(),
+			MaxConsecutiveFailures: req.GetLimits().GetMaxConsecutiveFailures()}}
 	switch req.GetKeyRule().GetKind() {
 	case runv1.KeyRule_KIND_REGISTERED_DOMAIN:
 		spec.KeyRule = store.KeyRegisteredDomain
@@ -56,6 +63,35 @@ func (r runService) CreateRun(ctx context.Context, req *runv1.CreateRunRequest) 
 		return nil, grpcErr(err)
 	}
 	return &runv1.CreateRunResponse{Run: runProto(run)}, nil
+}
+
+// maxAbortCodes bounds abort_on_codes.
+const maxAbortCodes = 64
+
+// reservedCodes are codes no recorded attempt carries, so a rule on them would never
+// trip: "revoked" marks the attempt of a task whose run ended, and "shutdown" a task a
+// worker handed back, which records no attempt.
+var reservedCodes = []string{"revoked", CodeShutdown}
+
+// validateAbortRules rejects abort_on_codes that cannot work as written.
+func validateAbortRules(l *runv1.RunLimits) error {
+	list := l.GetAbortOnCodes()
+	if len(list) > maxAbortCodes {
+		return fmt.Errorf("abort_on_codes: %d codes, at most %d", len(list), maxAbortCodes)
+	}
+	seen := make(map[string]bool, len(list))
+	for i, c := range list {
+		switch {
+		case c == "":
+			return fmt.Errorf("abort_on_codes[%d]: empty code", i)
+		case seen[c]:
+			return fmt.Errorf("abort_on_codes[%d]: duplicate code %q", i, c)
+		case slices.Contains(reservedCodes, c):
+			return fmt.Errorf("abort_on_codes[%d]: %q is reserved: no attempt is recorded with it, so the rule would never trip", i, c)
+		}
+		seen[c] = true
+	}
+	return nil
 }
 
 func (r runService) AddTasks(stream grpc.BidiStreamingServer[runv1.AddTasksRequest, runv1.AddTasksResponse]) error {
@@ -308,8 +344,8 @@ func (q queueService) ListQueues(ctx context.Context, req *queuev1.ListQueuesReq
 		return nil, grpcErr(err)
 	}
 	out := &queuev1.ListQueuesResponse{NextPageToken: next}
-	for _, v := range qs {
-		out.Queues = append(out.Queues, q.queueProto(v))
+	for i := range qs {
+		out.Queues = append(out.Queues, q.queueProto(qs[i]))
 	}
 	return out, nil
 }
@@ -340,7 +376,11 @@ func (q queueService) BlockQueue(ctx context.Context, req *queuev1.BlockQueueReq
 func (q queueService) queueProto(v store.Queue) *queuev1.Queue {
 	out := &queuev1.Queue{Key: string(v.Key), EffectiveLimits: q.s.pol.Resolve(nil, string(v.Key)).Queue,
 		Limiter: &queuev1.LimiterState{InFlight: safeconv.Uint32(v.InFlight), NextEligibleTime: ts(v.NextEligibleAt),
-			AdmissibleNow: safeconv.Uint32(v.AdmissibleNow), UnblockTime: ts(v.BlockedUntil), BlockReason: v.BlockReason}}
+			AdmissibleNow: safeconv.Uint32(v.AdmissibleNow), UnblockTime: ts(v.BlockedUntil), BlockReason: v.BlockReason,
+			StrainSteps: v.Strain.Steps, LastStrainTime: ts(v.Strain.Last)}}
+	if v.Strain.Interval > 0 {
+		out.Limiter.CurrentInterval = durationpb.New(v.Strain.Interval)
+	}
 	for _, b := range v.Backlogs {
 		out.Backlogs = append(out.Backlogs, &queuev1.RunBacklog{RunId: string(b.Run), Pool: string(b.Pool),
 			Pending: b.Pending, Delayed: b.Delayed, InFlight: safeconv.Uint32(b.InFlight), Weight: uint32(b.Weight)})
@@ -374,13 +414,17 @@ func runProto(r store.Run) *runv1.Run {
 	st := r.Stats
 	return &runv1.Run{
 		RunId: string(r.Spec.ID), Labels: r.Spec.Labels, State: runv1.Run_State(safeconv.Int32(int(r.State))), Paused: r.Paused,
-		Policy:  r.Spec.Policy,
-		Limits:  &runv1.RunLimits{DeadlineTime: ts(r.Spec.Limits.Deadline), MaxTasks: r.Spec.Limits.MaxTasks, MaxDepth: r.Spec.Limits.MaxDepth},
+		Policy: r.Spec.Policy,
+		Limits: &runv1.RunLimits{DeadlineTime: ts(r.Spec.Limits.Deadline), MaxTasks: r.Spec.Limits.MaxTasks, MaxDepth: r.Spec.Limits.MaxDepth,
+			AbortOnCodes: r.Spec.Limits.AbortOnCodes, MaxFailed: r.Spec.Limits.MaxFailed,
+			MaxConsecutiveFailures: r.Spec.Limits.MaxConsecutiveFailures},
 		KeyRule: &runv1.KeyRule{Kind: rule},
 		Stats: &runv1.RunStats{Pending: st.Pending, Delayed: st.Delayed, InFlight: st.InFlight, Succeeded: st.Succeeded,
 			Failed: st.Failed, Expired: st.Expired, Cancelled: st.Cancelled, Attempts: st.Attempts, QueueBlocks: st.QueueBlocks,
-			Discovered: st.Discovered, Duplicates: st.Duplicates, OverBudget: st.OverBudget, ByCode: st.ByCode, ByLabel: labelStatsProto(st.ByLabel), Invalid: st.Invalid},
+			Discovered: st.Discovered, Duplicates: st.Duplicates, OverBudget: st.OverBudget, ByCode: st.ByCode,
+			BlockedQueues: blockedQueuesProto(st.BlockedQueues), ByLabel: labelStatsProto(st.ByLabel), Invalid: st.Invalid},
 		CreateTime: ts(r.CreatedAt), SealTime: ts(r.SealedAt), FinishTime: ts(r.FinishedAt),
+		AbortReason: abortProto(r.Abort),
 	}
 }
 
@@ -394,6 +438,30 @@ func labelStatsProto(m map[string]store.LabelStats) map[string]*runv1.LabelStats
 			FailedByCode: l.FailedByCode}
 	}
 	return out
+}
+
+func blockedQueuesProto(bq []store.BlockedQueue) []*runv1.BlockedQueue {
+	out := make([]*runv1.BlockedQueue, 0, len(bq))
+	for _, b := range bq {
+		out = append(out, &runv1.BlockedQueue{QueueKey: string(b.Queue), UnblockTime: ts(b.Until), Reason: b.Reason, Waiting: b.Waiting})
+	}
+	return out
+}
+
+func abortProto(a *store.AbortReason) *runv1.AbortReason {
+	if a == nil {
+		return nil
+	}
+	rule := runv1.AbortReason_RULE_UNSPECIFIED
+	switch a.Rule {
+	case store.AbortOnCode:
+		rule = runv1.AbortReason_RULE_CODE
+	case store.AbortMaxFailed:
+		rule = runv1.AbortReason_RULE_MAX_FAILED
+	case store.AbortConsecutiveFailures:
+		rule = runv1.AbortReason_RULE_MAX_CONSECUTIVE_FAILURES
+	}
+	return &runv1.AbortReason{Rule: rule, Code: a.Code, TaskId: string(a.Task)}
 }
 
 func addResults(res []store.AddResult) []*taskv1.AddResult {
@@ -451,6 +519,8 @@ func snapshotType(st store.RunState) runv1.RunEvent_Type {
 		return runv1.RunEvent_TYPE_CANCELLED
 	case store.RunExpired:
 		return runv1.RunEvent_TYPE_EXPIRED
+	case store.RunAborted:
+		return runv1.RunEvent_TYPE_ABORTED
 	default:
 		return runv1.RunEvent_TYPE_STATS
 	}

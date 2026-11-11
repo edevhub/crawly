@@ -28,30 +28,79 @@ This ADR borrows it.
 
 - A **pool** is a named set of workers that execute the same kind of task, e.g. `default`
   (plain HTTP) or `browser` (headless). It is Temporal's task queue.
-- A task names its pool in `TaskSpec.pool` (empty: `default`). There is no capability or
-  label matching. Pool names match `[a-z0-9_]{1,32}`; anything else is `INVALID`.
-- A **session** serves exactly one pool. `Hello` carries `pool`, `worker_id` and
-  `build_version`. A worker process that serves several pools opens one session per pool.
+- A task names its pool in `TaskSpec.pool` (empty: `default`) and its handler in
+  `TaskSpec.handler`. There is no label or capability matching. Pool names match
+  `[a-z0-9_]{1,32}`; anything else is `INVALID`. A worker registers handler names of at most
+  256 bytes without a NUL byte, and a session names at most 64 of them; `Hello` with more, or
+  with a name that is not valid, is refused. A task that names a handler no worker could
+  register is not refused: it is stored as of unknown handler, which every session may try,
+  as it was before handlers took part in dispatch.
+- A **session** serves exactly one pool. `Hello` carries `pool`, `worker_id`,
+  `build_version` and `handlers`. A worker process that serves several pools opens one
+  session per pool.
 - A session for a pool that has no tasks yet is valid: it receives work as soon as the first
   task of that pool is added.
-- A worker that receives a task whose handler it does not have **hands it back**: outcome
-  `RELEASED`, code `no_handler`. A handler name is a contract between builds, and in a
-  rolling deploy the workers of the old build share a pool with the build that added a
-  handler. The Frontier returns the task to its backlog without counting an attempt, holds
-  it for a short delay and gives it out again, to whichever session is next. It fails the
-  task with code `no_handler` only when no worker could run it for a configured time (one
-  hour by default). The time starts with the first worker that lacks the handler and ends
-  with the first worker that runs the task, whatever the result, so a long deploy does not
-  fail a task that is being served.
-  - Dispatch does not select by handler. The store claims work by pool and queue, and a
-    handler filter under that would leave a backlog whose head no session can run. The
-    price of the simpler rule is that every round of a handed-back task takes a politeness
-    slot of its queue; the delay bounds that.
-  - The time is kept per replica, in memory, one entry per task that is going round. A
+- **A session is given only tasks whose handler it named.** `Hello.handlers` lists the
+  handlers the worker registered for the session's pool. A task with a handler the session
+  did not name is never dispatched to it. Tasks with no known handler (empty) are offered to
+  every session. A handler name is a contract between builds, and in a rolling deploy the
+  workers of the old build share a pool with the build that added a handler: the old
+  workers are never given the new handler's tasks, and the new ones are, at once.
+  - Handlers are a dimension of the store's readiness index (ADR 0001, Selection order;
+    ADR 0002, Lanes). An earlier version of this ADR left handlers out of dispatch, because a
+    handler filter under a backlog per pool and queue would leave a backlog whose head no
+    session can run: a session would read past tasks it cannot run to find the ones it
+    can, or give up and starve them. Politeness, fairness and statistics stay per backlog;
+    only the question "when could a task of this handler be dispatched" is asked per
+    handler, so no session reads past a task it cannot run.
+  - Priority orders the tasks a session can run: across its handlers within a run's
+    backlog, as before. A session with handlers `a` and `b` takes the highest-priority task
+    of either.
+  - A task whose handler no connected session has **waits in its backlog**. It takes no
+    politeness slot and no share of the queue, costs no round trip and does not stand in the
+    way of other tasks. It is dispatched as soon as a session with the handler connects and
+    grants a credit.
+  - It does not wait for ever without a sign. When no replica has reported a session with
+    the handler for a configured time (`-no-handler-grace`, one hour by default), the task
+    fails with code `no_handler`. Each replica reports the handlers of its sessions to the
+    store when they change and as a heartbeat well inside the grace period, and the store keeps
+    when each was last reported; a task fails when its handler was last reported longer ago
+    than the grace period and the task itself is at least as old. A session that names no
+    handlers is reported as able to run any, so while one is connected, and for the grace
+    period after, no handler of its pool counts as unserved: its tasks are its own to run or
+    hand back. The state is in the store, so a restart of a replica does not restart
+    the count, and the count is the same on every replica. The failure is recorded as an
+    attempt with code `no_handler` that was never dispatched. The sweep that does this is
+    bounded: it takes a limited number of queues in a round, goes on from where the last
+    round stopped, and one replica at a time does it. A Frontier logs each failure, and, once
+    in a while and not once per replica, each handler whose tasks wait, with how many queues
+    and runs have such tasks; that line and the failed tasks, found by code `no_handler`, are
+    what an operator sees.
+  - The limits of that guarantee. The store knows that some replica reported the handler
+    lately, not that the session is alive, has free credits or can reach the task: a handler
+    served by one worker that is stuck keeps its tasks from failing. Nothing fails before the
+    grace period has passed since the newest replica started, so that a restart of every
+    replica does not fail tasks whose workers are still reconnecting; replicas that are
+    replaced more often than the grace period therefore never fail such a task. A task of an
+    unknown handler is not covered: it is offered to every session and handed back (below).
+- **A session that names no handlers** (a worker of an SDK that predates `Hello.handlers`)
+  is offered every task of its pool, as before. A worker that receives a task whose handler
+  it does not have **hands it back**: outcome `RELEASED`, code `no_handler`. The Frontier
+  returns the task to its backlog without counting an attempt, holds it for a short delay
+  (five seconds by default) and gives it out again, to whichever session is next. It fails
+  the task with code `no_handler` only when no worker could run it for the grace period. That
+  time starts with the first worker that lacks the handler and ends with the first worker
+  that runs the task, whatever the result, so a long deploy does not fail a task that is being
+  served.
+  - Every round of a handed-back task takes a politeness slot of its queue; the delay bounds
+    that. Sessions that name their handlers do not cause such rounds.
+  - This time is kept per replica, in memory, one entry per task that is going round. A
     restart starts it again. Replicas that restart more often than the configured time
     therefore never fail such a task: it keeps going round until a worker has its handler
-    or its run ends. The Frontier logs the first hand-back of a task and its failure; the
-    run's stats show the code only once the task failed.
+    or its run ends.
+- Workers and Frontier can be upgraded in any order. An older Frontier ignores
+  `Hello.handlers` and behaves as the line above: it offers the session every task. A newer
+  Frontier treats an older worker as a session without handlers.
 
 ### Credits
 
@@ -127,7 +176,9 @@ This ADR borrows it.
 ### Outcomes
 
 Unchanged: `SUCCESS`, `RETRY` (with optional `retry_after`), `FAILED`, any of them with
-`block_queue_for`. The spider classifies; the Frontier applies `max_attempts` and backoff,
+`block_queue_for`, and any failure with `strain` (field 6: a sign of strain on the site,
+ADR 0001, Adaptive pacing; absent from an older worker, which means none). The spider
+classifies; the Frontier applies `max_attempts` and backoff,
 as Temporal's retry policy does, with `FAILED` in the place of a non-retryable error type.
 
 `RELEASED` is the fourth outcome, and the SDK's own: the worker did not run the task to an
@@ -135,7 +186,8 @@ end and hands it back. The Frontier undoes the dispatch as it does for an assign
 never reached a worker: the task is pending again, no attempt is recorded and the attempt
 number is used again. The SDK sends it in two cases:
 
-- the worker lacks the task's handler (code `no_handler`, see Pools);
+- the worker lacks the task's handler (code `no_handler`, see Pools). A worker that names
+  its handlers is not given such a task, unless the task's handler is unknown;
 - the worker shut down and its grace passed while the handler ran (code `shutdown`). The
   handler's context is cancelled, the task is handed back and the session stays open until
   that is acknowledged. A deploy during a slow page therefore never uses up `max_attempts`
@@ -198,7 +250,8 @@ else on this page.
 - **`Parser`** is the simpler strategy: `Parse(ctx, *Task, *Response) (*Result, error)`. The
   adapter `HTTP(parser, options...)` turns it into a `Handler`: it fetches, classifies the
   response (2xx parsed, 429 retried with a queue block, 408 and 5xx retried, other statuses
-  failed) and applies the redirect rule above. The classification is a default: a spider
+  failed; 502, 503, 504, a 429 without `Retry-After`, timeouts and failed connections carry
+  `strain`) and applies the redirect rule above. The classification is a default: a spider
   hands any status to a parser of its own, whose return value is then the outcome. That is
   how a 404 becomes a result ("the product is gone") and a 403 a block of the queue.
 - **Registration:** `Worker.Register(name, handler, options...)`, where `name` is the task's

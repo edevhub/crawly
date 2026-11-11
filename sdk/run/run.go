@@ -23,8 +23,13 @@ type (
 	Stats = runv1.RunStats
 	// LabelStats counts the ended tasks of one task label: Stats.ByLabel maps labels to them.
 	LabelStats = runv1.LabelStats
-	// Limits caps what a run may do: a deadline, a task budget and a crawl depth.
+	// Limits caps what a run may do (a deadline, a task budget, a crawl depth) and sets the
+	// rules that abort it.
 	Limits = runv1.RunLimits
+	// AbortReason is the rule that aborted a run and the task that tripped it.
+	AbortReason = runv1.AbortReason
+	// BlockedQueue is a blocked queue that a run's tasks wait on, as Stats lists it.
+	BlockedQueue = runv1.BlockedQueue
 	// Event is a run lifecycle event or a statistics update, as WatchRuns delivers it.
 	Event = runv1.RunEvent
 	// KeyRule says how a task's queue key is derived.
@@ -104,6 +109,14 @@ const (
 	StateCompleted = runv1.Run_STATE_COMPLETED
 	StateCancelled = runv1.Run_STATE_CANCELLED
 	StateExpired   = runv1.Run_STATE_EXPIRED
+	StateAborted   = runv1.Run_STATE_ABORTED
+)
+
+// Abort rules: what AbortReason.Rule names.
+const (
+	AbortOnCode              = runv1.AbortReason_RULE_CODE
+	AbortMaxFailed           = runv1.AbortReason_RULE_MAX_FAILED
+	AbortConsecutiveFailures = runv1.AbortReason_RULE_MAX_CONSECUTIVE_FAILURES
 )
 
 // Run event types.
@@ -116,6 +129,7 @@ const (
 	EventCancelled = runv1.RunEvent_TYPE_CANCELLED
 	EventExpired   = runv1.RunEvent_TYPE_EXPIRED
 	EventStats     = runv1.RunEvent_TYPE_STATS
+	EventAborted   = runv1.RunEvent_TYPE_ABORTED
 )
 
 // Task states.

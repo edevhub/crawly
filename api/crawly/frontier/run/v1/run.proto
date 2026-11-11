@@ -1,7 +1,15 @@
 // Crawly Frontier API: runs (scheduler API).
 //
 // Run termination: a run COMPLETES when it is sealed AND it has no pending, delayed or
-// in-flight tasks.
+// in-flight tasks. It ends early in one of three ways, and the remaining tasks are dropped
+// in each of them (counted as expired for the first, as cancelled for the other two):
+//   - EXPIRED: its deadline is reached.
+//   - CANCELLED: an operator or scheduler called CancelRun.
+//   - ABORTED: one of the rules of RunLimits (abort_on_codes, max_failed,
+//     max_consecutive_failures) tripped. The Frontier ends the run in the same
+//     transaction that applies the outcome; Run.abort_reason says which rule and which
+//     task. A run that is already over is not aborted, so a run has one reason at most.
+// Leases of the dropped tasks are revoked in all three cases.
 
 syntax = "proto3";
 
@@ -25,6 +33,7 @@ message Run {
     STATE_COMPLETED = 3;   // sealed and drained
     STATE_CANCELLED = 4;
     STATE_EXPIRED = 5;     // deadline reached; remaining tasks were dropped
+    STATE_ABORTED = 6;     // a rule of RunLimits tripped; remaining tasks were dropped (see abort_reason)
   }
   State state = 4;
   bool paused = 5;
@@ -40,6 +49,24 @@ message Run {
   google.protobuf.Timestamp create_time = 13;
   google.protobuf.Timestamp seal_time = 14;
   google.protobuf.Timestamp finish_time = 15;
+
+  // Why the run ended, when its state is ABORTED; unset otherwise.
+  AbortReason abort_reason = 16;
+}
+
+// The rule that ended a run and the outcome that tripped it.
+message AbortReason {
+  enum Rule {
+    RULE_UNSPECIFIED = 0;
+    RULE_CODE = 1;                      // RunLimits.abort_on_codes
+    RULE_MAX_FAILED = 2;                // RunLimits.max_failed
+    RULE_MAX_CONSECUTIVE_FAILURES = 3;  // RunLimits.max_consecutive_failures
+  }
+  Rule rule = 1;
+  // The code of the attempt that tripped the rule (empty when the attempt had none).
+  string code = 2;
+  // The task whose attempt tripped it.
+  string task_id = 3;
 }
 
 message RunStats {
@@ -58,7 +85,14 @@ message RunStats {
   uint64 duplicates = 10;
   uint64 over_budget = 11;
   map<string, uint64> by_code = 12;
-  uint64 cancelled = 13;  // dropped because the run was cancelled
+  // Dropped because the run was cancelled or aborted. Dropped by TTL or deadline: expired.
+  uint64 cancelled = 13;
+  // Queues that are blocked now and hold pending or delayed tasks of this run, so that
+  // the run's tasks wait for them. At most 20 are listed, the ones with the most waiting
+  // tasks first (ties by queue key); a run that waits on more has more than this list
+  // shows. Empty for a run that has ended. Best effort: when it cannot be read the run
+  // is returned without it. Lifecycle events (not STATS events) do not carry it.
+  repeated BlockedQueue blocked_queues = 14;
   // Final task counts per task label (TaskSpec.label). Every label the run has accepted
   // has an entry, with zero counts until a task ends; tasks without a label are not
   // listed. Counts agree with the task states: a task is counted once, when it ends.
@@ -68,6 +102,16 @@ message RunStats {
   // the result of AddTasks; a task that a handler discovers is otherwise lost without a trace.
   // Tasks of a batch that is refused because the run is closed are not counted.
   uint64 invalid = 16;
+}
+
+// A blocked queue a run waits on.
+message BlockedQueue {
+  string queue_key = 1;
+  google.protobuf.Timestamp unblock_time = 2;
+  // The code of the outcome that blocked the queue, or the reason of an operator's block.
+  string reason = 3;
+  // Pending and delayed tasks of this run on the queue.
+  uint64 waiting = 4;
 }
 
 // Tasks of one label that have ended, by how they ended. The sum of all labels is at
@@ -88,6 +132,31 @@ message RunLimits {
   // Soft: batches are rejected once reached; concurrent batches may overshoot slightly.
   uint64 max_tasks = 2;
   uint32 max_depth = 3;
+  // Rules that end the run as ABORTED (STATE_ABORTED). Each is checked in the transaction
+  // that applies an attempt's outcome, so two workers that trip a rule at once give one
+  // abort with one reason. 0 or empty: no such rule.
+  //
+  // An attempt that is recorded with one of these codes ends the run: a final failure, a
+  // retry (the attempt that asks for a retry counts, whether or not attempts remain) and
+  // a success alike. A task handed back unrun (released) records no attempt and never
+  // counts. The queue block that comes with the outcome is applied before the run ends,
+  // so a blocked site stays blocked. CreateRun rejects an empty code, a duplicate, more
+  // than 64 codes and the codes "revoked" and "shutdown", which no recorded attempt
+  // carries.
+  repeated string abort_on_codes = 4;
+  // The run ends when this many of its tasks have failed for good (no attempts left, or
+  // a failure that is not retried). Retries, expiries and drops do not count, and neither
+  // does a task whose last attempt ended because its lease expired: that is a failure of
+  // the worker fleet, not of the site, and a fleet outage must not end the run. (A run
+  // can still list the code lease_expired in abort_on_codes.)
+  uint64 max_failed = 5;
+  // The run ends when this many tasks have failed for good in a row. The order is the
+  // order in which the Frontier applies outcomes of the run, one at a time: a task that
+  // fails for good adds one, a task that succeeds resets the count to zero, and nothing
+  // else (a retry, a release, an expiry, a lease that expired) changes it. Outcomes of tasks that run at the
+  // same time count in the order they are applied, so with concurrent workers "in a row"
+  // means in the order of application, not in the order the pages were fetched.
+  uint32 max_consecutive_failures = 6;
 }
 
 message KeyRule {
@@ -111,6 +180,7 @@ message RunEvent {
     TYPE_CANCELLED = 6;
     TYPE_EXPIRED = 7;
     TYPE_STATS = 8;
+    TYPE_ABORTED = 9;
   }
   Type type = 1;
   Run run = 2;
@@ -127,7 +197,7 @@ message TaskStatus {
     STATE_SUCCEEDED = 4;
     STATE_FAILED = 5;
     STATE_EXPIRED = 6;
-    STATE_CANCELLED = 7;   // the run was cancelled before the task finished
+    STATE_CANCELLED = 7;   // the run was cancelled or aborted before the task finished
   }
   State state = 2;
   google.protobuf.Timestamp next_eligible_time = 3;

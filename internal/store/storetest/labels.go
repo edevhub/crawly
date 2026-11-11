@@ -330,6 +330,73 @@ func runLabels(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("LabelCountsDroppedByAbort", func(t *testing.T) {
+		// An abort fails one task and drops the rest as cancelled: the pending ones and
+		// the one in flight, in every queue, each under its label.
+		e := newEnv(t, f, store.Limits{})
+		r := e.runLimited(store.RunLimits{MaxFailed: 1})
+		e.addLabelled(r, 10, nil, e.labelled("q1", "a"), e.labelled("q2", "a"), e.labelled("q1", "b"), e.labelled("q2", "b"), e.labelled("q1", ""))
+		as := e.dispatch("default", 2)
+		if len(as) != 2 {
+			t.Fatalf("dispatched %d", len(as))
+		}
+		failed := as[0].Info.Label
+		e.fail(as[0], "boom")
+		if got := e.state(r); got.State != store.RunAborted {
+			t.Fatalf("state %v", got.State)
+		}
+		e.maintain()
+		by := e.byLabel(r)
+		var failures, dropped uint64
+		for _, l := range by {
+			failures += l.Failed
+			dropped += l.Cancelled
+			if l.Succeeded+l.Expired != 0 {
+				t.Fatalf("by label: %+v", by)
+			}
+		}
+		// Four labelled tasks end, each once; the one without a label is in no entry.
+		wantFailed := uint64(1)
+		if failed == "" {
+			wantFailed = 0
+		}
+		if len(by) != 2 || failures != wantFailed || failures+dropped != 4 || by[failed].FailedByCode["boom"] != wantFailed {
+			t.Fatalf("by label %+v after failing a task of %q", by, failed)
+		}
+		if st := e.state(r).Stats; st.Cancelled != 4 {
+			t.Fatalf("run counters: %+v", st)
+		}
+	})
+
+	t.Run("LabelCountsTasksFailedWithoutHandler", func(t *testing.T) {
+		// The sweep fails tasks that no session can run, with the code no_handler.
+		const grace = time.Hour
+		e := newEnv(t, f, store.Limits{})
+		if err := e.s.Start(ctx, store.Replica{ID: "r1", PolicyHash: "test"}); err != nil {
+			t.Fatal(err)
+		}
+		r := e.run("r")
+		tasks := make([]store.NewTask, 0, 4)
+		for i, label := range []string{"a", "a", "b", ""} {
+			nt := e.labelled(fmt.Sprintf("q%d", i%2), label)
+			nt.Pool, nt.Handler, nt.Spec = "default", "ghost", []byte("ghost")
+			tasks = append(tasks, nt)
+		}
+		e.addLabelled(r, 10, nil, tasks...)
+		e.clock.Advance(2 * grace)
+		if err := e.s.ServeHandlers(ctx, []store.PoolHandlers{{Pool: "default", Handlers: []string{"page"}}}); err != nil {
+			t.Fatal(err)
+		}
+		e.clock.Advance(2 * grace)
+		if u, err := e.s.SweepUnserved(ctx, grace); err != nil || len(u.Failed) == 0 {
+			t.Fatalf("%+v %v", u, err)
+		}
+		e.wantLabels(r, map[string]store.LabelStats{
+			"a": {Failed: 2, FailedByCode: map[string]uint64{store.CodeNoHandler: 2}},
+			"b": {Failed: 1, FailedByCode: map[string]uint64{store.CodeNoHandler: 1}},
+		})
+	})
+
 	t.Run("LabelOnTasks", func(t *testing.T) {
 		e := newEnv(t, f, store.Limits{})
 		r := e.run("r")

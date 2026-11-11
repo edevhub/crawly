@@ -51,6 +51,12 @@ change the schema on its own and refuses to start on a database that is behind i
 The migrations are recorded in the table `crawly_migrations`; to use another name, pass
 `-postgres-migrations-table` (or `CRAWLY_POSTGRES_MIGRATIONS_TABLE`) to both commands.
 
+A migration only adds to the schema, so the replicas of the previous version keep running on
+a migrated database, and you can migrate first and then roll the replicas. Indexes on the
+task tables are built without blocking writes, so on a large database `migrate` can take a
+while; running it again finishes an interrupted build. To go back, stop the new replicas and
+start the old ones; the added tables stay until a later migration removes what they replace.
+
 `-postgres` takes the same URL. When that URL goes through a transaction pooler such as
 PgBouncer, give the Frontier a direct one for `LISTEN` with `-postgres-listen` (or
 `CRAWLY_POSTGRES_LISTEN`).
@@ -136,7 +142,7 @@ err := w.Register("render", worker.HandlerFunc(func(ctx context.Context, t *work
 }), worker.InPool("browser"), worker.WithTimeout(2*time.Minute))
 ```
 
-One worker can register any number of handlers. A task is routed by its handler name.
+One worker can register any number of handlers. A task is routed by its handler name: the worker is given only tasks of the handlers it registered.
 
 ### Options
 
@@ -169,6 +175,7 @@ Outcomes are plain Go errors:
 | `worker.Retry(code, err)` | Transient failure; retried with backoff up to the policy's `max_attempts` |
 | `worker.Retry(code, err, worker.After(d))` | The same, and not before `d` |
 | `worker.Retry(code, err, worker.BlockQueue(d))` | The same, and the whole site is paused for `d`, for every run |
+| `worker.Retry(code, err, worker.Strain())` | The same, and the failure says the site is under strain: its queue slows down (see Policies) |
 | `worker.Fail(code, err)` | Permanent failure; never retried |
 | any other error | Transient failure, code `error` (`timeout` for a deadline) |
 | a panic | Transient failure, code `panic` |
@@ -200,7 +207,11 @@ per category against a tolerance, without putting the section into the outcome c
   Tasks without a label are not listed. `ListTasks` takes a `label` to list one section.
 
 The HTTP adapter classifies responses itself: 2xx is parsed, 429 retries and blocks the
-site for the `Retry-After` delay, 408 and 5xx retry, other statuses fail, and a redirect is
+site for the `Retry-After` delay (without one it signals strain, see Policies), 502, 503
+and 504 retry and signal strain, 408 and the other 5xx retry, other statuses fail, request
+timeouts and connections the site refused, reset or closed retry and signal strain (a name
+that does not resolve, a proxy or certificate error and a cancelled request retry without
+it), and a redirect is
 not followed: its target is added as a new task, so that the Frontier paces and deduplicates
 it like any other page. A parser can still return
 `worker.Retry` or `worker.Fail` for a 2xx page, for example a captcha served with status 200.
@@ -356,12 +367,71 @@ func main() {
 tasks in batches; when it fails part of the way it returns the results of the batches
 that were committed together with the error, and seeding again is safe. A seed over
 1 MiB (`sdk.MaxTaskBytes`) is not sent and its result is `INVALID`. `Wait` returns the
-run once it is completed, cancelled or expired; it reconnects with backoff when the stream
+run once it is completed, cancelled, expired or aborted; it reconnects with backoff when the stream
 breaks, which happens on every restart of a Frontier, and fails with `NotFound` when the
 run does not exist. Underneath it is `WatchRuns`, a raw stream that starts with the run's
 current state when it is given a `RunId`. The other
 run calls are `PauseRun`, `ResumeRun`, `CancelRun`, `GetRun`, `ListRuns`, `ListTasks` and
 `GetTask`. `c.Queues` and `c.Policies` are the operator APIs.
+
+### Ending a run on an outcome
+
+Without further rules a sealed run ends when it has nothing left to do, however long that
+takes: a site that blocks the crawler for 72 hours holds the run's tasks for 72 hours. Three
+limits end a run early, as `ABORTED`, in the same transaction that applies the outcome that
+trips them:
+
+```go
+c.Runs.CreateRun(ctx, &run.CreateRunRequest{
+	RunId: id,
+	Limits: &run.Limits{
+		AbortOnCodes:           []string{worker.CodeBlocked},
+		MaxFailed:              500,
+		MaxConsecutiveFailures: 20,
+	},
+})
+```
+
+- `AbortOnCodes`: an attempt recorded with one of these codes ends the run. It counts
+  whether the attempt is a final failure, a retry or a success; a task a worker handed back
+  without running it records no attempt and does not count. The queue block that came with
+  the outcome stays: only the run goes.
+- `MaxFailed`: the run ends when that many tasks have failed for good. Retries do not count.
+- `MaxConsecutiveFailures`: the run ends when that many tasks have failed for good in a row.
+  A success resets the count; a retry does not change it. The Frontier applies the outcomes
+  of a run one at a time, and "in a row" is that order, which with several workers is not
+  the order in which the pages were fetched.
+
+Lease expiries are not counted by `MaxFailed` or `MaxConsecutiveFailures`: a task whose last
+attempt ended because its worker vanished did not fail because of the site, and an outage of
+the worker fleet must not end the run. List `lease_expired` in `AbortOnCodes` to end it on
+one anyway.
+
+**Rollout.** Use the rules only after every Frontier replica runs a build that has them,
+then upgrade the schedulers. Older Frontiers ignore the fields, and an older replica takes
+an aborted run for a live one. With PostgreSQL, `CreateRun` with rules is refused while a
+replica that does not know them is still reporting, and the SDK fails `CreateRun` with
+`FailedPrecondition` when the answer lacks the rules it sent (the run then exists without
+them: cancel it and create it again). To go back to an older Frontier, run the migration's
+Down step first; it turns aborted runs into cancelled ones. See ADR 0002.
+
+`CreateRun` rejects an empty or repeated code, more than 64 codes, and the codes `revoked`
+and `shutdown`, which no recorded attempt carries. When two rules trip at once the code rule
+wins, then the streak, then the total; workers that trip a rule at the same moment give one
+abort and one reason.
+
+An aborted run is as final as a cancelled one: its remaining tasks are dropped and counted
+as `cancelled`, the handlers still running its tasks are revoked, and its state is
+`run.StateAborted`. What `Wait` returns and what `WatchRuns` ends with (`run.EventAborted`)
+carries `AbortReason`: the rule (`run.AbortOnCode`, `run.AbortMaxFailed` or
+`run.AbortConsecutiveFailures`), the code of the attempt and the task that tripped it. That
+tells an abort from an operator's `CancelRun`.
+
+A run whose tasks wait for a blocked queue says so: `Stats.BlockedQueues` lists the queues
+that are blocked now and hold pending or delayed tasks of the run, each with the time the
+block ends, its reason and the number of the run's tasks waiting there. A run can touch many
+queues, so the list holds at most 20, those with the most waiting tasks first, and it is
+empty once the run has ended.
 
 A run can set limits for itself, for every site or for the sites a glob matches:
 
@@ -391,6 +461,43 @@ per second, 2 concurrent).
 ```
 
 These are the global policies. A run's own policy is given at `CreateRun` (see above).
+
+### Slowing down a site that is struggling
+
+A fixed rate does not follow the site. When a spider reports a failure as a sign of strain
+on the site (the HTTP adapter does for 502, 503 and 504, a 429 without `Retry-After`, a
+request that timed out and a connection the site refused or reset; `worker.Strain()` does
+for a handler that fetches by itself), the site's queue halves its rate, down to one request
+a minute, and its concurrency and burst come down in the same proportion. Requests that fail
+together are one step. Each answer from the site that is no sign of strain (a success, a
+404) then raises the rate again by a tenth of the policy's rate, until the queue is back at
+the policy. A run's own limits do not escape it. A task keeps a budget of its own for such
+failures, `maxStrainAttempts` (10), next to `maxAttempts` for the others, so a site that was
+down for a while does not cost pages. Once the queue has sat at its ceiling for `maxOutage`
+(10 minutes) the site counts as down, and strain failures count against `maxAttempts`
+again. A site that stays down still takes a while to drain, about one task per ceiling
+interval: lower `maxInterval` or `maxAttempts` for sites where that is too slow. The queue's
+state is shared by all runs and all Frontier replicas, and `GetQueue` shows it
+(`current_interval`, `strain_steps`, `last_strain_time`). `BlockQueue` with no time, the
+operator's unblock, resets it; a slowdown nothing has touched for `maxOutage` is forgotten.
+
+It is on by default, and a global policy tunes or switches it off per site:
+
+```json
+{"name": "fragile", "match": {"queueKey": "*.example.com"},
+ "limits": {"ratePerSecond": 5, "adaptive": {"maxInterval": "300s", "decreaseFactor": 0.5, "recoveryStep": 0.1}},
+ "behaviour": {"maxStrainAttempts": 20}}
+```
+
+`"adaptive": {"enabled": false}` keeps the rate fixed. The settings belong to the site, so a
+run that sets `adaptive` is rejected. A queue without a rate limit is never slowed.
+
+Upgrading: roll out the Frontier binaries before a policy file that names `adaptive` or
+`maxStrainAttempts` (an older Frontier rejects fields it does not know). Nothing changes
+for a queue until its workers run the new SDK, which is what sends the signal. From then on
+a default install slows a failing site as described, with a ceiling of one request a
+minute and 10 strain attempts per task. To keep the old behaviour everywhere, add
+`{"name": "no-adaptive", "limits": {"adaptive": {"enabled": false}}}` to the policies.
 
 A spider that finds the crawler blocked asks the Frontier to leave the site alone
 (`worker.Blocked(d)`, or `worker.BlockQueue(d)` on any outcome). One outcome blocks a site
@@ -433,12 +540,23 @@ monthly partitions, and `-retain-tasks 2160h` drops a partition once every run i
 older than that and has no work left; the in-memory store deletes a run's tasks with the
 run.
 
-**Deploys.** A worker that is given a task for a handler it does not have hands the task
-back, and the Frontier gives it to another worker of the pool. A rolling deploy that adds
-or renames a handler therefore loses nothing while both builds run. A task whose handler no
-worker has fails with code `no_handler` after `-no-handler-grace` (one hour by default). A
-worker that stops lets its handlers finish for `WithShutdownGrace`, then cancels them and
-hands their tasks back, so a deploy never uses up a task's attempts.
+**Deploys.** A worker tells the Frontier which handlers it registered, and the Frontier
+gives it only tasks of those handlers. In a rolling deploy that adds or renames a handler,
+the workers of the old build are never given the new handler's tasks and the new ones are
+given them at once: no task goes round, none is dispatched twice, and none is lost. A task
+whose handler no worker has waits in its queue without using a politeness slot. It fails
+with code `no_handler` when no Frontier replica has had a session with the handler for
+`-no-handler-grace` (one hour by default; counted in the store, so a restart does not reset
+it, but nothing fails until that time has passed since the newest replica started). A
+worker of an older SDK counts as able to run any handler of its pool, so while one is
+connected no task of its pool fails this way. The Frontier logs each failure at `WARN`, and,
+once in a while, each handler whose tasks wait, with the number of queues and runs that
+have them; failed tasks are found by code `no_handler`. A worker
+that stops lets its handlers finish for `WithShutdownGrace`, then cancels them and hands
+their tasks back, so a deploy never uses up a task's attempts. Workers of an older SDK name
+no handlers: they are offered every task of their pool and hand back the ones they cannot
+run, as they did before, and a Frontier of an older version offers every task to every
+worker. Either can be upgraded first.
 
 **Logs.** A lease that expires is logged at `WARN` with its run, task and queue: the worker
 that held it has died or is stuck.

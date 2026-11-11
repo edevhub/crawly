@@ -57,6 +57,11 @@ message Outcome {
   // Retry-After header on a 429. Extends, never shortens, an existing block.
   // Capped by the queue's policy (Behaviour.max_queue_block, 24 hours by default).
   google.protobuf.Duration block_queue_for = 5;
+  // The failure is a sign that the site is under strain (a 503, a timeout, slow
+  // answers): the queue slows down, and the task is retried against
+  // Behaviour.max_strain_attempts instead of max_attempts. Absent on an older worker,
+  // which means no strain. Ignored for RELEASED.
+  bool strain = 6;
 }
 
 message FetchInfo {

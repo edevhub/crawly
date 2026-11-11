@@ -23,10 +23,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/edevhub/crawly/internal/wire"
@@ -61,11 +64,37 @@ func NewClient(target string, dial ...grpc.DialOption) (*Client, error) {
 	if len(dial) == 0 {
 		return nil, errors.New("sdk: transport security is required: pass grpc.WithTransportCredentials, or sdk.WithInsecure for plaintext")
 	}
-	conn, err := grpc.NewClient(target, dial...)
+	conn, err := grpc.NewClient(target, append(dial, grpc.WithChainUnaryInterceptor(checkAbortRules))...)
 	if err != nil {
 		return nil, err
 	}
 	return &Client{Runs: run.NewClient(conn), Policies: policy.NewClient(conn), Queues: queue.NewClient(conn), conn: conn}, nil
+}
+
+// checkAbortRules fails a CreateRun whose abort rules the Frontier did not keep. A
+// Frontier of a build that predates the rules ignores the fields it does not know and
+// creates the run without them, and so does an idempotent retry that reaches a replica
+// of such a build first. The answer carries the run's limits, so the rules that were
+// asked for and are missing are seen here, and a crawl that would have waited out a
+// block is not started by mistake. The run exists: cancel it, or create it again once
+// every Frontier replica is upgraded.
+func checkAbortRules(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	err := invoker(ctx, method, req, reply, cc, opts...)
+	rq, ok := req.(*run.CreateRunRequest)
+	rp, ok2 := reply.(*run.CreateRunResponse)
+	if err != nil || !ok || !ok2 {
+		return err
+	}
+	want, got := rq.GetLimits(), rp.GetRun().GetLimits()
+	if len(want.GetAbortOnCodes()) == 0 && want.GetMaxFailed() == 0 && want.GetMaxConsecutiveFailures() == 0 {
+		return nil
+	}
+	if !slices.Equal(want.GetAbortOnCodes(), got.GetAbortOnCodes()) || want.GetMaxFailed() != got.GetMaxFailed() ||
+		want.GetMaxConsecutiveFailures() != got.GetMaxConsecutiveFailures() {
+		return status.Errorf(codes.FailedPrecondition,
+			"sdk: run %q exists without the abort rules asked for: the Frontier does not support them (or a replica that does not created it)", rq.GetRunId())
+	}
+	return nil
 }
 
 // Close closes the connection.
