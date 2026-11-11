@@ -206,7 +206,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	// Keepalive pings notice a Frontier that vanished without closing the connection.
 	// The caller's options come last, so they can override it.
 	dial := append([]grpc.DialOption{grpc.WithKeepaliveParams(keepalive.ClientParameters{
-		Time: 30 * time.Second, Timeout: 10 * time.Second})}, w.dial...)
+		Time: 30 * time.Second, Timeout: 10 * time.Second}),
+		// An assignment is a task with what the Frontier adds to it. The room above the
+		// task limit takes a task that was stored before there was one.
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxAssignmentBytes))}, w.dial...)
 	conn, err := grpc.NewClient(w.target, dial...)
 	if err != nil {
 		return err
@@ -296,7 +299,9 @@ func (r *runner) run(ctx context.Context) {
 			wait = 200 * time.Millisecond
 		}
 		if status.Code(err) == codes.ResourceExhausted {
-			r.dropRefused()
+			// The next session can do better at once: nothing is gained by waiting.
+			r.failRefused()
+			wait = 200 * time.Millisecond
 		}
 		r.w.log.Warn("session ended, reconnecting", "pool", r.pool, "err", err, "in", wait)
 		select {
@@ -470,25 +475,52 @@ func (r *runner) sendReportLocked(rep *report) {
 	_ = r.stream.Send(&workerv1.WorkRequest{Msg: &workerv1.WorkRequest_Complete{Complete: rep.complete}})
 }
 
-// dropRefused gives up the oldest report of the session that just ended. The Frontier
-// closed that session because a message was too large for it, and a report is resent
-// first on every new session: keeping it would end each of them the same way. The
-// task's lease expires and the Frontier gives the task out again.
-func (r *runner) dropRefused() {
+// CodeReportTooLarge is the code of a task that failed because the Frontier refused
+// its report as too large.
+const CodeReportTooLarge = "report_too_large"
+
+// refusable is the size from which a message can be what a Frontier refused as too
+// large. A session can also end with that status for a message of the Frontier's, and
+// then no report of the worker's is at fault.
+const refusable = 4 << 10
+
+// failRefused ends the task whose report the Frontier refused as too large. The
+// session that just ended was closed for a message over the Frontier's limit, and a
+// report is resent first on every new session: kept as it is, it would end each of
+// them the same way, and left to its lease, the handler would build the same report
+// on every attempt. The report is replaced by a permanent failure without discovered
+// tasks. The batches the Frontier took before the refusal stay added.
+//
+// The report at fault is the one with the largest message among those sent on that
+// session: whatever was refused, that one would be refused as well.
+func (r *runner) failRefused() {
 	r.sendMu.Lock()
-	gen := r.gen
-	r.sendMu.Unlock()
+	defer r.sendMu.Unlock()
 	r.mu.Lock()
-	i := slices.IndexFunc(r.unacked, func(rep *report) bool { return rep.sentGen == gen })
-	var lease string
-	if i >= 0 {
-		lease = r.unacked[i].leaseID
-		r.unacked = slices.Delete(r.unacked, i, i+1)
+	var worst *report
+	largest := refusable
+	for _, rep := range r.unacked {
+		if rep.sentGen != r.gen {
+			continue
+		}
+		for _, b := range rep.batches {
+			if n := proto.Size(b); n > largest {
+				worst, largest = rep, n
+			}
+		}
+		if n := proto.Size(rep.complete); n > largest {
+			worst, largest = rep, n
+		}
+	}
+	if worst != nil {
+		worst.batches = nil
+		worst.complete = &workerv1.Complete{LeaseId: worst.leaseID, Attempt: worst.complete.GetAttempt(), Fetch: worst.complete.GetFetch(),
+			Outcome: &taskv1.Outcome{Kind: taskv1.Outcome_KIND_FAILED, Code: CodeReportTooLarge,
+				Message: fmt.Sprintf("the frontier refused a message of %d bytes of the task's report", largest)}}
 	}
 	r.mu.Unlock()
-	if i >= 0 {
-		r.w.log.Error("the frontier refused a report as too large; the report is dropped", "pool", r.pool, "lease", lease)
-		r.checkIdle()
+	if worst != nil {
+		r.w.log.Error("the frontier refused a report as too large; its task is failed", "pool", r.pool, "lease", worst.leaseID, "bytes", largest)
 	}
 }
 
@@ -651,6 +683,9 @@ func (r *runner) heartbeat(ctx context.Context, a *active, d time.Duration) (sto
 // batchSize is how many discovered tasks go into one DiscoverBatch at most. A batch
 // is also bounded by its size in bytes.
 const batchSize = 200
+
+// maxAssignmentBytes is the largest message the worker takes from the Frontier.
+const maxAssignmentBytes = 8 << 20
 
 // CodeTaskTooLarge is the code of a task that failed because one of the tasks it
 // discovered exceeds MaxTaskBytes.

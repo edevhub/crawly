@@ -117,6 +117,24 @@ func TestSeed(t *testing.T) {
 		}
 	}
 
+	// The Frontier holds the limit itself, for callers that do not use Seed.
+	stream, err := c.Runs.AddTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&run.AddTasksRequest{RunId: "seed", BatchId: "raw", Tasks: []*task.Spec{large[30],
+		{Request: &task.Request{Url: "https://big.example/after"}, Handler: "page"}}}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := stream.Recv()
+	if err != nil || len(raw.GetResults()) != 2 || raw.GetResults()[0].GetStatus() != task.StatusInvalid ||
+		raw.GetResults()[1].GetStatus() != task.StatusAdded {
+		t.Fatalf("a task over the limit sent to the Frontier: %v %v", raw.GetResults(), err)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatal(err)
+	}
+
 	// Seeding nothing is not an error.
 	if res, err := c.Seed(ctx, "seed"); err != nil || len(res) != 0 {
 		t.Fatalf("empty seed: %v %v", res, err)

@@ -635,8 +635,8 @@ func TestLargeDiscoveries(t *testing.T) {
 	}
 }
 
-// TestRefusedReport: a report the Frontier refuses as too large is given up, and the
-// worker carries on with other work.
+// TestRefusedReport: a report the Frontier refuses as too large fails its task, once,
+// and the worker carries on with the reports and the work around it.
 func TestRefusedReport(t *testing.T) {
 	e := newEnv(t)
 	e.f.Stop()
@@ -650,13 +650,14 @@ func TestRefusedReport(t *testing.T) {
 	register(t, w, "page", noop)
 	e.start(w)
 
-	e.open("refused", nil, spec("https://a.example/list", "list"))
-	// The run that follows is served while the first one's report keeps being refused.
-	if st := e.crawl("after", nil, spec("https://b.example/", "page")); st.GetSucceeded() != 1 {
-		t.Fatalf("stats: %v", st)
+	seeds := make([]*task.Spec, 0, 21)
+	seeds = append(seeds, spec("https://a.example/list", "list"))
+	for i := range 20 { // reports around the refused one
+		seeds = append(seeds, spec("https://b.example/"+strconv.Itoa(i), "page"))
 	}
-	// The refused task is tried until its attempts run out, each ending with its lease.
-	if st := e.wait("refused"); st.GetFailed() != 1 || st.GetByCode()["lease_expired"] == 0 {
-		t.Fatalf("stats: %v", st)
+	st := e.crawl("refused", nil, seeds...)
+	if st.GetSucceeded() != 20 || st.GetFailed() != 1 || st.GetByCode()[worker.CodeReportTooLarge] != 1 ||
+		st.GetAttempts() != 21 || st.GetByCode()["lease_expired"] != 0 {
+		t.Fatalf("the refused task must fail on its first attempt and nothing else: %v", st)
 	}
 }

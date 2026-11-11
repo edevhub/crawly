@@ -76,9 +76,17 @@ This ADR borrows it.
   new `DiscoverBatch` by count and by size, and a handler that returns a task over the
   limit fails its own task for good with code `task_too_large`, with none of its tasks
   added. The same bounds apply to seeds.
-- A report the Frontier refuses with `RESOURCE_EXHAUSTED` is final for that report: the SDK
-  drops it instead of resending it on the next session, where it would end the session
-  again. The task's lease expires and the task is retried.
+- A report the Frontier refuses with `RESOURCE_EXHAUSTED` is final for that report. The
+  bounds above keep the SDK's messages under gRPC's default limit, so this happens only
+  against a Frontier with a lower one. Resent as it is, the report would end every new
+  session; left to its lease, the handler would build the same report on every attempt.
+  The SDK therefore replaces it with `FAILED`, code `report_too_large`, without discovered
+  tasks. The batches the Frontier took before the refusal stay added.
+- The bounds are enforced by each side from its own version on. A worker of an older SDK
+  still sends batches bounded by count only, and does not look at the result of each
+  discovered task, so a task over 1 MiB that a new Frontier answers with `INVALID` is
+  dropped without a sign on that worker. Workers are upgraded with the Frontier, or
+  before it.
 
 ### Leases and heartbeats
 

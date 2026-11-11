@@ -13,12 +13,12 @@ const (
 	// MaxTaskBytes is the largest task the Frontier accepts, as the encoded size of its
 	// spec: request, headers, body and context together.
 	MaxTaskBytes = 1 << 20
-	// MaxBatchBytes is how much a batch of tasks holds before the next one starts. A
-	// batch can exceed it by one task at most, which keeps it under gRPC's limit.
+	// MaxBatchBytes is how much the tasks of one batch weigh at most. What the message
+	// adds around them, ids and framing, is a few KiB: far from gRPC's limit.
 	MaxBatchBytes = 2 << 20
 )
 
-// Batches splits tasks into consecutive batches of at most maxTasks tasks and about
+// Batches splits tasks into consecutive batches of at most maxTasks tasks and
 // MaxBatchBytes each, and calls yield with the bounds of each one. The tasks must be
 // within MaxTaskBytes.
 func Batches(tasks []*taskv1.TaskSpec, maxTasks int, yield func(from, to int)) {

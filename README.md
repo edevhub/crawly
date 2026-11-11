@@ -205,7 +205,8 @@ a site needs special rules: case-insensitive paths, tracking parameters, POST bo
 A task is limited to 1 MiB (`worker.MaxTaskBytes`): URL, headers, body and `Context`
 together. A handler that returns a larger one fails its own task with code
 `task_too_large`. Any number of tasks can be returned from one handler: the SDK sends them
-in batches bounded by count and by size.
+in batches bounded by count and by size. Upgrade the workers with the Frontier or before
+it: a worker of an older SDK does not notice a task the Frontier refuses for its size.
 
 ## Scheduling a run
 
