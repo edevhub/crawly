@@ -154,9 +154,9 @@ type httpHandler struct {
 //     same host is the same name and port as written: "example.com" and
 //     "www.example.com" are two. The body goes along in every case, as it does in
 //     browsers and HTTP clients; a spider whose body carries a secret changes the
-//     task with WithRedirect. A
-//     redirect to the task's own URL would only be dropped as a duplicate, so it is a
-//     permanent failure with code "redirect_loop";
+//     task with WithRedirect. A redirect that asks for the very request the task made
+//     would only be dropped as a duplicate, so it is a permanent failure with code
+//     "redirect_loop";
 //   - 429: retry, and the queue is blocked for the Retry-After delay when the site sent one;
 //   - 408 and 5xx: retry;
 //   - any other status: permanent failure;
@@ -259,11 +259,16 @@ func (h *httpHandler) Handle(ctx context.Context, t *Task) (*Result, error) {
 		if err != nil {
 			return &Result{Fetch: fetch}, Fail(code, fmt.Errorf("redirect without a usable Location: %w", err))
 		}
-		if sameURL(loc, resp.Request.URL) {
+		// 307 and 308 repeat the request; the other redirects ask for a GET.
+		repeats := resp.StatusCode == http.StatusTemporaryRedirect || resp.StatusCode == http.StatusPermanentRedirect
+		plainGet := t.Method == http.MethodGet && len(t.Body) == 0
+		if sameURL(loc, resp.Request.URL) && (repeats || plainGet) {
+			// The target is the request the task just made. A POST that is answered
+			// with a 303 to its own URL is not: the GET it asks for is another request.
 			return &Result{Fetch: fetch}, Fail("redirect_loop", errors.New("the page redirects to itself"))
 		}
 		next := NewTask{URL: loc.String(), Context: t.Context}
-		if resp.StatusCode == http.StatusTemporaryRedirect || resp.StatusCode == http.StatusPermanentRedirect {
+		if repeats {
 			// 307 and 308 repeat the request as it was.
 			next.Method, next.Body, next.Header = t.Method, t.Body, redirectHeader(t.Header, resp.Request.URL, loc)
 		}

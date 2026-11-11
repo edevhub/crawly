@@ -13,6 +13,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -425,6 +426,11 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 		}
 		stored := proto.CloneOf(ts)
 		stored.QueueKey, stored.Pool = queue, string(pool)
+		if stored.GetRequest().GetMethod() != "" {
+			// Methods are case-sensitive on the wire. One spelling is stored and sent,
+			// the one the dedup key counts, so that "post" and "POST" are one request.
+			stored.Request.Method = strings.ToUpper(stored.GetRequest().GetMethod())
+		}
 		raw, err := proto.Marshal(stored)
 		if err != nil {
 			out[i].Invalid = true

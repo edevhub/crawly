@@ -225,8 +225,10 @@ res.Tasks = append(res.Tasks, worker.NewTask{
 ```
 
 Discovered tasks are deduplicated per run by a normalised URL (scheme + host + path +
-sorted query; scheme and host lowercased, path and query as they are). Set `DedupKey` when
-a site needs special rules: case-insensitive paths, tracking parameters, POST bodies.
+sorted query; scheme and host lowercased, path and query as they are). A method other
+than GET and a body that is not empty are part of the key as well, so the pages of a
+search API behind one URL are separate tasks. Set `DedupKey` when a site needs special
+rules: case-insensitive paths, tracking parameters, requests told apart by a header.
 
 A task is limited to 1 MiB (`worker.MaxTaskBytes`): URL, headers, body and `Context`
 together. A handler that returns a larger one fails its own task with code
