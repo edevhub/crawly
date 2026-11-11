@@ -14,8 +14,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -23,6 +26,7 @@ import (
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/poolname"
 	"github.com/edevhub/crawly/internal/safeconv"
+	"github.com/edevhub/crawly/internal/wire"
 )
 
 // DefaultPool is the pool a handler serves unless registered with InPool.
@@ -291,6 +295,9 @@ func (r *runner) run(ctx context.Context) {
 		if time.Since(started) > 10*time.Second {
 			wait = 200 * time.Millisecond
 		}
+		if status.Code(err) == codes.ResourceExhausted {
+			r.dropRefused()
+		}
 		r.w.log.Warn("session ended, reconnecting", "pool", r.pool, "err", err, "in", wait)
 		select {
 		case <-base.Done():
@@ -463,6 +470,28 @@ func (r *runner) sendReportLocked(rep *report) {
 	_ = r.stream.Send(&workerv1.WorkRequest{Msg: &workerv1.WorkRequest_Complete{Complete: rep.complete}})
 }
 
+// dropRefused gives up the oldest report of the session that just ended. The Frontier
+// closed that session because a message was too large for it, and a report is resent
+// first on every new session: keeping it would end each of them the same way. The
+// task's lease expires and the Frontier gives the task out again.
+func (r *runner) dropRefused() {
+	r.sendMu.Lock()
+	gen := r.gen
+	r.sendMu.Unlock()
+	r.mu.Lock()
+	i := slices.IndexFunc(r.unacked, func(rep *report) bool { return rep.sentGen == gen })
+	var lease string
+	if i >= 0 {
+		lease = r.unacked[i].leaseID
+		r.unacked = slices.Delete(r.unacked, i, i+1)
+	}
+	r.mu.Unlock()
+	if i >= 0 {
+		r.w.log.Error("the frontier refused a report as too large; the report is dropped", "pool", r.pool, "lease", lease)
+		r.checkIdle()
+	}
+}
+
 func (r *runner) ackBatch(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -619,8 +648,18 @@ func (r *runner) heartbeat(ctx context.Context, a *active, d time.Duration) (sto
 	return func() { close(done) }
 }
 
-// batchSize is how many discovered tasks go into one DiscoverBatch.
+// batchSize is how many discovered tasks go into one DiscoverBatch at most. A batch
+// is also bounded by its size in bytes.
 const batchSize = 200
+
+// CodeTaskTooLarge is the code of a task that failed because one of the tasks it
+// discovered exceeds MaxTaskBytes.
+const CodeTaskTooLarge = "task_too_large"
+
+// MaxTaskBytes is the largest task the Frontier accepts: URL, headers, body and
+// Context together, as encoded on the wire. A handler that returns a larger one fails
+// its own task for good with CodeTaskTooLarge, and none of its tasks is added.
+const MaxTaskBytes = wire.MaxTaskBytes
 
 func buildReport(a *active, task *Task, res *Result, err error, poolFor func(handler string) string) *report {
 	if res == nil {
@@ -629,6 +668,17 @@ func buildReport(a *active, task *Task, res *Result, err error, poolFor func(han
 	out := &taskv1.Outcome{Kind: taskv1.Outcome_KIND_SUCCESS, Code: res.Code}
 	if res.BlockQueueFor > 0 {
 		out.BlockQueueFor = durationpb.New(res.BlockQueueFor)
+	}
+	var specs []*taskv1.TaskSpec
+	if err == nil {
+		specs = make([]*taskv1.TaskSpec, len(res.Tasks))
+		for i := range res.Tasks {
+			specs[i] = taskSpec(task, res.Tasks[i], poolFor)
+			if n := proto.Size(specs[i]); n > MaxTaskBytes && err == nil {
+				err = Fail(CodeTaskTooLarge, fmt.Errorf("discovered task %d (%s) is %d bytes, the limit is %d",
+					i, truncate(res.Tasks[i].URL, 200), n, MaxTaskBytes))
+			}
+		}
 	}
 	if err != nil {
 		e := classify(err)
@@ -653,14 +703,10 @@ func buildReport(a *active, task *Task, res *Result, err error, poolFor func(han
 	if err != nil {
 		return rep // discovered tasks are reported only for a task that succeeded
 	}
-	for i := 0; i < len(res.Tasks); i += batchSize {
-		b := &workerv1.DiscoverBatch{LeaseId: a.leaseID, Attempt: a.attempt, BatchId: fmt.Sprintf("%s/%d", a.leaseID, i/batchSize)}
-		chunk := res.Tasks[i:min(i+batchSize, len(res.Tasks))]
-		for j := range chunk {
-			b.Tasks = append(b.Tasks, taskSpec(task, chunk[j], poolFor))
-		}
-		rep.batches = append(rep.batches, b)
-	}
+	wire.Batches(specs, batchSize, func(from, to int) {
+		rep.batches = append(rep.batches, &workerv1.DiscoverBatch{LeaseId: a.leaseID, Attempt: a.attempt,
+			BatchId: fmt.Sprintf("%s/%d", a.leaseID, len(rep.batches)), Tasks: specs[from:to]})
+	})
 	return rep
 }
 
