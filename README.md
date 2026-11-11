@@ -304,6 +304,12 @@ per second, 2 concurrent).
 
 These are the global policies. A run's own policy is given at `CreateRun` (see above).
 
+A spider that finds the crawler blocked asks the Frontier to leave the site alone
+(`worker.Blocked(d)`, or `worker.BlockQueue(d)` on any outcome). One outcome blocks a site
+for 24 hours at most, unless the site's policy allows more with
+`"behaviour": {"maxQueueBlock": "259200s"}` (72 hours). The ceiling is read from the global policies only,
+since a block stops every run on the site.
+
 ## Running the Frontier
 
 **Transport security.** Without flags the Frontier serves plaintext, which suits a trial

@@ -46,6 +46,7 @@ var (
 		FetchTimeout:     durationpb.New(30 * time.Second),
 		LeaseDuration:    durationpb.New(60 * time.Second),
 		MaxLeaseDuration: durationpb.New(10 * time.Minute),
+		MaxQueueBlock:    durationpb.New(24 * time.Hour),
 	}
 )
 
@@ -360,5 +361,8 @@ func mergeBehaviour(dst, src *policyv1.Behaviour, name string, prov map[string]s
 	}
 	if src.TaskTtl != nil {
 		dst.TaskTtl, prov["behaviour.task_ttl"] = src.TaskTtl, name
+	}
+	if src.MaxQueueBlock != nil {
+		dst.MaxQueueBlock, prov["behaviour.max_queue_block"] = src.MaxQueueBlock, name
 	}
 }

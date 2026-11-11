@@ -166,7 +166,7 @@ type Outcome struct {
 	RetryAfter *durationpb.Duration `protobuf:"bytes,4,opt,name=retry_after,json=retryAfter,proto3" json:"retry_after,omitempty"`
 	// Any kind: block the task's whole queue (all runs) for this long, e.g. from a
 	// Retry-After header on a 429. Extends, never shortens, an existing block.
-	// Capped at 24 hours per outcome.
+	// Capped by the queue's policy (Behaviour.max_queue_block, 24 hours by default).
 	BlockQueueFor *durationpb.Duration `protobuf:"bytes,5,opt,name=block_queue_for,json=blockQueueFor,proto3" json:"block_queue_for,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -156,7 +156,8 @@ type ErrorOption func(*Error)
 func After(d time.Duration) ErrorOption { return func(e *Error) { e.RetryAfter = d } }
 
 // BlockQueue asks the Frontier to stop dispatching the task's whole queue for the
-// duration, e.g. from a Retry-After header on a 429.
+// duration, e.g. from a Retry-After header on a 429. The queue's policy bounds it
+// (max_queue_block, 24 hours by default).
 func BlockQueue(d time.Duration) ErrorOption { return func(e *Error) { e.BlockQueueFor = d } }
 
 // Retry reports a transient failure.
