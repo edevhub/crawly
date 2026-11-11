@@ -37,6 +37,7 @@ type pool struct {
 	name     store.PoolName
 	mu       sync.Mutex
 	sessions map[*session]struct{}
+	served   uint64 // guarded by mu: counts the dispatches that handed out work
 	wake     chan struct{}
 }
 
@@ -55,6 +56,7 @@ type session struct {
 	out    chan *workerv1.WorkResponse
 
 	credits int                           // guarded by pool.mu
+	served  uint64                        // guarded by pool.mu: pool.served when it last got work; 0: never
 	goodbye bool                          // guarded by pool.mu: the worker takes no more work
 	leases  map[store.LeaseID]store.RunID // guarded by pool.mu
 
@@ -433,9 +435,11 @@ func (s *Server) dispatchLoop(ctx context.Context, p *pool) {
 func (s *Server) dispatchRound(ctx context.Context, p *pool) time.Time {
 	for ctx.Err() == nil {
 		p.mu.Lock()
+		// The session that has waited longest for work goes first, so that work is
+		// shared between the workers of a pool whatever their free credits are.
 		var sess *session
 		for c := range p.sessions {
-			if c.credits > 0 && c.ctx.Err() == nil && (sess == nil || c.credits > sess.credits) {
+			if c.credits > 0 && c.ctx.Err() == nil && (sess == nil || c.served < sess.served) {
 				sess = c
 			}
 		}
@@ -448,6 +452,12 @@ func (s *Server) dispatchRound(ctx context.Context, p *pool) time.Time {
 			return time.Time{} // a Credit wakes the loop
 		}
 		res, err := s.store.Dispatch(ctx, store.DispatchRequest{Session: sess.id, Worker: sess.worker, Pool: p.name, Slots: slots})
+		if len(res.Assignments) > 0 {
+			p.mu.Lock()
+			p.served++
+			sess.served = p.served
+			p.mu.Unlock()
+		}
 		// Assignments returned are committed and must be delivered, error or not.
 		for i := range res.Assignments {
 			a := &res.Assignments[i]

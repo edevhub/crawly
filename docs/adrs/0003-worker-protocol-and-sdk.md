@@ -47,9 +47,12 @@ This ADR borrows it.
   it cannot serve. Flow control (how many credits, how fast) lives entirely in the worker,
   through the SDK's tuner (below).
 - **One dispatch loop per pool on each replica** holds the free credits of that pool's
-  sessions. It asks the store for work for the session with the most free credits and
-  sends it the assignments. A loop per session would wake every idle session at the same
-  moment for one task.
+  sessions. It asks the store for work for the session that has waited longest since it
+  was last given work, for as many tasks as that session has credits, and sends it the
+  assignments. Work is therefore shared between the workers of a pool in turns, whatever
+  their free credits are: a worker that holds a long task still gets its turn, and adding
+  a worker spreads the load at once. A loop per session would wake every idle session at
+  the same moment for one task.
 
 ### Message order
 
