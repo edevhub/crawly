@@ -575,6 +575,7 @@ func Run(t *testing.T, f Factory) {
 		if st := e.finish(held, store.ResultSucceeded); st != store.FinishStale {
 			t.Fatalf("completion after cancel: %v", st)
 		}
+		e.maintain() // the backlog of a cancelled run drains eventually
 		if st := e.state(r).Stats; st.Cancelled != 4 || st.Pending != 0 || st.InFlight != 0 {
 			t.Fatalf("drained: %+v", st)
 		}
@@ -591,6 +592,7 @@ func Run(t *testing.T, f Factory) {
 		if as := e.dispatch("default", 1); len(as) != 0 {
 			t.Fatal("an expired task was dispatched")
 		}
+		e.maintain() // expired tasks are removed eventually
 		if st := e.state(r); st.State != store.RunCompleted || st.Stats.Expired != 1 {
 			t.Fatalf("after TTL: %+v", st)
 		}

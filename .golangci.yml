@@ -73,6 +73,9 @@ linters:
         - shadow # err shadowing is idiomatic
     misspell:
       locale: UK
+      ignore-rules:
+        - sanitize # pgx.Identifier.Sanitize
+        - materialized # the SQL keyword
     nolintlint:
       require-explanation: true
       require-specific: true
@@ -109,6 +112,10 @@ linters:
     paths:
       - internal/gen
       - reference
+    rules:
+      - path: _test\.go
+        linters: [gosec]
+        text: "G404" # tests pick random workloads; they need no cryptographic randomness
 
 issues:
   max-issues-per-linter: 0

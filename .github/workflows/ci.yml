@@ -12,6 +12,19 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: crawly
+          POSTGRES_DB: crawly
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d crawly"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -31,4 +44,14 @@ jobs:
         with:
           version: v2.15.0
       - name: Test
+        env:
+          # Without it the tests of the PostgreSQL store are skipped.
+          CRAWLY_TEST_POSTGRES: postgres://postgres:crawly@localhost:5432/crawly
         run: go test -race -count=1 ./...
+      - name: The PostgreSQL store was tested
+        env:
+          CRAWLY_TEST_POSTGRES: postgres://postgres:crawly@localhost:5432/crawly
+        run: |
+          # A skipped suite passes: make sure the conformance suite really ran.
+          go test -count=1 -run 'TestConformance$' -v ./internal/store/pgstore/ | tee /tmp/pgstore.log
+          grep -q -- '--- PASS: TestConformance ' /tmp/pgstore.log
