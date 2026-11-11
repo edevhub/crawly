@@ -250,7 +250,8 @@ type Behaviour struct {
 	TaskTtl *durationpb.Duration `protobuf:"bytes,7,opt,name=task_ttl,json=taskTtl,proto3" json:"task_ttl,omitempty"`
 	// The longest one outcome can block the queue for (Outcome.block_queue_for). A block
 	// stops every run on the queue, so the ceiling belongs to the queue: it is read from
-	// the global policies only, and a run's own behaviour cannot change it. Default 24h.
+	// the global policies only, and a run that sets it is rejected. Must be positive.
+	// Default 24h.
 	MaxQueueBlock *durationpb.Duration `protobuf:"bytes,8,opt,name=max_queue_block,json=maxQueueBlock,proto3" json:"max_queue_block,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

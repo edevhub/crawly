@@ -27,7 +27,24 @@ func TestQueueBlockCeiling(t *testing.T) {
 		t.Fatal(err)
 	}
 	asked := &taskv1.Outcome{Kind: taskv1.Outcome_KIND_FAILED, Code: "blocked", BlockQueueFor: durationpb.New(100 * time.Hour)}
-	greedy := &policyv1.RunPolicy{Behaviour: &policyv1.Behaviour{MaxQueueBlock: durationpb.New(1000 * time.Hour)}}
+	// CreateRun rejects such a policy; one that got through must still change nothing.
+	greedy := &policyv1.RunPolicy{Behaviour: &policyv1.Behaviour{MaxQueueBlock: durationpb.New(1000 * time.Hour)},
+		Overrides: []*policyv1.RunQueueOverride{{QueueKey: "*", Behaviour: &policyv1.Behaviour{MaxQueueBlock: durationpb.New(2000 * time.Hour)}}}}
+	if err := policy.ValidateRun(greedy); err == nil {
+		t.Error("a run that sets the ceiling must be rejected")
+	}
+	if err := policy.ValidateRun(&policyv1.RunPolicy{Overrides: greedy.GetOverrides()}); err == nil {
+		t.Error("a run override that sets the ceiling must be rejected")
+	}
+	if r := pol.Resolve(greedy, "shop.example"); r.Behaviour.GetMaxQueueBlock().AsDuration() != 72*time.Hour ||
+		r.Provenance["behaviour.max_queue_block"] != "cooldown" {
+		t.Errorf("resolved for a run: %v from %q", r.Behaviour.GetMaxQueueBlock().AsDuration(), r.Provenance["behaviour.max_queue_block"])
+	}
+	for _, bad := range []string{"0s", "-5s"} {
+		if _, err := policy.Parse([]byte(`{"policies": [{"name": "p", "behaviour": {"maxQueueBlock": "` + bad + `"}}]}`)); err == nil {
+			t.Errorf("a ceiling of %s must be rejected", bad)
+		}
+	}
 	for queue, want := range map[store.QueueKey]time.Duration{"shop.example": 72 * time.Hour, "other.example": 24 * time.Hour} {
 		if got := s.decide(store.LeaseInfo{Queue: queue}, asked, nil).Block; got != want {
 			t.Errorf("%s: blocked for %v, want %v", queue, got, want)

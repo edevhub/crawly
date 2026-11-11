@@ -70,7 +70,8 @@ message Behaviour {
   google.protobuf.Duration task_ttl = 7;
   // The longest one outcome can block the queue for (Outcome.block_queue_for). A block
   // stops every run on the queue, so the ceiling belongs to the queue: it is read from
-  // the global policies only, and a run's own behaviour cannot change it. Default 24h.
+  // the global policies only, and a run that sets it is rejected. Must be positive.
+  // Default 24h.
   google.protobuf.Duration max_queue_block = 8;
 }
 

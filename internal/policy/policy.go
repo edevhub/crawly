@@ -77,6 +77,11 @@ func New(policies []*policyv1.Policy) (*Set, error) {
 		if err := validateLimits(p.GetLimits()); err != nil {
 			return nil, fmt.Errorf("policy %q: %w", p.GetName(), err)
 		}
+		if b := p.GetBehaviour(); b.GetMaxQueueBlock() != nil && b.GetMaxQueueBlock().AsDuration() <= 0 {
+			// Zero would silently turn off every block of the queue, a site's
+			// Retry-After included.
+			return nil, fmt.Errorf("policy %q: max_queue_block must be positive", p.GetName())
+		}
 		ps = append(ps, proto.CloneOf(p))
 	}
 	slices.SortStableFunc(ps, func(a, b *policyv1.Policy) int {
@@ -174,6 +179,11 @@ func (s *Set) Resolve(rp *policyv1.RunPolicy, queue string) Resolved {
 	if rp == nil {
 		return r
 	}
+	// A block stops every run on the queue, so its ceiling is the queue's: what a run
+	// says about it does not apply.
+	const blockField = "behaviour.max_queue_block"
+	ceiling, ceilingFrom := r.Behaviour.GetMaxQueueBlock(), r.Provenance[blockField]
+	defer func() { r.Behaviour.MaxQueueBlock, r.Provenance[blockField] = ceiling, ceilingFrom }()
 	if rp.Weight != nil {
 		r.Weight, r.Provenance["weight"] = rp.GetWeight(), "run"
 	}
@@ -288,6 +298,19 @@ func specificity(pattern string) int {
 		n += 1 << 20
 	}
 	return n
+}
+
+// ValidateRun checks a run's own policy for what a run may not set.
+func ValidateRun(rp *policyv1.RunPolicy) error {
+	if rp.GetBehaviour().GetMaxQueueBlock() != nil {
+		return errors.New("behaviour.max_queue_block cannot be set by a run: a block stops every run on the queue, so its ceiling comes from the global policies")
+	}
+	for _, o := range rp.GetOverrides() {
+		if o.GetBehaviour().GetMaxQueueBlock() != nil {
+			return fmt.Errorf("override %q: behaviour.max_queue_block cannot be set by a run", o.GetQueueKey())
+		}
+	}
+	return nil
 }
 
 // minRate is the smallest rate_per_second accepted: one request in ten years.
