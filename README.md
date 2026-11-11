@@ -25,7 +25,7 @@ Early. What exists today:
 | Conformance suite (`internal/store/storetest`) | Covers politeness, overrides, blocks, fairness, pools, fencing, termination, lifecycle |
 
 Not implemented yet: bucket ownership, the per-replica store call budget, Frontier metrics,
-and the SDK's `MaxTasksPerSecond` and resource-based tuner.
+and the SDK's resource-based tuner.
 
 ## Try it
 
@@ -132,6 +132,7 @@ One worker can register any number of handlers. A task is routed by its handler 
 | Where | Option | Meaning |
 |---|---|---|
 | `worker.New` | `WithMaxConcurrentTasks(n)` | How many handlers run at once |
+| | `WithMaxTasksPerSecond(n)` | How fast the worker takes work: at most `n` task starts a second, over all its pools. Protects the worker, not the sites |
 | | `WithID(id)`, `WithBuildVersion(v)` | Recorded on every attempt, for lineage |
 | | `WithShutdownGrace(d)` | How long running handlers get to finish on shutdown |
 | | `WithInsecure()` or `WithDialOptions(...)` | Transport security has no default: plaintext must be asked for, or pass gRPC credentials |
@@ -301,3 +302,7 @@ store (`make postgres-stop` removes it). Plain `go test ./...` skips those tests
 Releases are semantic version tags. The `Release` workflow computes the next version, runs
 the full test suite and only then tags and publishes; a `v*` tag pushed by hand goes
 through the same gate.
+
+## License
+
+[MIT](LICENSE).

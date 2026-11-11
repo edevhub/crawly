@@ -2,8 +2,10 @@ package worker_test
 
 import (
 	"context"
+	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -31,6 +33,14 @@ func TestNewValidates(t *testing.T) {
 	}
 	if _, err := worker.New("localhost:1"); err == nil {
 		t.Error("transport security must be chosen explicitly")
+	}
+	for _, rate := range []float64{-1, math.NaN(), math.Inf(1)} {
+		if _, err := worker.New("localhost:1", worker.WithInsecure(), worker.WithMaxTasksPerSecond(rate)); err == nil {
+			t.Errorf("a task rate of %v must be rejected", rate)
+		}
+	}
+	if _, err := worker.New("localhost:1", worker.WithInsecure(), worker.WithMaxTasksPerSecond(0.5)); err != nil {
+		t.Errorf("a task rate below one a second must be accepted: %v", err)
 	}
 	if _, err := worker.New("localhost:1", worker.WithInsecure()); err != nil {
 		t.Errorf("defaults must be valid: %v", err)
@@ -343,6 +353,59 @@ func TestConcurrencyLimit(t *testing.T) {
 	}
 	if p := peak.Load(); p > 3 {
 		t.Fatalf("peak concurrency %d, want at most 3", p)
+	}
+}
+
+// TestMaxTasksPerSecond: the worker starts tasks no faster than its rate, over all its
+// pools together, however many slots are free.
+func TestMaxTasksPerSecond(t *testing.T) {
+	e := newEnv(t)
+	const rate, perPool = 20, 8
+	var mu sync.Mutex
+	var starts []time.Time
+	handler := worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+		mu.Lock()
+		starts = append(starts, time.Now())
+		mu.Unlock()
+		return nil, nil
+	})
+	w := newWorker(t, e.addr, worker.WithMaxConcurrentTasks(8), worker.WithMaxTasksPerSecond(rate))
+	register(t, w, "page", handler)
+	register(t, w, "render", handler, worker.InPool("browser"))
+	e.start(w)
+
+	seeds := make([]*task.Spec, 0, 2*perPool)
+	for i := range perPool {
+		host := "https://h" + strconv.Itoa(i) + ".example/"
+		render := spec(host+"render", "render")
+		render.Pool = "browser"
+		seeds = append(seeds, spec(host+"page", "page"), render)
+	}
+	st := e.crawl("paced", nil, seeds...)
+	if st.GetSucceeded() != uint64(len(seeds)) {
+		t.Fatalf("stats: %v", st)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	slices.SortFunc(starts, time.Time.Compare)
+	// 16 tasks at 20 a second are 15 intervals of 50 ms. Unpaced, they take a few
+	// milliseconds.
+	span, want := starts[len(starts)-1].Sub(starts[0]), time.Duration(len(seeds)-1)*time.Second/rate
+	if span < want*9/10 {
+		t.Fatalf("%d tasks started within %v; at %d a second they take at least %v", len(seeds), span, rate, want)
+	}
+	// No window of half a second holds more than half a second's worth, give or take
+	// the timing of the handlers.
+	for i := range starts {
+		n := 0
+		for _, at := range starts[i:] {
+			if at.Sub(starts[i]) < 500*time.Millisecond {
+				n++
+			}
+		}
+		if n > rate/2+2 {
+			t.Fatalf("%d tasks started within half a second at %d a second", n, rate)
+		}
 	}
 }
 
