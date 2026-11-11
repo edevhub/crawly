@@ -683,6 +683,34 @@ If the set changed, `UPDATE backlogs SET ready_at = now() WHERE pending > 0 AND 
 (in primary key order, in batches, each its own transaction; `'infinity'` is reset too,
 backlogs of paused and ended runs keep `NULL` on purpose) and `NOTIFY` every pool channel.
 
+## Migrations
+
+The schema is a set of versioned SQL migrations, embedded in the Frontier binary and
+applied with [goose](https://github.com/pressly/goose) by a command of its own:
+
+```sh
+crawly-frontier migrate -postgres "$URL"          # applies what is pending
+crawly-frontier migrate -postgres "$URL" status   # lists the migrations
+```
+
+- **A step of the rollout:** the store never changes the schema. On start it reads the
+  highest applied version and refuses to run when it is lower than the version of its
+  build. A higher version is accepted with a warning, so the replicas of the previous
+  build keep running during a rolling update. In this sense, a migration must stay
+  compatible with the build before it.
+- **Version table:** goose records the applied migrations in a table, `crawly_migrations`
+  by default. The name is configurable (`-postgres-migrations-table`, or
+  `CRAWLY_POSTGRES_MIGRATIONS_TABLE`), optionally as `schema.table`, so the table does not
+  collide with the migrations of another application in the same database. The Frontier
+  takes the same setting to find the version.
+- **Concurrent runs:** the command holds a session advisory lock while it works, so
+  several runs at once are safe: one applies the migrations and the others find nothing
+  to do. The lock needs a direct connection, not one through a transaction pooler.
+- **Forward only:** the command applies migrations and reports their state. There is no
+  command to roll a migration back.
+- **Partitions:** the monthly partitions of `tasks` and `attempts` are not migrations.
+  The store creates and drops them as time passes.
+
 ## Retention
 
 - `tasks` and `attempts`: monthly partitions by `run_created_on`, dropped (or archived)

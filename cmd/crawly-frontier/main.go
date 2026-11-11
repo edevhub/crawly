@@ -6,6 +6,12 @@
 // PostgreSQL: it survives restarts and several replicas can share one database.
 // Without it the store is in memory: the state is lost on restart, which suits
 // development and trials. Policies are static: change the file and restart.
+//
+// The Frontier does not change the database schema. Apply the migrations before a new
+// version starts:
+//
+//	crawly-frontier migrate -postgres postgres://user@host/db
+//	crawly-frontier migrate -postgres postgres://user@host/db status
 package main
 
 import (
@@ -31,17 +37,39 @@ import (
 // Environment variables that stand in for the flags of the same name, so that
 // credentials need not be on the command line.
 const (
-	envPostgres       = "CRAWLY_POSTGRES"
-	envPostgresListen = "CRAWLY_POSTGRES_LISTEN"
+	envPostgres           = "CRAWLY_POSTGRES"
+	envPostgresListen     = "CRAWLY_POSTGRES_LISTEN"
+	envPostgresMigrations = "CRAWLY_POSTGRES_MIGRATIONS_TABLE"
 )
 
 type config struct {
 	listen, policies         string
 	postgres, postgresListen string
+	migrationsTable          string
+}
+
+// migrationsTableFlag is shared by the server, which reads the table, and the migrate
+// command, which writes it.
+func migrationsTableFlag(fs *flag.FlagSet, into *string) {
+	def := os.Getenv(envPostgresMigrations)
+	if def == "" {
+		def = pgstore.DefaultMigrationsTable
+	}
+	fs.StringVar(into, "postgres-migrations-table", def,
+		"table that records the applied migrations, optionally schema.table (or $"+envPostgresMigrations+")")
 }
 
 func main() {
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		if err := migrate(context.Background(), os.Args[2:], os.Stdout, log); err != nil {
+			log.Error("migrate failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 	var cfg config
+	migrationsTableFlag(flag.CommandLine, &cfg.migrationsTable)
 	flag.StringVar(&cfg.listen, "listen", ":7070", "gRPC listen address")
 	flag.StringVar(&cfg.policies, "policies", "", `policy file: {"policies": [...]} in proto JSON; empty uses the built-in defaults`)
 	flag.StringVar(&cfg.postgres, "postgres", os.Getenv(envPostgres),
@@ -49,7 +77,6 @@ func main() {
 	flag.StringVar(&cfg.postgresListen, "postgres-listen", os.Getenv(envPostgresListen),
 		"direct PostgreSQL connection URL for LISTEN, when -postgres goes through a transaction pooler (or $"+envPostgresListen+")")
 	flag.Parse()
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	if err := run(cfg, log); err != nil {
 		log.Error("frontier stopped", "err", err)
 		os.Exit(1)
@@ -62,7 +89,7 @@ func openStore(ctx context.Context, cfg config, pol store.Policies, log *slog.Lo
 		log.Warn("the store is in memory: the state is lost on restart")
 		return memstore.New(pol), func() {}, nil
 	}
-	opts := []pgstore.Option{pgstore.WithLogger(log)}
+	opts := []pgstore.Option{pgstore.WithLogger(log), pgstore.WithMigrationsTable(cfg.migrationsTable)}
 	if cfg.postgresListen != "" {
 		opts = append(opts, pgstore.WithListenDSN(cfg.postgresListen))
 	}

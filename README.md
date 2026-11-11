@@ -36,12 +36,18 @@ go run github.com/edevhub/crawly/cmd/crawly-frontier@latest -listen :7070
 ```
 
 With PostgreSQL 18 the state survives restarts and several replicas can share the database.
-The schema is created on the first start:
+Apply the schema migrations first, and again before every new version starts:
 
 ```sh
 export CRAWLY_POSTGRES='postgres://crawly:secret@localhost:5432/crawly'
+go run github.com/edevhub/crawly/cmd/crawly-frontier@latest migrate
 go run github.com/edevhub/crawly/cmd/crawly-frontier@latest -listen :7070
 ```
+
+`migrate status` lists the migrations and whether they are applied. The Frontier does not
+change the schema on its own and refuses to start on a database that is behind its build.
+The migrations are recorded in the table `crawly_migrations`; to use another name, pass
+`-postgres-migrations-table` (or `CRAWLY_POSTGRES_MIGRATIONS_TABLE`) to both commands.
 
 `-postgres` takes the same URL. When that URL goes through a transaction pooler such as
 PgBouncer, give the Frontier a direct one for `LISTEN` with `-postgres-listen` (or

@@ -28,16 +28,17 @@ import (
 
 // Store implements store.Store on PostgreSQL.
 type Store struct {
-	db        *pgxpool.Pool
-	pol       store.Policies
-	clock     func() time.Time // nil: the database clock
-	log       *slog.Logger
-	listenDSN string
-	keepTasks time.Duration
-	keepRuns  time.Duration
-	ids       idGen
-	deadlocks atomic.Int64
-	rounds    atomic.Int64 // Maintain rounds, to pace the ledger audit
+	db              *pgxpool.Pool
+	pol             store.Policies
+	clock           func() time.Time // nil: the database clock
+	log             *slog.Logger
+	listenDSN       string
+	migrationsTable string
+	keepTasks       time.Duration
+	keepRuns        time.Duration
+	ids             idGen
+	deadlocks       atomic.Int64
+	rounds          atomic.Int64 // Maintain rounds, to pace the ledger audit
 
 	stop   context.CancelFunc // ends the listener
 	ctx    context.Context    //nolint:containedctx // the lifetime of the listener, ended by Close
@@ -64,6 +65,16 @@ func WithClock(now func() time.Time) Option { return func(s *Store) { s.clock = 
 
 // WithLogger sets the logger. The default is slog.Default.
 func WithLogger(l *slog.Logger) Option { return func(s *Store) { s.log = l } }
+
+// WithMigrationsTable names the table the migrations were recorded in, when it is not
+// DefaultMigrationsTable. The store reads it to check the schema version.
+func WithMigrationsTable(table string) Option {
+	return func(s *Store) {
+		if table != "" {
+			s.migrationsTable = table
+		}
+	}
+}
 
 // WithListenDSN sets the connection used for LISTEN. It must reach the database
 // directly: LISTEN does not work through a transaction pooler. The default is the
@@ -102,7 +113,8 @@ func New(ctx context.Context, dsn string, pol store.Policies, opts ...Option) (*
 	}
 	s := &Store{
 		db: db, pol: pol, log: slog.Default(), listenDSN: dsn, ready: make(chan struct{}),
-		runsByID: map[store.RunID]*runMeta{}, runsByNo: map[int64]*runMeta{},
+		migrationsTable: DefaultMigrationsTable,
+		runsByID:        map[store.RunID]*runMeta{}, runsByNo: map[int64]*runMeta{},
 		poolIDs: map[store.PoolName]int16{}, poolName: map[int16]store.PoolName{},
 		months: map[time.Time]bool{}, totals: map[int64]*total{},
 		subs: map[chan store.Notification]struct{}{},
@@ -111,7 +123,7 @@ func New(ctx context.Context, dsn string, pol store.Policies, opts ...Option) (*
 	for _, o := range opts {
 		o(s)
 	}
-	if err := s.migrate(ctx); err != nil {
+	if err := s.checkSchema(ctx); err != nil {
 		s.Close()
 		return nil, err
 	}
