@@ -13,6 +13,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/policy"
 	"github.com/edevhub/crawly/internal/store"
+	"github.com/edevhub/crawly/internal/wire"
 )
 
 // Config configures a Frontier replica.
@@ -503,12 +505,17 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 	out := make([]store.NewTask, len(specs))
 	for i, ts := range specs {
 		pool, queue, fp, err := identify(spec.KeyRule, ts)
-		if err != nil {
+		if err != nil || proto.Size(ts) > wire.MaxTaskBytes {
 			out[i].Invalid = true
 			continue
 		}
 		stored := proto.CloneOf(ts)
 		stored.QueueKey, stored.Pool = queue, string(pool)
+		if stored.GetRequest().GetMethod() != "" {
+			// Methods are case-sensitive on the wire. One spelling is stored and sent,
+			// the one the dedup key counts, so that "post" and "POST" are one request.
+			stored.Request.Method = strings.ToUpper(stored.GetRequest().GetMethod())
+		}
 		raw, err := proto.Marshal(stored)
 		if err != nil {
 			out[i].Invalid = true

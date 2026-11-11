@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +28,7 @@ func (e *echo) Parse(_ context.Context, _ *Task, r *Response) (*Result, error) {
 	return e.res, e.err
 }
 
-func get(url string) *Task { return &Task{Method: http.MethodGet, URL: url} }
+func get(target string) *Task { return &Task{Method: http.MethodGet, URL: target} }
 
 // failure asserts err is a classified failure and returns it.
 func failure(t *testing.T, err error, kind Kind, code string) *Error {
@@ -318,24 +320,112 @@ func (via) RoundTrip(r *http.Request) (*http.Response, error) {
 	return http.DefaultTransport.RoundTrip(r)
 }
 
-// TestHTTPRedirectKeepsRequest: a 307 or 308 to another host repeats the request as it
-// was, so the discovered task carries the method, body and headers.
+// TestHTTPRedirectKeepsRequest: a 307 or 308 repeats the request as it was, so the
+// discovered task carries the method and body. The headers go along on the same host
+// only: another host gets the ones that describe the content.
 func TestHTTPRedirectKeepsRequest(t *testing.T) {
+	header := func() http.Header {
+		return http.Header{"X-Token": {"abc"}, "Authorization": {"Bearer secret"}, "Cookie": {"sid=1"},
+			"Content-Type": {"application/json"}, "Accept": {"application/json"}}
+	}
 	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		var target string
 		site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "https://other.example/search", status)
+			http.Redirect(w, r, target, status)
 		}))
-		task := &Task{Method: http.MethodPost, URL: site.URL, Body: []byte(`{"q":1}`), Header: http.Header{"X-Token": {"abc"}}}
-		res, err := HTTP(&echo{}).Handle(context.Background(), task)
+		handle := func(to string) NewTask {
+			target = to
+			res, err := HTTP(&echo{}).Handle(context.Background(),
+				&Task{Method: http.MethodPost, URL: site.URL + "/search", Body: []byte(`{"q":1}`), Header: header()})
+			if err != nil || len(res.Tasks) != 1 {
+				t.Fatalf("%d to %s: %+v %v", status, to, res, err)
+			}
+			next := res.Tasks[0]
+			if next.Method != http.MethodPost || string(next.Body) != `{"q":1}` {
+				t.Fatalf("%d to %s: the request was not carried over: %+v", status, to, next)
+			}
+			return next
+		}
+
+		next := handle("/v2/search")
+		if next.URL != site.URL+"/v2/search" || len(next.Header) != 5 || next.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("%d on the same host: %+v", status, next)
+		}
+		next = handle("https://other.example/search")
+		if next.URL != "https://other.example/search" || len(next.Header) != 2 ||
+			next.Header.Get("Content-Type") == "" || next.Header.Get("Accept") != "application/json" {
+			t.Fatalf("%d to another host: headers %v, want the content headers only", status, next.Header)
+		}
 		site.Close()
-		if err != nil || len(res.Tasks) != 1 {
-			t.Fatalf("%d: %+v %v", status, res, err)
+	}
+
+	// A step down from https to http on the same host does not carry them either.
+	from, _ := url.Parse("https://a.example/x")
+	to, _ := url.Parse("http://a.example/x")
+	if h := redirectHeader(header(), from, to); len(h) != 2 {
+		t.Fatalf("https to http: %v", h)
+	}
+	if h := redirectHeader(header(), to, from); len(h) != 5 {
+		t.Fatalf("http to https on the same host: %v", h)
+	}
+}
+
+// TestHTTPWithStatus: a status handed to a parser has the outcome the parser gives it.
+func TestHTTPWithStatus(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st, _ := strconv.Atoi(r.URL.Path[1:])
+		w.WriteHeader(st)
+		_, _ = fmt.Fprint(w, "body of ", st)
+	}))
+	defer site.Close()
+	ctx := context.Background()
+	main, gone := &echo{}, &echo{}
+	h := HTTP(main, WithStatus(gone, http.StatusNotFound, http.StatusGone), WithStatus(Blocked(72*time.Hour), http.StatusForbidden))
+
+	// A 404 is a result here: the parser sees the response and the task succeeds.
+	res, err := h.Handle(ctx, get(site.URL+"/404"))
+	if err != nil || gone.calls != 1 || main.calls != 0 || string(gone.resp.Body) != "body of 404" || gone.resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("404: %+v %v", res, err)
+	}
+	if res.Code != "http_404" || res.Fetch.HTTPStatus != 404 {
+		t.Fatalf("404: code %q, fetch %+v", res.Code, res.Fetch)
+	}
+	if _, err = h.Handle(ctx, get(site.URL+"/410")); err != nil || gone.calls != 2 {
+		t.Fatalf("410: %v", err)
+	}
+	// A 403 blocks the queue, and the fetch is still recorded.
+	res, err = h.Handle(ctx, get(site.URL+"/403"))
+	if e := failure(t, err, KindFail, CodeBlocked); e.BlockQueueFor != 72*time.Hour || res.Fetch.HTTPStatus != 403 {
+		t.Fatalf("403: %+v, fetch %+v", e, res.Fetch)
+	}
+	// The other statuses are classified as before.
+	if _, err = h.Handle(ctx, get(site.URL+"/200")); err != nil || main.calls != 1 {
+		t.Fatalf("200: %v", err)
+	}
+	_, err = h.Handle(ctx, get(site.URL+"/401"))
+	requireFailure(t, err, KindFail, "http_401")
+	_, err = h.Handle(ctx, get(site.URL+"/503"))
+	requireFailure(t, err, KindRetry, "http_503")
+}
+
+// TestHTTPWithRedirect: the spider can adjust the task added for a redirect.
+func TestHTTPWithRedirect(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/final?utm=1", http.StatusFound)
+	}))
+	defer site.Close()
+	h := HTTP(&echo{}, WithRedirect(func(t *Task, r *Response, target *NewTask) {
+		if r.StatusCode != http.StatusFound || r.Header.Get("Location") != "/final?utm=1" {
+			t.Handler = "wrong response"
 		}
-		next := res.Tasks[0]
-		if next.URL != "https://other.example/search" || next.Method != http.MethodPost || string(next.Body) != `{"q":1}` ||
-			next.Header.Get("X-Token") != "abc" {
-			t.Fatalf("%d: the request was not carried over: %+v", status, next)
-		}
+		target.DedupKey, target.Handler = "final", t.Handler+"_redirected"
+	}))
+	task := get(site.URL + "/start")
+	task.Handler = "page"
+	res, err := h.Handle(context.Background(), task)
+	if err != nil || len(res.Tasks) != 1 || res.Tasks[0].DedupKey != "final" || res.Tasks[0].Handler != "page_redirected" ||
+		res.Tasks[0].URL != site.URL+"/final?utm=1" {
+		t.Fatalf("%+v %v", res, err)
 	}
 }
 
@@ -394,4 +484,108 @@ func TestHTTPContentTypes(t *testing.T) {
 	if _, err := HTTP(p).Handle(ctx, get(site.URL+"/pdf")); err != nil || p.calls != 3 {
 		t.Fatalf("the default: %d calls, %v", p.calls, err)
 	}
+}
+
+// TestHTTPRedirectToOwnURL: a redirect to the task's own URL is a loop only when it
+// asks for the request the task just made.
+func TestHTTPRedirectToOwnURL(t *testing.T) {
+	var status int
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", r.URL.Path)
+		w.WriteHeader(status)
+	}))
+	defer site.Close()
+	post := func() *Task { return &Task{Method: http.MethodPost, URL: site.URL + "/form", Body: []byte("q=1")} }
+
+	// Post, then redirect to the same URL: the GET is another request.
+	status = http.StatusSeeOther
+	res, err := HTTP(&echo{}).Handle(context.Background(), post())
+	if err != nil || len(res.Tasks) != 1 || res.Tasks[0].URL != site.URL+"/form" || res.Tasks[0].Method != "" || res.Tasks[0].Body != nil {
+		t.Fatalf("303 of a POST to its own URL: %+v %v", res, err)
+	}
+	// A 307 repeats the POST: that is the same request again.
+	status = http.StatusTemporaryRedirect
+	_, err = HTTP(&echo{}).Handle(context.Background(), post())
+	requireFailure(t, err, KindFail, "redirect_loop")
+}
+
+// TestHTTPRedirectHeaderIsACopy: the redirect task does not share its headers with
+// the task that was redirected, so a hook can change one without the other.
+func TestHTTPRedirectHeaderIsACopy(t *testing.T) {
+	for _, target := range []string{"/next", "https://other.example/next"} {
+		site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+		}))
+		task := &Task{Method: http.MethodPost, URL: site.URL, Header: http.Header{"Authorization": {"Bearer a"}, "Accept": {"text/html"}}}
+		h := HTTP(&echo{}, WithRedirect(func(_ *Task, _ *Response, next *NewTask) {
+			next.Header.Del("Authorization")
+			next.Header["Accept"][0] = "changed"
+		}))
+		_, err := h.Handle(context.Background(), task)
+		site.Close()
+		if err != nil || task.Header.Get("Authorization") != "Bearer a" || task.Header.Get("Accept") != "text/html" {
+			t.Fatalf("to %s: the task's own headers were changed: %v %v", target, task.Header, err)
+		}
+	}
+}
+
+// downgrade answers a request to https://a.example with a redirect to plain http, and
+// records what reaches the http side.
+type downgrade struct{ plain []*http.Request }
+
+func (d *downgrade) RoundTrip(r *http.Request) (*http.Response, error) {
+	res := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: r}
+	if r.URL.Scheme == "https" {
+		res.StatusCode = http.StatusFound
+		res.Header.Set("Location", "http://a.example/x")
+	} else {
+		d.plain = append(d.plain, r)
+	}
+	return res, nil
+}
+
+// TestHTTPNeverFollowsADowngrade: a redirect from https to http is not followed inside
+// a task, whatever the spider opted into: the client would send the task's headers in
+// the clear. The target becomes a task.
+func TestHTTPNeverFollowsADowngrade(t *testing.T) {
+	for name, opt := range map[string]HTTPOption{"same host": WithSameHostRedirects(), "cross host": WithCrossHostRedirects()} {
+		d := &downgrade{}
+		h := HTTP(&echo{}, opt, WithHTTPClient(&http.Client{Transport: d}))
+		res, err := h.Handle(context.Background(), &Task{Method: http.MethodGet, URL: "https://a.example/",
+			Header: http.Header{"Authorization": {"Bearer secret"}, "X-Api-Key": {"k"}}})
+		if err != nil || len(d.plain) != 0 || len(res.Tasks) != 1 || res.Tasks[0].URL != "http://a.example/x" || len(res.Tasks[0].Header) != 0 {
+			t.Fatalf("%s: %d plain requests, result %+v, %v", name, len(d.plain), res, err)
+		}
+	}
+}
+
+// TestHTTPLargeBodyOfAnUnparsedStatus: the size of a body nobody reads does not change
+// what its status means.
+func TestHTTPLargeBodyOfAnUnparsedStatus(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st, _ := strconv.Atoi(r.URL.Path[1:])
+		if st == http.StatusFound {
+			w.Header().Set("Location", "/next")
+		}
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(st)
+		_, _ = w.Write(make([]byte, 4096))
+	}))
+	defer site.Close()
+	ctx := context.Background()
+	h := HTTP(&echo{}, WithMaxBodyBytes(1024), WithStatus(&echo{}, http.StatusNotFound))
+	_, err := h.Handle(ctx, get(site.URL+"/503"))
+	requireFailure(t, err, KindRetry, "http_503")
+	_, err = h.Handle(ctx, get(site.URL+"/429"))
+	if e := failure(t, err, KindRetry, "http_429"); e.BlockQueueFor != 30*time.Second {
+		t.Fatalf("429: the queue block was lost: %+v", e)
+	}
+	if res, err := h.Handle(ctx, get(site.URL+"/302")); err != nil || len(res.Tasks) != 1 {
+		t.Fatalf("302: %+v %v", res, err)
+	}
+	// A status that goes to a parser is still held to the limit.
+	_, err = h.Handle(ctx, get(site.URL+"/404"))
+	requireFailure(t, err, KindFail, "body_too_large")
+	_, err = h.Handle(ctx, get(site.URL+"/200"))
+	requireFailure(t, err, KindFail, "body_too_large")
 }

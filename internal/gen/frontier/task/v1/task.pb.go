@@ -169,6 +169,7 @@ type Outcome struct {
 	// frontier fails the task with this code when no worker has run it for the time it
 	// is configured to wait), "shutdown" (RELEASED: the worker stopped before the handler
 	// finished),
+	// "task_too_large" (FAILED: the handler returned a task over the size limit),
 	// "panic" (RETRY: the handler crashed), "redirect" (SUCCESS: a redirect to another
 	// host was added as a task instead of followed), "lease_expired" (set by the frontier).
 	Code    string `protobuf:"bytes,2,opt,name=code,proto3" json:"code,omitempty"`
@@ -343,17 +344,21 @@ func (x *FetchInfo) GetItemsEmitted() uint32 {
 	return 0
 }
 
-// What clients submit (scheduler seeds, worker discoveries).
+// What clients submit (scheduler seeds, worker discoveries). A spec is limited to 1 MiB
+// as encoded; a larger one is INVALID.
 type TaskSpec struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Request *Request               `protobuf:"bytes,1,opt,name=request,proto3" json:"request,omitempty"`
 	// Queue the task belongs to. Empty: derived from the run's KeyRule.
 	QueueKey string `protobuf:"bytes,2,opt,name=queue_key,json=queueKey,proto3" json:"queue_key,omitempty"`
-	// Dedup key. Empty: the default normalisation of request.url: scheme + host + path +
-	// query parameters sorted alphanumerically ascending. Scheme and host are lowercased,
-	// path and query keep their case (fragment, method, headers and body are ignored). Set
-	// it whenever a site needs special rules, e.g. case-insensitive paths, tracking
-	// parameters, or requests told apart by method or body.
+	// Dedup key. Empty: the default key of the request. For a GET that is the normalised
+	// request.url: scheme + host + path + query parameters sorted alphanumerically
+	// ascending. Scheme and host are lowercased, path and query keep their case, the
+	// fragment is ignored. A method other than GET is put in front of it, in upper case
+	// (an empty method is a GET), and the SHA-256 of a body that is not empty behind it.
+	// Headers are never part of it. Set it whenever a site needs special
+	// rules, e.g. case-insensitive paths, tracking parameters, or requests told apart by
+	// a header.
 	// Dedup is scoped to the run and the queue key (the fingerprint includes the queue key).
 	// With HOST or REGISTERED_DOMAIN key rules that is the same as per run.
 	DedupKey string `protobuf:"bytes,3,opt,name=dedup_key,json=dedupKey,proto3" json:"dedup_key,omitempty"`
@@ -586,7 +591,7 @@ func (x *Task) GetPool() string {
 type Request struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Url           string                 `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
-	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`   // default GET
+	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`   // default GET; stored and sent in upper case
 	Headers       []*Header              `protobuf:"bytes,3,rep,name=headers,proto3" json:"headers,omitempty"` // repeated, to allow duplicate header names
 	Body          []byte                 `protobuf:"bytes,4,opt,name=body,proto3" json:"body,omitempty"`       // keep small; reference large payloads via context
 	unknownFields protoimpl.UnknownFields

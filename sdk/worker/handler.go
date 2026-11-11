@@ -113,12 +113,15 @@ type NewTask struct {
 	Pool string
 	// QueueKey overrides the queue derived from the URL.
 	QueueKey string
-	// DedupKey overrides the default URL normalisation. Set it when the site needs
-	// special rules: case-sensitive paths, tracking parameters, POST bodies.
+	// DedupKey overrides the default key: the normalised URL, with the method and the
+	// body for requests other than GET. Set it when the site needs special rules:
+	// case-insensitive paths, tracking parameters, requests told apart by a header.
 	DedupKey  string
 	Priority  int32
 	NotBefore time.Time
-	Context   map[string][]byte
+	// Context is opaque spider data, handed back with the task. The whole task, with
+	// Context, must fit into MaxTaskBytes.
+	Context map[string][]byte
 }
 
 // Kind classifies a failure.
