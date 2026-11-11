@@ -1,0 +1,29 @@
+// Crawly Frontier API: SessionService, for operators to see the workers that are
+// connected. Session types are in session.proto.
+
+syntax = "proto3";
+
+package crawly.frontier.session.v1;
+
+import "crawly/frontier/session/v1/session.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/session/v1;sessionv1";
+
+service SessionService {
+  // Lists the sessions of the replica that serves the call, not of the whole
+  // deployment: a session is a stream held by one replica and is kept nowhere else.
+  // Ask each replica to see all of them; the response names the replica.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+}
+
+message ListSessionsRequest {
+  // Only the sessions of this pool; empty: all.
+  string pool = 1;
+}
+
+message ListSessionsResponse {
+  // Sorted by pool, then connection time.
+  repeated Session sessions = 1;
+  // The replica that answered.
+  string replica_id = 2;
+}

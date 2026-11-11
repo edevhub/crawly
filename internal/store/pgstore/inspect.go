@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -361,4 +362,72 @@ func (s *Store) BlockQueue(ctx context.Context, key store.QueueKey, until time.T
 		return store.Queue{}, err
 	}
 	return s.GetQueue(ctx, key)
+}
+
+// PoolStats sums the work of every pool across all runs. The totals come from the
+// backlogs that have work (backlogs_active), one row per backlog and no task is read;
+// the due queues come from the readiness index (backlogs_ready), the dueLimit oldest
+// backlogs of each pool. A backlog of a paused or ended run is not ready, whatever its
+// index entry says: the entry is only lowered by the next dispatch round (heal).
+func (s *Store) PoolStats(ctx context.Context, dueLimit int) ([]store.PoolStats, error) {
+	now, err := s.Now(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(ctx, `SELECT p.name,
+			coalesce(sum(b.pending) FILTER (WHERE b.ready_at <= $1 AND r.state IN ('open', 'sealed') AND NOT r.paused), 0),
+			coalesce(sum(b.pending) FILTER (WHERE NOT (b.ready_at <= $1 AND r.state IN ('open', 'sealed') AND NOT r.paused)), 0),
+			coalesce(sum(b.in_flight), 0)
+		FROM backlogs b JOIN pools p ON p.pool_id = b.pool_id JOIN runs r ON r.run_no = b.run_no
+		WHERE b.pending > 0 OR b.in_flight > 0 GROUP BY p.name ORDER BY p.name`, now)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (store.PoolStats, error) {
+		var ps store.PoolStats
+		var pool string
+		var pending, delayed, inFlight int64
+		err := row.Scan(&pool, &pending, &delayed, &inFlight)
+		ps.Pool = store.PoolName(pool)
+		ps.Pending, ps.Delayed, ps.InFlight = uint64(max(pending, 0)), uint64(max(delayed, 0)), uint64(max(inFlight, 0))
+		return ps, err
+	})
+	if err != nil {
+		return nil, wrap(err)
+	}
+	if dueLimit < 0 {
+		dueLimit = 0
+	}
+	rows, err = s.db.Query(ctx, `SELECT p.name, d.queue_key, min(d.ready_at)
+		FROM pools p CROSS JOIN LATERAL (
+			SELECT b.queue_key, b.ready_at FROM backlogs b JOIN runs r ON r.run_no = b.run_no
+			WHERE b.pool_id = p.pool_id AND b.ready_at <= $1 AND b.pending > 0 AND r.state IN ('open', 'sealed') AND NOT r.paused
+			ORDER BY b.ready_at LIMIT $2) d
+		GROUP BY p.name, d.queue_key ORDER BY min(d.ready_at), d.queue_key`, now, dueLimit)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	type due struct {
+		pool string
+		d    store.DueQueue
+	}
+	dues, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (due, error) {
+		var d due
+		var key string
+		var since pgtype.Timestamptz
+		err := row.Scan(&d.pool, &key, &since)
+		d.d = store.DueQueue{Queue: store.QueueKey(key), Since: timeOf(since)}
+		return d, err
+	})
+	if err != nil {
+		return nil, wrap(err)
+	}
+	for _, d := range dues {
+		i := slices.IndexFunc(out, func(ps store.PoolStats) bool { return string(ps.Pool) == d.pool })
+		if i < 0 {
+			continue // the pool's work was dispatched between the two reads
+		}
+		out[i].Due = append(out[i].Due, d.d)
+	}
+	return out, nil
 }

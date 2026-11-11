@@ -105,6 +105,10 @@ type Inspect interface {
 	ListQueues(ctx context.Context, f QueueFilter, page Page) ([]Queue, string, error)
 	// BlockQueue sets (or with a zero time, clears) an operator block for all runs.
 	BlockQueue(ctx context.Context, key QueueKey, until time.Time, reason string) (Queue, error)
+	// PoolStats sums the work of every pool across all runs, for monitoring. It reads
+	// the readiness index and the backlogs that have work, never the tasks, so it is
+	// cheap enough to call on every scrape. At most dueLimit queues are listed per pool.
+	PoolStats(ctx context.Context, dueLimit int) ([]PoolStats, error)
 }
 
 // Background serves replica startup, the dispatch loop and maintenance.
@@ -321,6 +325,10 @@ type Assignment struct {
 	Lease Lease
 	Info  LeaseInfo
 	Spec  []byte
+	// Waited is how long the task was eligible before this dispatch, by the store
+	// clock: from its creation, its not-before time or its retry time, whichever is
+	// last. It is what politeness, blocks and busy workers cost the task.
+	Waited time.Duration
 }
 
 // LeaseRef names one attempt's lease; the attempt number fences stale holders.
@@ -347,6 +355,8 @@ type LeaseInfo struct {
 	Fingerprint Fingerprint
 	Depth       uint32
 	Parent      TaskID
+	// Worker is the worker the lease was dispatched to.
+	Worker WorkerInfo
 }
 
 // FinishSource says who ends an attempt, which decides how the lease is checked.
@@ -483,4 +493,28 @@ type QueueFilter struct {
 	Run         RunID
 	KeyPrefix   string
 	OnlyBlocked bool
+}
+
+// ---- monitoring
+
+// PoolStats is the work of one pool across all runs.
+type PoolStats struct {
+	Pool PoolName
+	// Pending is the tasks that can be dispatched when their queues admit them,
+	// Delayed the tasks of backlogs that wait for a time (politeness, a block, a retry
+	// delay or a not-before time), InFlight the tasks that hold a lease. Pending and
+	// Delayed are as approximate as Backlog.Pending and Backlog.Delayed.
+	Pending, Delayed, InFlight uint64
+	// Due lists the queues with work that could be dispatched now, longest waiting
+	// first. A queue is due when its backlog is ready (not paused, not blocked, not
+	// held back by politeness or concurrency): nothing but a worker is missing.
+	Due []DueQueue
+}
+
+// DueQueue is a queue whose work in one pool has been ready since a time.
+type DueQueue struct {
+	Queue QueueKey
+	// Since is when the work became ready, by the store clock. It may be earlier than
+	// the true time, never later.
+	Since time.Time
 }

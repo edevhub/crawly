@@ -304,7 +304,8 @@ func (s *Store) claim(ctx context.Context, tx pgx.Tx, now time.Time, key store.Q
 		UPDATE tasks t SET state = 'in_flight', attempt = t.attempt + 1, lease_nonce = $6,
 			worker_id = $7, worker_version = $8, dispatched_at = $5, lease_expires_at = $9, lease_deadline = $10
 		FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id
-		RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.fingerprint, t.priority, t.spec`,
+		RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.fingerprint, t.priority, t.spec,
+			t.created_at, t.not_before`,
 		b.meta.createdOn, b.run, string(key), b.pool, now, nonce, req.Worker.ID, req.Worker.Version, expires, deadline, n)
 	if err != nil {
 		return nil, err
@@ -323,16 +324,18 @@ func (s *Store) claim(ctx context.Context, tx pgx.Tx, now time.Time, key store.Q
 			parent       pgtype.UUID
 			parentBucket *int16
 			fp           []byte
+			created, due pgtype.Timestamptz
 		)
-		if err := row.Scan(&c.id, &attempt, &depth, &parent, &parentBucket, &fp, &c.priority, &c.a.Spec); err != nil {
+		if err := row.Scan(&c.id, &attempt, &depth, &parent, &parentBucket, &fp, &c.priority, &c.a.Spec, &created, &due); err != nil {
 			return c, err
 		}
+		c.a.Waited = max(now.Sub(latest(timeOf(created), timeOf(due))), 0)
 		task := taskKey{bucket: bucket, day: b.meta.day, id: c.id}
 		ref := leaseKey{task: task, attempt: uint32(attempt), nonce: nonce}.ref() //nolint:gosec // G115: attempts are positive
 		c.a.Lease = store.Lease{Ref: ref, ExpiresAt: expires, Duration: lease.Duration}
 		c.a.Info = store.LeaseInfo{Ref: ref, Task: task.ID(), Run: b.meta.spec.ID, RunPolicy: b.meta.spec.Policy,
 			Queue: key, Pool: poolName, Fingerprint: store.Fingerprint(fp), Depth: uint32(depth), //nolint:gosec // G115: depths are not negative
-			Parent: parentID(parent, parentBucket, b.meta.day)}
+			Parent: parentID(parent, parentBucket, b.meta.day), Worker: req.Worker}
 		return c, nil
 	})
 	if err != nil {

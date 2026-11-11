@@ -51,6 +51,8 @@ func (p *pool) wakeUp() {
 type session struct {
 	id     store.SessionID
 	worker store.WorkerInfo
+	pool   store.PoolName
+	since  time.Time // when the session opened
 	ctx    context.Context
 	cancel context.CancelFunc
 	out    chan *workerv1.WorkResponse
@@ -131,6 +133,9 @@ func (s *Server) release(ctx context.Context, sess *session) {
 	for _, ref := range refs {
 		s.leases.Delete(ref.ID)
 		st, err := s.store.Finish(ctx, store.Finish{Lease: ref, Source: store.SourceWorker, Result: store.ResultReleased})
+		if err == nil && st == store.FinishAccepted {
+			s.m.undelivered(sess.pool)
+		}
 		if err != nil || st != store.FinishAccepted {
 			// The lease expires on its own and the reaper retries the task.
 			s.log.Warn("releasing an undelivered assignment", "lease", ref.ID, "status", st, "err", err)
@@ -170,7 +175,8 @@ func (w workerService) Work(stream grpc.BidiStreamingServer[workerv1.WorkRequest
 	s.sessions++
 	id := store.SessionID(fmt.Sprintf("%s/%d", s.cfg.ReplicaID, s.sessions))
 	s.mu.Unlock()
-	sess := &session{id: id, ctx: ctx, cancel: cancel, out: make(chan *workerv1.WorkResponse, 256),
+	sess := &session{id: id, ctx: ctx, cancel: cancel, out: make(chan *workerv1.WorkResponse, 256), since: time.Now(),
+		pool:   store.PoolName(hello.GetPool()),
 		worker: store.WorkerInfo{ID: hello.GetWorkerId(), Version: hello.GetBuildVersion()},
 		leases: map[store.LeaseID]store.RunID{}, undelivered: map[store.LeaseID]store.LeaseRef{}}
 	p := s.pool(loops, store.PoolName(hello.GetPool()))
@@ -235,6 +241,7 @@ func (w workerService) Work(stream grpc.BidiStreamingServer[workerv1.WorkRequest
 	}
 	sess.send(&workerv1.WorkResponse{Msg: &workerv1.WorkResponse_Welcome{Welcome: &workerv1.Welcome{
 		SessionId: string(id), ServerTime: timestamppb.New(now), Releases: true}}})
+	s.m.opened.WithLabelValues(s.m.pools.label(hello.GetPool())).Inc()
 	s.log.Info("session opened", "session", id, "pool", p.name, "worker", sess.worker.ID)
 	defer s.log.Info("session closed", "session", id)
 
@@ -371,6 +378,7 @@ func (s *Server) handleDiscover(ctx context.Context, sess *session, m *workerv1.
 	case err != nil:
 		return err
 	}
+	s.m.tasksAdded("discovered", res)
 	ack.Results = addResults(res)
 	return reply(workerv1.DiscoverAck_STATUS_ACCEPTED)
 }
@@ -388,6 +396,7 @@ func (s *Server) handleComplete(ctx context.Context, p *pool, sess *session, m *
 			return err
 		}
 		if st == store.FinishAccepted {
+			s.m.finished(info, m.GetOutcome().GetKind(), f)
 			s.served(info, sess.worker, m.GetOutcome(), f)
 		}
 	}
@@ -462,6 +471,7 @@ func (s *Server) dispatchRound(ctx context.Context, p *pool) time.Time {
 			sess.served = p.served
 			p.mu.Unlock()
 		}
+		s.m.dispatch(p.name, res.Assignments)
 		// Assignments returned are committed and must be delivered, error or not.
 		for i := range res.Assignments {
 			a := &res.Assignments[i]

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -28,6 +29,7 @@ import (
 	policyv1 "github.com/edevhub/crawly/internal/gen/frontier/policy/v1"
 	queuev1 "github.com/edevhub/crawly/internal/gen/frontier/queue/v1"
 	runv1 "github.com/edevhub/crawly/internal/gen/frontier/run/v1"
+	sessionv1 "github.com/edevhub/crawly/internal/gen/frontier/session/v1"
 	taskv1 "github.com/edevhub/crawly/internal/gen/frontier/task/v1"
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/policy"
@@ -53,14 +55,19 @@ type Config struct {
 	// round takes a politeness slot of its queue, so the delay bounds what a pool
 	// without the handler costs the queue's other tasks. Zero: five seconds.
 	NoHandlerDelay time.Duration
+	// Metrics is where the replica registers its Prometheus metrics. The Frontier
+	// serves nothing itself: the caller exposes the registry. Nil: the metrics are
+	// kept in a registry nobody reads. A registry takes one replica.
+	Metrics prometheus.Registerer
 }
 
 // Server is one Frontier replica.
 type Server struct {
-	store store.Store
+	store store.Store // the configured store, timed
 	pol   *policy.Set
 	log   *slog.Logger
 	cfg   Config
+	m     *metrics
 
 	mu        sync.Mutex
 	pools     map[store.PoolName]*pool
@@ -97,8 +104,18 @@ func New(cfg Config) (*Server, error) {
 	if cfg.NoHandlerDelay <= 0 {
 		cfg.NoHandlerDelay = 5 * time.Second
 	}
-	s := &Server{store: cfg.Store, pol: cfg.Policies, log: cfg.Logger, cfg: cfg,
+	if cfg.Metrics == nil {
+		cfg.Metrics = prometheus.NewRegistry()
+	}
+	m, err := newMetrics(cfg.Metrics, cfg.Policies.Class)
+	if err != nil {
+		return nil, fmt.Errorf("frontier: registering metrics: %w", err)
+	}
+	s := &Server{store: timedStore{Store: cfg.Store, m: m}, pol: cfg.Policies, log: cfg.Logger, cfg: cfg, m: m,
 		pools: map[store.PoolName]*pool{}, draining: make(chan struct{}), health: health.NewServer()}
+	if err := cfg.Metrics.Register(newStateCollector(s)); err != nil {
+		return nil, fmt.Errorf("frontier: registering metrics: %w", err)
+	}
 	s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING) // until Run
 	return s, nil
 }
@@ -118,7 +135,7 @@ func (s *Server) serving(ok bool) {
 	s.health.SetServingStatus("", state)
 }
 
-// Register exposes the four services and the standard gRPC health service on a gRPC
+// Register exposes the five services and the standard gRPC health service on a gRPC
 // server.
 func (s *Server) Register(g grpc.ServiceRegistrar) {
 	healthpb.RegisterHealthServer(g, s.health)
@@ -126,6 +143,7 @@ func (s *Server) Register(g grpc.ServiceRegistrar) {
 	runv1.RegisterRunServiceServer(g, runService{s: s})
 	policyv1.RegisterPolicyServiceServer(g, policyService{s: s})
 	queuev1.RegisterQueueServiceServer(g, queueService{s: s})
+	sessionv1.RegisterSessionServiceServer(g, sessionService{s: s})
 }
 
 // Run registers the replica with the store and runs its background loops until ctx is
@@ -199,6 +217,7 @@ func (s *Server) reaper(ctx context.Context) {
 			case err != nil:
 				s.log.Warn("reaper: finishing lease", "lease", info.Ref.ID, "err", err)
 			case done == store.FinishAccepted:
+				s.m.expired(*info, f)
 				s.unserved.Delete(info.Task) // a worker took the task and ran its handler
 				// The worker that held the task is gone or stuck: worth a line.
 				s.log.Warn("lease expired", "run", info.Run, "task", info.Task, "queue", info.Queue,

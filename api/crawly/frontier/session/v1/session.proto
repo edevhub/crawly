@@ -1,0 +1,28 @@
+// Crawly Frontier API: sessions (operator API).
+//
+// A session is one open Work stream of one worker in one pool. It lives in the memory of
+// the replica that serves the stream.
+
+syntax = "proto3";
+
+package crawly.frontier.session.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/edevhub/crawly/internal/gen/frontier/session/v1;sessionv1";
+
+message Session {
+  string session_id = 1;
+  // Hello.worker_id and Hello.build_version, as the worker sent them.
+  string worker_id = 2;
+  string build_version = 3;
+  string pool = 4;
+  google.protobuf.Timestamp connected_time = 5;
+  // Execution slots the worker has granted and not yet used.
+  uint32 credits = 6;
+  // Assignments the session holds: leases dispatched to it or heartbeated on it that
+  // have not been completed.
+  uint32 unfinished_assignments = 7;
+  // The replica that holds the session.
+  string replica_id = 8;
+}

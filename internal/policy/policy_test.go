@@ -94,3 +94,20 @@ func TestRateTooSmall(t *testing.T) {
 		t.Fatalf("interval %v", got)
 	}
 }
+
+func TestClass(t *testing.T) {
+	s, _ := Parse([]byte(cfg))
+	for key, want := range map[string]string{"www.example.com": "example", "api.example.com": "example", "other.org": "all"} {
+		if got := s.Class(key); got != want {
+			t.Errorf("Class(%q) = %q, want %q", key, got, want)
+		}
+	}
+	none, _ := Parse([]byte(`{"policies": [{"name": "only", "match": {"queueKey": "a.org"}, "limits": {"ratePerSecond": 1}}]}`))
+	if got := none.Class("b.org"); got != builtin {
+		t.Errorf("Class of a queue no policy matches = %q, want %q", got, builtin)
+	}
+	empty, _ := New(nil)
+	if got := empty.Class("x"); got != builtin {
+		t.Errorf("Class with no policies = %q", got)
+	}
+}

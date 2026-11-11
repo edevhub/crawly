@@ -74,7 +74,8 @@ fails, depending on `GOTOOLCHAIN`.
 |---|---|
 | `github.com/edevhub/crawly/sdk/worker` | Writing spiders |
 | `github.com/edevhub/crawly/sdk` | The client for schedulers and operators |
-| `github.com/edevhub/crawly/sdk/run`, `sdk/task`, `sdk/policy`, `sdk/queue` | The API types, one package per API area |
+| `github.com/edevhub/crawly/sdk/run`, `sdk/task`, `sdk/policy`, `sdk/queue`, `sdk/session` | The API types, one package per API area |
+| `github.com/edevhub/crawly/sdk/worker/prom` | Prometheus metrics of a worker (see [Metrics](#metrics)); import it only if you want them |
 
 ## Writing a spider
 
@@ -148,6 +149,7 @@ One worker can register any number of handlers. A task is routed by its handler 
 | | `WithShutdownGrace(d)` | How long running handlers get to finish on shutdown |
 | | `WithInsecure()` or `WithDialOptions(...)` | Transport security has no default: plaintext must be asked for, or pass gRPC credentials |
 | | `WithLogger(l)` | `slog` logger |
+| | `WithMetrics(m)` | Report to a `worker.Metrics`; `prom.New(registry)` is the Prometheus one (see [Metrics](#metrics)). Default: none |
 | `Register` | `InPool(name)` | The pool that executes the handler. The worker opens one session per pool |
 | | `WithTimeout(d)` | Upper bound for one call of the handler |
 | `worker.HTTP` | `WithUserAgent(ua)` | User-Agent for requests that carry none |
@@ -338,7 +340,12 @@ breaks, which happens on every restart of a Frontier, and fails with `NotFound` 
 run does not exist. Underneath it is `WatchRuns`, a raw stream that starts with the run's
 current state when it is given a `RunId`. The other
 run calls are `PauseRun`, `ResumeRun`, `CancelRun`, `GetRun`, `ListRuns`, `ListTasks` and
-`GetTask`. `c.Queues` and `c.Policies` are the operator APIs.
+`GetTask`. `c.Queues`, `c.Policies` and `c.Sessions` are the operator APIs. `c.Sessions.ListSessions`
+lists the workers that are connected: for each session its id, worker id, build version, pool,
+connection time, unused credits, unfinished assignments and the replica that holds it. A
+session lives in the memory of the replica that serves its stream, so the call answers for
+the replica it reaches, and names it (`replica_id`). With several replicas, ask each one,
+e.g. through a headless service, or read `crawly_frontier_sessions` for the count per pool.
 
 A run can set limits for itself, for every site or for the sites a glob matches:
 
@@ -417,8 +424,103 @@ worker has fails with code `no_handler` after `-no-handler-grace` (one hour by d
 worker that stops lets its handlers finish for `WithShutdownGrace`, then cancels them and
 hands their tasks back, so a deploy never uses up a task's attempts.
 
+**Metrics.** `-metrics-addr :9090` serves Prometheus metrics at `/metrics`, in plain HTTP
+and without authentication, so bind it to a private interface. Without the flag nothing
+listens. See [Metrics](#metrics).
+
 **Logs.** A lease that expires is logged at `WARN` with its run, task and queue: the worker
 that held it has died or is stuck.
+
+## Metrics
+
+Both sides export Prometheus metrics, and neither opens a listener or touches the default
+registry on its own.
+
+**Frontier.** `crawly-frontier -metrics-addr :9090` serves `/metrics`, with the Go runtime
+and process collectors. When you embed the Frontier, pass a `prometheus.Registerer` as
+`frontier.Config.Metrics` and expose the registry yourself.
+
+**Worker SDK.** `worker.WithMetrics(m)` takes a small interface, `worker.Metrics`, so the
+SDK itself does not import a metrics library. The package `sdk/worker/prom` implements it
+with Prometheus. A spider that does not import `prom` does not link `client_golang` (the
+module's `go.mod` still lists it, and `sdk/local` and `sdk/crawlytest` link it because they run the Frontier in your process):
+
+```go
+reg := prometheus.NewRegistry()
+m, err := prom.New(reg)
+w, err := worker.New("frontier:7070", worker.WithInsecure(), worker.WithMetrics(m))
+// serve it yourself: http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+```
+
+### Label rules
+
+Queue keys are hosts, so there is no bound on them, and no metric carries one. Instead:
+
+- **`policy`** is the name of the most specific global policy that matches the queue, or
+  `builtin` when none does. A queue that has a policy of its own, or whose group has one
+  (`*.example.com`), gets its own series; the others fall into the policy that matches
+  them, or into `builtin`. The number of values is the number of policies plus one. To
+  watch a site on its own, give it a policy. To find one site that is misbehaving among
+  many, use the `ListQueues` call (`only_blocked`).
+- **`pool`, `worker` and `code`** are chosen by workers. Each is capped per process:
+  100 pools, 200 worker ids, 100 codes. A value past the cap is counted as `other`.
+  Worker ids label lease expiries only.
+- Nothing is labelled by run, task or URL.
+
+### Scope with several replicas
+
+Counters, histograms, `sessions`, `credits` and `assignments` are **per replica**: it counts
+what it did and holds. Sum them over replicas. The gauges that read the store
+(`pool_tasks`, `oldest_due_task_age_seconds`) are **global**: every replica reports the
+same figure, so use `max`, not `sum`. They are read at scrape time, at most once every five
+seconds, from the readiness index and the backlogs that have work, never from the tasks.
+When the store cannot be read they are left out.
+
+### Frontier metrics
+
+All names start with `crawly_frontier_`.
+
+| Name | Type | Labels | Scope | Serves the alert |
+|---|---|---|---|---|
+| `oldest_due_task_age_seconds` | gauge | `pool`, `policy` | global | Due work that nobody works. Age of the longest waiting ready work; absent when none is ready |
+| `sessions` | gauge | `pool` | replica | The same alert: `oldest_due_task_age_seconds > 300 and on(pool) sum(sessions) == 0`. 0 for a pool the replica knows and has no session in |
+| `pool_tasks` | gauge | `pool`, `state` (`pending`, `delayed`, `in_flight`) | global | Backlog size. `pending` is ready work, `delayed` waits for a time, a slot or a resume |
+| `credits`, `assignments` | gauge | `pool` | replica | Free slots workers granted; assignments held and not completed |
+| `lease_expiries_total` | counter | `worker`, `pool` | replica | A worker whose lease was reaped |
+| `queue_blocks_total` | counter | `policy` | replica | A site blocked the crawler |
+| `dispatch_wait_seconds` | histogram | `policy` | replica | Time spent keeping the pace: how long a task was eligible before it was dispatched |
+| `fetch_duration_seconds` | histogram | `policy` | replica | A slow site, from the fetch time workers report |
+| `released_tasks_total` | counter | `pool`, `code` (`no_handler`, `shutdown`, `undelivered`) | replica | Tasks going round between workers |
+| `dispatched_tasks_total` | counter | `pool`, `policy` | replica | Dispatches |
+| `task_outcomes_total` | counter | `pool`, `kind`, `code`, `result` | replica | Outcomes by the kind and code the worker gave, and what the Frontier decided (`succeeded`, `retry`, `failed`, `released`) |
+| `attempts_total` | counter | `pool` | replica | Attempts that ended; a release is not one |
+| `tasks_added_total` | counter | `source` (`seed`, `discovered`), `status` | replica | Added, `duplicate`, `over_budget`, `run_closed`, `invalid` |
+| `sessions_opened_total` | counter | `pool` | replica | Reconnects: a rate far above the number of workers |
+| `store_call_duration_seconds` | histogram | `method` | replica | A slow store |
+| `store_errors_total` | counter | `method`, `kind` (`unavailable`, `other`) | replica | A failing store. Answers such as not found or a stale lease are not failures |
+| `grpc_handled_total` | counter | `method`, `code` | replica | Calls finished. A `Work` call ends when its session does |
+| `replica_info` | gauge | `replica`, `policy_set` | replica | Always 1; ties a series to the replica `ListSessions` names |
+
+`oldest_due_task_age_seconds` measures how long a queue has been ready: not paused, not
+blocked, not held back by politeness or by its concurrency limit. A queue held back by
+its pace is not due. The store keeps the time a backlog became ready and may keep it
+earlier than it was, never later, so the age may be too long, never too short. At most the
+1000 longest ready backlogs of a pool are looked at, so a policy whose due work is younger
+than all of those is not shown while a large part of the pool is already late.
+
+### Worker metrics
+
+All names start with `crawly_worker_`; the registry of the process says which worker.
+
+| Name | Type | Labels | Meaning |
+|---|---|---|---|
+| `sessions` | gauge | `pool` | Sessions open with the Frontier: 0 while it reconnects |
+| `sessions_opened_total` | counter | `pool` | More than one per pool means the worker reconnected |
+| `tasks_running` | gauge | `pool`, `handler` | Handlers running now |
+| `tasks_finished_total` | counter | `pool`, `handler`, `kind`, `code` | How tasks ended: `success`, `retry`, `failed`, `released`, or `lost` when the lease was lost and nothing was reported. `handler` is `unregistered` for a task whose handler the worker lacks |
+| `task_duration_seconds` | histogram | `pool`, `handler` | How long handlers ran |
+| `fetch_duration_seconds` | histogram | `pool`, `handler` | Fetch duration the handler reported (`worker.HTTP` reports it) |
+| `leases_lost_total` | counter | `pool`, `reason` | `fenced`, `expired`, `run_cancelled`, `max_duration`, `no_extension`, `report_discarded` |
 
 ## Development
 

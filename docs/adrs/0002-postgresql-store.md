@@ -600,6 +600,28 @@ No locks: the core finishes each lease with `Source = Reaper`, and fencing makes
 a late worker completion safe (one of them gets `STALE`). Partitions with no in-flight tasks
 have empty `tasks_leases` indexes, so the scan touches only active partitions.
 
+### Pool statistics
+
+`PoolStats` serves the metrics and runs on every scrape, so it reads backlogs and never
+tasks. The totals per pool are one grouped read over the backlogs that have work
+(`backlogs_active`), joined to their runs, because the readiness of a backlog of a paused
+or ended run is only lowered by the next dispatch round and must not count. The queues
+whose work is ready come from the readiness index, one bounded read per pool:
+
+```sql
+SELECT b.queue_key, b.ready_at FROM backlogs b JOIN runs r USING (run_no)
+WHERE b.pool_id = $pool AND b.ready_at <= now() AND b.pending > 0
+  AND r.state IN ('open', 'sealed') AND NOT r.paused
+ORDER BY b.ready_at LIMIT $due_limit;
+```
+
+A backlog is ready when `ready_at` has come. A `NULL` or `'infinity'` readiness, and one in
+the future, count the backlog's tasks as delayed.
+
+The dispatch query returns each claimed task's creation time and `not_before`, from which
+the assignment's wait is computed, and the worker the lease was dispatched to is the
+`worker_id` the claim wrote.
+
 ### Run completion
 
 Runs inside Finish (step 9), inside `Maintain` after expiring or cancelling the last tasks of
