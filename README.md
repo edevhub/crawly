@@ -154,6 +154,8 @@ One worker can register any number of handlers. A task is routed by its handler 
 | | `WithHTTPClient(c)` | Your own client: proxies, cookies, TLS |
 | | `WithMaxBodyBytes(n)` | Largest body accepted; a larger one fails with `body_too_large`. Default 10 MiB |
 | | `WithContentTypes(types...)` | Parse only these media types; another one fails with `unsupported_content_type`. Default: all |
+| | `WithStatus(parser, statuses...)` | Hand these statuses to a parser instead of the default classification: a 404 that is a result, a 403 that is a block |
+| | `WithRedirect(func)` | Adjust the task added for a redirect before it is added, e.g. set its `DedupKey` |
 | | `WithSameHostRedirects()` | Follow redirects on the task's host inside the task. Each hop is a request on top of the site's rate limit, and it is not deduplicated |
 | | `WithCrossHostRedirects()` | Follow every redirect, also to other hosts, which are then fetched outside their own limits |
 
@@ -178,6 +180,27 @@ site for the `Retry-After` delay, 408 and 5xx retry, other statuses fail, and a 
 not followed: its target is added as a new task, so that the Frontier paces and deduplicates
 it like any other page. A parser can still return
 `worker.Retry` or `worker.Fail` for a 2xx page, for example a captcha served with status 200.
+
+A status means what the spider says it means. `WithStatus` hands a status to a parser of
+its own, whose return value is the outcome of the task:
+
+```go
+gone := worker.ParserFunc(func(ctx context.Context, t *worker.Task, r *worker.Response) (*worker.Result, error) {
+	return &worker.Result{Code: "gone"}, markGone(ctx, t.URL) // a 404 here is a result
+})
+h := worker.HTTP(parser,
+	worker.WithStatus(gone, http.StatusNotFound, http.StatusGone),
+	worker.WithStatus(worker.Blocked(72*time.Hour), http.StatusForbidden))
+```
+
+`worker.Blocked(d)` fails the task with code `blocked` and asks the Frontier to leave the
+site alone for `d`, for every run. A parser that recognises a challenge page served with
+status 200 can return the same: `return worker.Blocked(d).Parse(ctx, t, r)`.
+
+A 307 or 308 repeats the request, so the task added for it keeps the method and the body.
+It keeps the task's headers only on the same host: to another host, or from https to http,
+only `Accept`, `Accept-Language`, `Content-Language`, `Content-Type` and `User-Agent` go
+along, so that a site cannot send a spider's credentials to a host of its choosing.
 
 ### Delivery
 

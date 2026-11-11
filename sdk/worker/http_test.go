@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +28,7 @@ func (e *echo) Parse(_ context.Context, _ *Task, r *Response) (*Result, error) {
 	return e.res, e.err
 }
 
-func get(url string) *Task { return &Task{Method: http.MethodGet, URL: url} }
+func get(target string) *Task { return &Task{Method: http.MethodGet, URL: target} }
 
 // failure asserts err is a classified failure and returns it.
 func failure(t *testing.T, err error, kind Kind, code string) *Error {
@@ -318,24 +320,109 @@ func (via) RoundTrip(r *http.Request) (*http.Response, error) {
 	return http.DefaultTransport.RoundTrip(r)
 }
 
-// TestHTTPRedirectKeepsRequest: a 307 or 308 to another host repeats the request as it
-// was, so the discovered task carries the method, body and headers.
+// TestHTTPRedirectKeepsRequest: a 307 or 308 repeats the request as it was, so the
+// discovered task carries the method and body. The headers go along on the same host
+// only: another host gets the ones that describe the content.
 func TestHTTPRedirectKeepsRequest(t *testing.T) {
+	header := func() http.Header {
+		return http.Header{"X-Token": {"abc"}, "Authorization": {"Bearer secret"}, "Cookie": {"sid=1"},
+			"Content-Type": {"application/json"}, "Accept": {"application/json"}}
+	}
 	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		var target string
 		site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "https://other.example/search", status)
+			http.Redirect(w, r, target, status)
 		}))
-		task := &Task{Method: http.MethodPost, URL: site.URL, Body: []byte(`{"q":1}`), Header: http.Header{"X-Token": {"abc"}}}
-		res, err := HTTP(&echo{}).Handle(context.Background(), task)
+		handle := func(to string) NewTask {
+			target = to
+			res, err := HTTP(&echo{}).Handle(context.Background(),
+				&Task{Method: http.MethodPost, URL: site.URL + "/search", Body: []byte(`{"q":1}`), Header: header()})
+			if err != nil || len(res.Tasks) != 1 {
+				t.Fatalf("%d to %s: %+v %v", status, to, res, err)
+			}
+			next := res.Tasks[0]
+			if next.Method != http.MethodPost || string(next.Body) != `{"q":1}` {
+				t.Fatalf("%d to %s: the request was not carried over: %+v", status, to, next)
+			}
+			return next
+		}
+
+		next := handle("/v2/search")
+		if next.URL != site.URL+"/v2/search" || len(next.Header) != 5 || next.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("%d on the same host: %+v", status, next)
+		}
+		next = handle("https://other.example/search")
+		if next.URL != "https://other.example/search" || len(next.Header) != 2 ||
+			next.Header.Get("Content-Type") == "" || next.Header.Get("Accept") != "application/json" {
+			t.Fatalf("%d to another host: headers %v, want the content headers only", status, next.Header)
+		}
 		site.Close()
-		if err != nil || len(res.Tasks) != 1 {
-			t.Fatalf("%d: %+v %v", status, res, err)
-		}
-		next := res.Tasks[0]
-		if next.URL != "https://other.example/search" || next.Method != http.MethodPost || string(next.Body) != `{"q":1}` ||
-			next.Header.Get("X-Token") != "abc" {
-			t.Fatalf("%d: the request was not carried over: %+v", status, next)
-		}
+	}
+
+	// A step down from https to http on the same host does not carry them either.
+	from, _ := url.Parse("https://a.example/x")
+	to, _ := url.Parse("http://a.example/x")
+	if h := redirectHeader(header(), from, to); len(h) != 2 {
+		t.Fatalf("https to http: %v", h)
+	}
+	if h := redirectHeader(header(), to, from); len(h) != 5 {
+		t.Fatalf("http to https on the same host: %v", h)
+	}
+}
+
+// TestHTTPWithStatus: a status handed to a parser has the outcome the parser gives it.
+func TestHTTPWithStatus(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st, _ := strconv.Atoi(r.URL.Path[1:])
+		w.WriteHeader(st)
+		_, _ = fmt.Fprint(w, "body of ", st)
+	}))
+	defer site.Close()
+	ctx := context.Background()
+	main, gone := &echo{}, &echo{}
+	h := HTTP(main, WithStatus(gone, http.StatusNotFound, http.StatusGone), WithStatus(Blocked(72*time.Hour), http.StatusForbidden))
+
+	// A 404 is a result here: the parser sees the response and the task succeeds.
+	res, err := h.Handle(ctx, get(site.URL+"/404"))
+	if err != nil || gone.calls != 1 || main.calls != 0 || string(gone.resp.Body) != "body of 404" || gone.resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("404: %+v %v", res, err)
+	}
+	if res.Code != "http_404" || res.Fetch.HTTPStatus != 404 {
+		t.Fatalf("404: code %q, fetch %+v", res.Code, res.Fetch)
+	}
+	if _, err = h.Handle(ctx, get(site.URL+"/410")); err != nil || gone.calls != 2 {
+		t.Fatalf("410: %v", err)
+	}
+	// A 403 blocks the queue, and the fetch is still recorded.
+	res, err = h.Handle(ctx, get(site.URL+"/403"))
+	if e := failure(t, err, KindFail, CodeBlocked); e.BlockQueueFor != 72*time.Hour || res.Fetch.HTTPStatus != 403 {
+		t.Fatalf("403: %+v, fetch %+v", e, res.Fetch)
+	}
+	// The other statuses are classified as before.
+	if _, err = h.Handle(ctx, get(site.URL+"/200")); err != nil || main.calls != 1 {
+		t.Fatalf("200: %v", err)
+	}
+	_, err = h.Handle(ctx, get(site.URL+"/401"))
+	requireFailure(t, err, KindFail, "http_401")
+	_, err = h.Handle(ctx, get(site.URL+"/503"))
+	requireFailure(t, err, KindRetry, "http_503")
+}
+
+// TestHTTPWithRedirect: the spider can adjust the task added for a redirect.
+func TestHTTPWithRedirect(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/final?utm=1", http.StatusFound)
+	}))
+	defer site.Close()
+	h := HTTP(&echo{}, WithRedirect(func(t *Task, target *NewTask) {
+		target.DedupKey, target.Handler = "final", t.Handler+"_redirected"
+	}))
+	task := get(site.URL + "/start")
+	task.Handler = "page"
+	res, err := h.Handle(context.Background(), task)
+	if err != nil || len(res.Tasks) != 1 || res.Tasks[0].DedupKey != "final" || res.Tasks[0].Handler != "page_redirected" ||
+		res.Tasks[0].URL != site.URL+"/final?utm=1" {
+		t.Fatalf("%+v %v", res, err)
 	}
 }
 

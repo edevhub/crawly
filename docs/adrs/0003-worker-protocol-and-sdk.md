@@ -120,6 +120,13 @@ Both are the spider's side of the contract; the Frontier cannot see either.
 
   A spider can make the fetcher follow redirects on the same host, or all of them, for the
   sites that need it, and accepts the extra requests with it.
+
+  A 307 or 308 repeats the request, so its task keeps method and body. The headers of a
+  task are the spider's, and credentials sit in headers of its own naming as often as in
+  `Authorization` or `Cookie`. The task for the target therefore keeps them only on the same
+  host and without a step down from https to http; otherwise only the headers that
+  describe the content go along. The spider can adjust the task before it is added, which
+  is also where it sets its own dedup key.
 - **Dedup keys.** The Frontier's default dedup key is a simple normalisation of the URL
   (ADR 0001, Dedup). A spider sets `TaskSpec.dedup_key` whenever its site needs special
   rules: case-insensitive paths, tracking or session parameters, requests told apart by
@@ -136,7 +143,9 @@ else on this page.
 - **`Parser`** is the simpler strategy: `Parse(ctx, *Task, *Response) (*Result, error)`. The
   adapter `HTTP(parser, options...)` turns it into a `Handler`: it fetches, classifies the
   response (2xx parsed, 429 retried with a queue block, 408 and 5xx retried, other statuses
-  failed) and applies the redirect rule above.
+  failed) and applies the redirect rule above. The classification is a default: a spider
+  hands any status to a parser of its own, whose return value is then the outcome. That is
+  how a 404 becomes a result ("the product is gone") and a 403 a block of the queue.
 - **Registration:** `Worker.Register(name, handler, options...)`, where `name` is the task's
   `handler` field. Options are functional: `InPool(name)` (the worker opens one session per
   pool its handlers serve) and `WithTimeout(d)`. Functional options were chosen over an
