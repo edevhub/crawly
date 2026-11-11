@@ -255,7 +255,10 @@ type Welcome struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
 	// Frontier clock; workers never compute scheduling times from their own clock.
-	ServerTime    *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=server_time,json=serverTime,proto3" json:"server_time,omitempty"`
+	ServerTime *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=server_time,json=serverTime,proto3" json:"server_time,omitempty"`
+	// The frontier understands Outcome RELEASED. A worker sends that kind only to a
+	// frontier that says so: an older one would fail the task for good.
+	Releases      bool `protobuf:"varint,3,opt,name=releases,proto3" json:"releases,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -302,6 +305,13 @@ func (x *Welcome) GetServerTime() *timestamppb.Timestamp {
 		return x.ServerTime
 	}
 	return nil
+}
+
+func (x *Welcome) GetReleases() bool {
+	if x != nil {
+		return x.Releases
+	}
+	return false
 }
 
 // One credit is one execution slot. Credits are additive; the frontier never holds more
@@ -982,12 +992,13 @@ const file_crawly_frontier_worker_v1_worker_proto_rawDesc = "" +
 	"\x05Hello\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12#\n" +
 	"\rbuild_version\x18\x02 \x01(\tR\fbuildVersion\x12\x12\n" +
-	"\x04pool\x18\x05 \x01(\tR\x04poolJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05\"e\n" +
+	"\x04pool\x18\x05 \x01(\tR\x04poolJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05\"\x81\x01\n" +
 	"\aWelcome\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12;\n" +
 	"\vserver_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"serverTime\"\x1e\n" +
+	"serverTime\x12\x1a\n" +
+	"\breleases\x18\x03 \x01(\bR\breleases\"\x1e\n" +
 	"\x06Credit\x12\x14\n" +
 	"\x05slots\x18\x01 \x01(\rR\x05slots\"\t\n" +
 	"\aGoodbye\"J\n" +

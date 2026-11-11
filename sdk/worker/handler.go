@@ -130,12 +130,10 @@ const (
 	KindRetry Kind = iota + 1
 	// KindFail is a permanent failure. It is never retried.
 	KindFail
-	// kindRelease hands the task back to the Frontier: it was not run to an end, and
-	// no attempt is counted.
-	kindRelease
 )
 
-// Codes of a task the worker hands back.
+// Codes of a task the worker hands back to the Frontier: it was not run to an end,
+// and no attempt is counted. Only the SDK decides that; a handler cannot.
 const (
 	codeNoHandler = "no_handler"
 	codeShutdown  = "shutdown"

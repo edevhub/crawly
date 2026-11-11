@@ -39,14 +39,19 @@ This ADR borrows it.
   rolling deploy the workers of the old build share a pool with the build that added a
   handler. The Frontier returns the task to its backlog without counting an attempt, holds
   it for a short delay and gives it out again, to whichever session is next. It fails the
-  task with code `no_handler` only when no worker ran it for a configured time (one hour by
-  default), so a handler nobody has still shows in the run's stats.
+  task with code `no_handler` only when no worker could run it for a configured time (one
+  hour by default). The time starts with the first worker that lacks the handler and ends
+  with the first worker that runs the task, whatever the result, so a long deploy does not
+  fail a task that is being served.
   - Dispatch does not select by handler. The store claims work by pool and queue, and a
     handler filter under that would leave a backlog whose head no session can run. The
     price of the simpler rule is that every round of a handed-back task takes a politeness
     slot of its queue; the delay bounds that.
-  - The time is kept per replica, in memory. A restart starts it again, which only delays
-    the failure.
+  - The time is kept per replica, in memory, one entry per task that is going round. A
+    restart starts it again. Replicas that restart more often than the configured time
+    therefore never fail such a task: it keeps going round until a worker has its handler
+    or its run ends. The Frontier logs the first hand-back of a task and its failure; the
+    run's stats show the code only once the task failed.
 
 ### Credits
 
@@ -120,7 +125,16 @@ number is used again. The SDK sends it in two cases:
   of a task that was not at fault.
 
 A handler cannot return it: a spider that could hand back any task at will could keep a
-task alive for ever.
+task alive for ever. For the same reason the Frontier accepts `RELEASED` with these two
+codes only, and treats any other code as `FAILED`.
+
+An outcome the handler classified itself stands, also when it arrives at the moment of the
+cut: only a handler that returns its cancellation is handed back.
+
+A Frontier says in `Welcome.releases` that it understands `RELEASED`. To a Frontier that
+does not, the SDK sends what it sent before: `FAILED` for a missing handler, and nothing
+for a cut handler, whose lease then expires. Workers and Frontier can therefore be
+upgraded in any order.
 
 Codes the SDK reports itself: `no_handler` and `shutdown` (`RELEASED`), `panic` (a handler
 panicked: `RETRY`) and `redirect` (`SUCCESS`: the target of the redirect was added as a

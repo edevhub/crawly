@@ -50,7 +50,9 @@ const (
 	Outcome_KIND_FAILED Outcome_Kind = 3
 	// The worker hands the task back without having run it to an end: it lacks the
 	// task's handler, or it shut down. The attempt is not counted and no attempt is
-	// recorded; another worker gets the task.
+	// recorded; another worker gets the task. Valid with the codes "no_handler" and
+	// "shutdown" only, and only when Welcome.releases is set; with any other code it
+	// is a permanent failure.
 	Outcome_KIND_RELEASED Outcome_Kind = 4
 )
 

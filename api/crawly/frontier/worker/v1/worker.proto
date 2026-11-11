@@ -28,6 +28,9 @@ message Welcome {
   string session_id = 1;
   // Frontier clock; workers never compute scheduling times from their own clock.
   google.protobuf.Timestamp server_time = 2;
+  // The frontier understands Outcome RELEASED. A worker sends that kind only to a
+  // frontier that says so: an older one would fail the task for good.
+  bool releases = 3;
 }
 
 // One credit is one execution slot. Credits are additive; the frontier never holds more
