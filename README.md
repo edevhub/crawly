@@ -51,6 +51,12 @@ change the schema on its own and refuses to start on a database that is behind i
 The migrations are recorded in the table `crawly_migrations`; to use another name, pass
 `-postgres-migrations-table` (or `CRAWLY_POSTGRES_MIGRATIONS_TABLE`) to both commands.
 
+A migration only adds to the schema, so the replicas of the previous version keep running on
+a migrated database, and you can migrate first and then roll the replicas. Indexes on the
+task tables are built without blocking writes, so on a large database `migrate` can take a
+while; running it again finishes an interrupted build. To go back, stop the new replicas and
+start the old ones; the added tables stay until a later migration removes what they replace.
+
 `-postgres` takes the same URL. When that URL goes through a transaction pooler such as
 PgBouncer, give the Frontier a direct one for `LISTEN` with `-postgres-listen` (or
 `CRAWLY_POSTGRES_LISTEN`).
@@ -136,7 +142,7 @@ err := w.Register("render", worker.HandlerFunc(func(ctx context.Context, t *work
 }), worker.InPool("browser"), worker.WithTimeout(2*time.Minute))
 ```
 
-One worker can register any number of handlers. A task is routed by its handler name.
+One worker can register any number of handlers. A task is routed by its handler name: the worker is given only tasks of the handlers it registered.
 
 ### Options
 
@@ -469,12 +475,23 @@ monthly partitions, and `-retain-tasks 2160h` drops a partition once every run i
 older than that and has no work left; the in-memory store deletes a run's tasks with the
 run.
 
-**Deploys.** A worker that is given a task for a handler it does not have hands the task
-back, and the Frontier gives it to another worker of the pool. A rolling deploy that adds
-or renames a handler therefore loses nothing while both builds run. A task whose handler no
-worker has fails with code `no_handler` after `-no-handler-grace` (one hour by default). A
-worker that stops lets its handlers finish for `WithShutdownGrace`, then cancels them and
-hands their tasks back, so a deploy never uses up a task's attempts.
+**Deploys.** A worker tells the Frontier which handlers it registered, and the Frontier
+gives it only tasks of those handlers. In a rolling deploy that adds or renames a handler,
+the workers of the old build are never given the new handler's tasks and the new ones are
+given them at once: no task goes round, none is dispatched twice, and none is lost. A task
+whose handler no worker has waits in its queue without using a politeness slot. It fails
+with code `no_handler` when no Frontier replica has had a session with the handler for
+`-no-handler-grace` (one hour by default; counted in the store, so a restart does not reset
+it, but nothing fails until that time has passed since the newest replica started). A
+worker of an older SDK counts as able to run any handler of its pool, so while one is
+connected no task of its pool fails this way. The Frontier logs each failure at `WARN`, and,
+once in a while, each handler whose tasks wait, with the number of queues and runs that
+have them; failed tasks are found by code `no_handler`. A worker
+that stops lets its handlers finish for `WithShutdownGrace`, then cancels them and hands
+their tasks back, so a deploy never uses up a task's attempts. Workers of an older SDK name
+no handlers: they are offered every task of their pool and hand back the ones they cannot
+run, as they did before, and a Frontier of an older version offers every task to every
+worker. Either can be upgraded first.
 
 **Logs.** A lease that expires is logged at `WARN` with its run, task and queue: the worker
 that held it has died or is stuck.

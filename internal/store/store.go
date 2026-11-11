@@ -85,8 +85,9 @@ type Work interface {
 	// AddTasks adds seeds (Parent nil; run must be open) or discovered tasks (Parent
 	// set; the parent lease must be live). One result per task, in order.
 	AddTasks(ctx context.Context, req AddRequest) ([]AddResult, error)
-	// Dispatch claims up to req.Slots tasks of req.Pool, following the scheduling model.
-	// It never blocks waiting for work. It can return assignments together with an
+	// Dispatch claims up to req.Slots tasks of req.Pool that the session can run (see
+	// DispatchRequest.Handlers), following the scheduling model. It never blocks
+	// waiting for work. It can return assignments together with an
 	// error; every assignment returned is committed and must be delivered.
 	Dispatch(ctx context.Context, req DispatchRequest) (DispatchResult, error)
 	// Lease returns what the core needs to decide a transition for a lease. A plain
@@ -115,6 +116,22 @@ type Inspect interface {
 type Background interface {
 	// Start registers the replica and its policy set.
 	Start(ctx context.Context, r Replica) error
+	// ServeHandlers records that this replica has sessions that can run these handlers.
+	// It is called when the sessions change and, while they stay, more often than the
+	// grace period of SweepUnserved. SweepUnserved reads it, and so does Dispatch: work
+	// in another pool that none of the pool's sessions can run is not given first
+	// refusal on a queue.
+	ServeHandlers(ctx context.Context, sets []PoolHandlers) error
+	// SweepUnserved looks for pending tasks whose handler no session can run. It fails
+	// the ones that waited longer than grace (code CodeNoHandler, no attempt recorded)
+	// and reports the handlers whose tasks wait. A handler is served from the moment a
+	// replica reports it until grace after the last report; a task waits from its
+	// creation, and no grace ends before one has passed since the newest replica
+	// started. A call is one bounded round: the store keeps where the last round
+	// stopped, and a call that comes sooner than a quarter of grace (at most a
+	// minute) after another, from any replica, does nothing. Safe to call
+	// concurrently.
+	SweepUnserved(ctx context.Context, grace time.Duration) (Unserved, error)
 	// Notifications delivers coalesced wake-ups until ctx is done. A missed
 	// notification only delays work until the next NextReadyAt or poll.
 	Notifications(ctx context.Context) (<-chan Notification, error)
@@ -153,6 +170,48 @@ type LeaseSettings struct {
 type Replica struct {
 	ID         string
 	PolicyHash string
+}
+
+// CodeNoHandler is the code of a task that no worker had a handler for during the grace
+// period.
+const CodeNoHandler = "no_handler"
+
+// PoolHandlers is the set of handlers the sessions of one pool can run. The handler
+// "" stands for a session that names no handlers and so can run any: while one is
+// reported, no handler of the pool counts as unserved.
+type PoolHandlers struct {
+	Pool     PoolName
+	Handlers []string
+}
+
+// HandlerRef names a handler within a pool.
+type HandlerRef struct {
+	Pool    PoolName
+	Handler string
+}
+
+// FailedTasks counts tasks failed because no session could run their handler.
+type FailedTasks struct {
+	HandlerRef
+	Tasks int
+}
+
+// WaitingHandler is a handler whose tasks wait because no session can run it.
+type WaitingHandler struct {
+	HandlerRef
+	Lanes int // the queues and runs with such tasks; counted up to a bound
+}
+
+// Unserved is what SweepUnserved found.
+type Unserved struct {
+	Waiting []WaitingHandler // handlers with pending tasks that no live session can run
+	Failed  []FailedTasks    // tasks failed by this call
+	// Held is set when tasks wait and nothing may fail yet, because a replica
+	// started less than the grace period ago.
+	Held bool
+	// Report is set on at most one call in a while, cluster-wide: the caller logs
+	// what waits then, so that the replicas do not each log the same lines.
+	Report bool
 }
 
 // Notification is a coalesced wake-up for the dispatch loop or run watchers.
@@ -339,6 +398,7 @@ type NewTask struct {
 	Fingerprint Fingerprint
 	Queue       QueueKey
 	Pool        PoolName
+	Handler     string // the handler that runs the task; empty: unknown, offered to every session
 	Priority    int32
 	NotBefore   time.Time     // zero: immediately
 	TTL         time.Duration // 0: none
@@ -369,7 +429,11 @@ type DispatchRequest struct {
 	Session SessionID
 	Worker  WorkerInfo
 	Pool    PoolName
-	Slots   int
+	// Handlers are the task handlers the session can run. Only tasks of these handlers
+	// are claimed, and tasks with no handler, which any session may try. Empty: the
+	// session names none, and every task of the pool is claimed.
+	Handlers []string
+	Slots    int
 }
 
 // WorkerInfo identifies a worker process.

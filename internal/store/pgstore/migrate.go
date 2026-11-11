@@ -115,7 +115,81 @@ func (m *Migrator) Up(ctx context.Context) ([]Migration, error) {
 	if err != nil {
 		return applied, fmt.Errorf("pgstore: migrating: %w", err)
 	}
+	// The indexes that migration 2 declares on tasks are built here, on the partitions
+	// that exist, without a lock that stops writes. Every call checks them, so a build
+	// that was interrupted is finished by the next one.
+	if err := buildTaskIndexes(ctx, m.db); err != nil {
+		return applied, fmt.Errorf("pgstore: building the indexes of tasks: %w", err)
+	}
 	return applied, nil
+}
+
+// partitionsOfTasks lists the partitions of tasks.
+func partitionsOfTasks(ctx context.Context, conn *sql.Conn) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = to_regclass('tasks') ORDER BY c.relname`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var parts []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		parts = append(parts, name)
+	}
+	return parts, rows.Err()
+}
+
+// taskIndexes are the indexes migration 2 declares ON ONLY tasks: the partitions get
+// theirs from buildTaskIndexes, and the partitions created later from the parent.
+var taskIndexes = []struct{ parent, suffix, columns string }{
+	{"tasks_claim_h", "claim_h", `(run_no, queue_key, pool_id, handler, priority DESC, task_id)
+		INCLUDE (not_before, expires_at) WHERE state = 'pending'`},
+	{"tasks_next_h", "next_h", `(run_no, queue_key, pool_id, handler, not_before) WHERE state = 'pending'`},
+}
+
+// buildTaskIndexes gives every partition of tasks the indexes of taskIndexes. Each is
+// created with CREATE INDEX CONCURRENTLY, which waits for the transactions that run
+// but never stops a write, and attached to the parent index. It leaves what exists
+// alone, and replaces an index that an interrupted build left invalid.
+func buildTaskIndexes(ctx context.Context, db *sql.DB) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	parts, err := partitionsOfTasks(ctx, conn)
+	if err != nil {
+		return err
+	}
+	for _, part := range parts {
+		for _, ix := range taskIndexes {
+			name := pgx.Identifier{part + "_" + ix.suffix}.Sanitize()
+			var attached bool
+			if err := conn.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_index x
+					JOIN pg_inherits ih ON ih.inhrelid = x.indexrelid
+					WHERE ih.inhparent = to_regclass($1) AND x.indrelid = to_regclass($2) AND x.indisvalid)`,
+				ix.parent, pgx.Identifier{part}.Sanitize()).Scan(&attached); err != nil {
+				return err
+			}
+			if attached {
+				continue
+			}
+			for _, stmt := range []string{
+				"DROP INDEX CONCURRENTLY IF EXISTS " + name,
+				"CREATE INDEX CONCURRENTLY " + name + " ON " + pgx.Identifier{part}.Sanitize() + " " + ix.columns,
+				"ALTER INDEX " + ix.parent + " ATTACH PARTITION " + name,
+			} {
+				if _, err := conn.ExecContext(ctx, stmt); err != nil {
+					return fmt.Errorf("%s: %w", stmt, err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // Status lists every migration of this build, in order.

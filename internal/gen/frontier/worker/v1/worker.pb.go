@@ -192,10 +192,14 @@ type Hello struct {
 	WorkerId string `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	// Spider build version. Informational; recorded on every attempt for lineage.
 	BuildVersion string `protobuf:"bytes,2,opt,name=build_version,json=buildVersion,proto3" json:"build_version,omitempty"`
-	// Required. The pool this session serves, e.g. "default" or "browser". A task whose
-	// handler the worker lacks is handed back (Outcome RELEASED, code "no_handler").
-	// Pool names match [a-z0-9_]{1,32}.
-	Pool          string `protobuf:"bytes,5,opt,name=pool,proto3" json:"pool,omitempty"`
+	// Required. The pool this session serves, e.g. "default" or "browser". Pool names match
+	// [a-z0-9_]{1,32}.
+	Pool string `protobuf:"bytes,5,opt,name=pool,proto3" json:"pool,omitempty"`
+	// The handlers this session can run, i.e. the task handler names the worker registered
+	// for the pool. The frontier gives the session only tasks of these handlers. Empty: the
+	// session is offered every task of its pool and hands back (Outcome RELEASED, code
+	// "no_handler") the ones it cannot run, as workers that predate this field do.
+	Handlers      []string `protobuf:"bytes,6,rep,name=handlers,proto3" json:"handlers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -249,6 +253,13 @@ func (x *Hello) GetPool() string {
 		return x.Pool
 	}
 	return ""
+}
+
+func (x *Hello) GetHandlers() []string {
+	if x != nil {
+		return x.Handlers
+	}
+	return nil
 }
 
 type Welcome struct {
@@ -988,11 +999,12 @@ var File_crawly_frontier_worker_v1_worker_proto protoreflect.FileDescriptor
 
 const file_crawly_frontier_worker_v1_worker_proto_rawDesc = "" +
 	"\n" +
-	"&crawly/frontier/worker/v1/worker.proto\x12\x19crawly.frontier.worker.v1\x1a\"crawly/frontier/task/v1/task.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"i\n" +
+	"&crawly/frontier/worker/v1/worker.proto\x12\x19crawly.frontier.worker.v1\x1a\"crawly/frontier/task/v1/task.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x85\x01\n" +
 	"\x05Hello\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12#\n" +
 	"\rbuild_version\x18\x02 \x01(\tR\fbuildVersion\x12\x12\n" +
-	"\x04pool\x18\x05 \x01(\tR\x04poolJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05\"\x81\x01\n" +
+	"\x04pool\x18\x05 \x01(\tR\x04pool\x12\x1a\n" +
+	"\bhandlers\x18\x06 \x03(\tR\bhandlersJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05\"\x81\x01\n" +
 	"\aWelcome\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12;\n" +
