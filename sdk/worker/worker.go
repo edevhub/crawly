@@ -100,6 +100,7 @@ type Worker struct {
 	grace     time.Duration
 	dial      []grpc.DialOption
 	log       *slog.Logger
+	metrics   Metrics
 
 	mu       sync.Mutex
 	handlers map[string]*registration // by handler name
@@ -115,7 +116,7 @@ func New(target string, opts ...Option) (*Worker, error) {
 	}
 	host, _ := os.Hostname()
 	w := &Worker{target: target, id: fmt.Sprintf("%s-%d", host, os.Getpid()), maxTasks: 8,
-		grace: 30 * time.Second, log: slog.Default(), handlers: map[string]*registration{}}
+		grace: 30 * time.Second, log: slog.Default(), metrics: noMetrics{}, handlers: map[string]*registration{}}
 	for _, o := range opts {
 		o(w)
 	}
@@ -260,6 +261,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	client := workerv1.NewWorkerServiceClient(conn)
 	var wg sync.WaitGroup
 	for pool := range pools {
+		w.metrics.PoolStarted(pool)
 		r := &runner{w: w, pool: pool, client: client, running: map[string]*active{}, idle: make(chan struct{}, 1)}
 		wg.Go(func() { r.run(ctx) })
 	}
@@ -442,6 +444,12 @@ func (r *runner) session(ctx, hctx context.Context) error {
 		r.sendMu.Unlock()
 	}()
 
+	welcomed := false
+	defer func() {
+		if welcomed {
+			r.w.metrics.SessionClosed(r.pool)
+		}
+	}()
 	for {
 		m, err := stream.Recv()
 		if err != nil {
@@ -452,11 +460,15 @@ func (r *runner) session(ctx, hctx context.Context) error {
 			r.mu.Lock()
 			r.releases = msg.Welcome.GetReleases()
 			r.mu.Unlock()
+			if !welcomed {
+				welcomed = true
+				r.w.metrics.SessionOpened(r.pool)
+			}
 			r.w.log.Info("session opened", "pool", r.pool, "session", msg.Welcome.GetSessionId())
 		case *workerv1.WorkResponse_Assignment:
 			r.start(hctx, msg.Assignment)
 		case *workerv1.WorkResponse_Revoked:
-			r.revoke(msg.Revoked.GetLeaseId(), msg.Revoked.GetReason().String())
+			r.revoke(msg.Revoked.GetLeaseId(), msg.Revoked.GetReason().String(), revokeReason(msg.Revoked.GetReason()))
 		case *workerv1.WorkResponse_Extended:
 			r.extended(msg.Extended.GetLeaseId())
 		case *workerv1.WorkResponse_DiscoverAck:
@@ -468,6 +480,7 @@ func (r *runner) session(ctx, hctx context.Context) error {
 		case *workerv1.WorkResponse_CompleteAck:
 			if st := msg.CompleteAck.GetStatus(); st != workerv1.CompleteAck_STATUS_ACCEPTED {
 				r.w.log.Warn("a result was discarded: the lease was lost", "lease", msg.CompleteAck.GetLeaseId(), "status", st.String())
+				r.w.metrics.LeaseLost(r.pool, "report_discarded")
 			}
 			r.ackComplete(msg.CompleteAck.GetLeaseId())
 		case *workerv1.WorkResponse_Drain:
@@ -630,7 +643,25 @@ func (r *runner) ackComplete(leaseID string) {
 	r.checkIdle()
 }
 
-func (r *runner) revoke(leaseID, reason string) {
+// revokeReason is the short name of a revocation reason, for Metrics.LeaseLost.
+func revokeReason(r workerv1.LeaseRevoked_Reason) string {
+	switch r {
+	case workerv1.LeaseRevoked_REASON_FENCED:
+		return "fenced"
+	case workerv1.LeaseRevoked_REASON_EXPIRED:
+		return "expired"
+	case workerv1.LeaseRevoked_REASON_RUN_CANCELLED:
+		return "run_cancelled"
+	case workerv1.LeaseRevoked_REASON_MAX_DURATION:
+		return "max_duration"
+	case workerv1.LeaseRevoked_REASON_UNSPECIFIED:
+	}
+	return "unknown"
+}
+
+// revoke cancels the handler of a lease the worker lost. reason is for the log, why for
+// Metrics.LeaseLost.
+func (r *runner) revoke(leaseID, reason, why string) {
 	r.mu.Lock()
 	a := r.running[leaseID]
 	if a != nil {
@@ -638,6 +669,7 @@ func (r *runner) revoke(leaseID, reason string) {
 	}
 	r.mu.Unlock()
 	if a != nil {
+		r.w.metrics.LeaseLost(r.pool, why)
 		r.w.log.Warn("lease revoked, cancelling the handler", "lease", leaseID, "reason", reason)
 		a.cancel()
 	}
@@ -668,6 +700,12 @@ func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 	r.credits = max(r.credits-1, 0) // the assignment used one
 	r.mu.Unlock()
 
+	handler := ""
+	if reg != nil {
+		handler = reg.name // a name the worker registered: the task's own may be anything
+	}
+	r.w.metrics.TaskStarted(r.pool, handler)
+	began := time.Now()
 	r.handlers.Go(func() {
 		defer cancel()
 		var res *Result
@@ -711,14 +749,39 @@ func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 			r.unacked = append(r.unacked, rep)
 		}
 		r.mu.Unlock()
+		done := TaskDone{Pool: r.pool, Handler: handler, Kind: "lost", Duration: time.Since(began)}
+		if res != nil {
+			done.Fetch = res.Fetch
+		}
+		if rep != nil {
+			done.Kind, done.Code = outcomeKind(rep.complete.GetOutcome().GetKind()), rep.complete.GetOutcome().GetCode()
+		}
 		// A lost lease is not reported: only its slot is returned.
 		if rep != nil {
 			r.sendReportLocked(rep)
 		}
 		r.grantLocked()
 		r.sendMu.Unlock()
+		// Outside the locks: the implementation is the caller's.
+		r.w.metrics.TaskFinished(done)
 		r.checkIdle()
 	})
+}
+
+// outcomeKind is the name Metrics gives a reported outcome kind.
+func outcomeKind(k taskv1.Outcome_Kind) string {
+	switch k {
+	case taskv1.Outcome_KIND_SUCCESS:
+		return "success"
+	case taskv1.Outcome_KIND_RETRY:
+		return "retry"
+	case taskv1.Outcome_KIND_FAILED:
+		return "failed"
+	case taskv1.Outcome_KIND_RELEASED:
+		return "released"
+	case taskv1.Outcome_KIND_UNSPECIFIED:
+	}
+	return "unknown"
 }
 
 // call runs the handler, turning a panic into a retryable failure.
@@ -774,7 +837,7 @@ func (r *runner) heartbeat(ctx context.Context, a *active, d time.Duration) (sto
 				}
 				r.mu.Unlock()
 				if expired {
-					r.revoke(a.leaseID, "the lease ran out without an extension")
+					r.revoke(a.leaseID, "the lease ran out without an extension", "no_extension")
 					return
 				}
 				r.send(&workerv1.WorkRequest{Msg: &workerv1.WorkRequest_Extend{Extend: &workerv1.ExtendLease{

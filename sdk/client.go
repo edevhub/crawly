@@ -2,7 +2,7 @@
 //
 //   - sdk/worker: write spiders. Implement a Handler or a Parser and register it.
 //   - sdk (this package): Client, a connection for schedulers and operators.
-//   - sdk/run, sdk/task, sdk/policy, sdk/queue: the API types and service clients.
+//   - sdk/run, sdk/task, sdk/policy, sdk/queue, sdk/session: the API types and service clients.
 //   - sdk/local: a Frontier inside your process, for dry runs.
 //   - sdk/crawlytest: the same inside a test, to test a spider end to end.
 //
@@ -37,6 +37,7 @@ import (
 	"github.com/edevhub/crawly/sdk/policy"
 	"github.com/edevhub/crawly/sdk/queue"
 	"github.com/edevhub/crawly/sdk/run"
+	"github.com/edevhub/crawly/sdk/session"
 	"github.com/edevhub/crawly/sdk/task"
 )
 
@@ -45,6 +46,7 @@ type Client struct {
 	Runs     run.Client
 	Policies policy.Client
 	Queues   queue.Client
+	Sessions session.Client
 	conn     *grpc.ClientConn
 }
 
@@ -68,7 +70,8 @@ func NewClient(target string, dial ...grpc.DialOption) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{Runs: run.NewClient(conn), Policies: policy.NewClient(conn), Queues: queue.NewClient(conn), conn: conn}, nil
+	return &Client{Runs: run.NewClient(conn), Policies: policy.NewClient(conn), Queues: queue.NewClient(conn),
+		Sessions: session.NewClient(conn), conn: conn}, nil
 }
 
 // checkAbortRules fails a CreateRun whose abort rules the Frontier did not keep. A

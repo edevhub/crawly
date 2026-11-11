@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -385,4 +386,78 @@ func (s *Store) BlockQueue(ctx context.Context, key store.QueueKey, until time.T
 		return store.Queue{}, err
 	}
 	return s.GetQueue(ctx, key)
+}
+
+// PoolStats sums the work of every pool across all runs. The totals come from the
+// backlogs that have work (backlogs_active), one row per backlog, each with the
+// earliest readiness of its lanes (lanes is where readiness is kept; backlogs.ready_at
+// is only a copy for the build before); no task is read. The due queues come from the
+// readiness index of the lanes (lanes_ready_pool), the dueLimit oldest lanes of each
+// pool. A backlog of a paused or ended run is not ready, whatever its lanes say: they
+// are only lowered by the next dispatch round (heal).
+func (s *Store) PoolStats(ctx context.Context, dueLimit int) ([]store.PoolStats, error) {
+	now, err := s.Now(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(ctx, `SELECT p.name,
+			coalesce(sum(b.pending) FILTER (WHERE l.ready_at <= $1 AND r.state IN ('open', 'sealed') AND NOT r.paused), 0),
+			coalesce(sum(b.pending) FILTER (WHERE NOT (l.ready_at <= $1 AND r.state IN ('open', 'sealed') AND NOT r.paused)), 0),
+			coalesce(sum(b.in_flight), 0)
+		FROM backlogs b JOIN pools p ON p.pool_id = b.pool_id JOIN runs r ON r.run_no = b.run_no
+		LEFT JOIN LATERAL (SELECT min(ready_at) AS ready_at FROM lanes
+			WHERE run_no = b.run_no AND queue_key = b.queue_key AND pool_id = b.pool_id) l ON true
+		WHERE b.pending > 0 OR b.in_flight > 0 GROUP BY p.name ORDER BY p.name`, now)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (store.PoolStats, error) {
+		var ps store.PoolStats
+		var pool string
+		var pending, delayed, inFlight int64
+		err := row.Scan(&pool, &pending, &delayed, &inFlight)
+		ps.Pool = store.PoolName(pool)
+		ps.Pending, ps.Delayed, ps.InFlight = uint64(max(pending, 0)), uint64(max(delayed, 0)), uint64(max(inFlight, 0))
+		return ps, err
+	})
+	if err != nil {
+		return nil, wrap(err)
+	}
+	if dueLimit < 0 {
+		dueLimit = 0
+	}
+	rows, err = s.db.Query(ctx, `SELECT p.name, d.queue_key, min(d.ready_at)
+		FROM pools p CROSS JOIN LATERAL (
+			SELECT l.queue_key, l.ready_at FROM lanes l
+			JOIN backlogs b ON b.run_no = l.run_no AND b.queue_key = l.queue_key AND b.pool_id = l.pool_id
+			JOIN runs r ON r.run_no = l.run_no
+			WHERE l.pool_id = p.pool_id AND l.ready_at <= $1 AND b.pending > 0 AND r.state IN ('open', 'sealed') AND NOT r.paused
+			ORDER BY l.ready_at LIMIT $2) d
+		GROUP BY p.name, d.queue_key ORDER BY min(d.ready_at), d.queue_key`, now, dueLimit)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	type due struct {
+		pool string
+		d    store.DueQueue
+	}
+	dues, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (due, error) {
+		var d due
+		var key string
+		var since pgtype.Timestamptz
+		err := row.Scan(&d.pool, &key, &since)
+		d.d = store.DueQueue{Queue: store.QueueKey(key), Since: timeOf(since)}
+		return d, err
+	})
+	if err != nil {
+		return nil, wrap(err)
+	}
+	for _, d := range dues {
+		i := slices.IndexFunc(out, func(ps store.PoolStats) bool { return string(ps.Pool) == d.pool })
+		if i < 0 {
+			continue // the pool's work was dispatched between the two reads
+		}
+		out[i].Due = append(out[i].Due, d.d)
+	}
+	return out, nil
 }

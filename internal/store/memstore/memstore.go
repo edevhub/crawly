@@ -170,6 +170,7 @@ type task struct {
 	priority  int32
 	seq       uint64
 	notBefore time.Time
+	eligible  time.Time // when the task last became eligible: creation, not-before or retry time
 	expiresAt time.Time
 	strained  uint32          // attempts that ended in a retry with strain
 	state     store.TaskState // Pending, InFlight or a final state; Delayed is derived
@@ -495,7 +496,7 @@ func (s *Store) AddTasks(_ context.Context, req store.AddRequest) ([]store.AddRe
 			s.seq++
 			t := &task{id: store.TaskID("t" + strconv.FormatUint(s.seq, 36)), r: r, fp: nt.Fingerprint,
 				depth: depth, parent: parent, spec: nt.Spec, handler: nt.Handler, label: nt.Label, created: now, priority: nt.Priority, seq: s.seq,
-				notBefore: nt.NotBefore, state: store.TaskPending}
+				notBefore: nt.NotBefore, eligible: later(now, nt.NotBefore), state: store.TaskPending}
 			if nt.TTL > 0 {
 				t.expiresAt = now.Add(nt.TTL)
 				s.ttl[t] = struct{}{}
@@ -743,6 +744,7 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, h handlerSet,
 		for _, t := range claimed {
 			delete(s.ttl, t)
 			s.leased[t] = struct{}{}
+			waited := max(now.Sub(t.eligible), 0)
 			t.state, t.worker, t.dispatch = store.TaskInFlight, req.Worker, now
 			t.attempt++
 			t.nonce = nonce()
@@ -753,9 +755,10 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, h handlerSet,
 				t.deadline = t.expires
 			}
 			res.Assignments = append(res.Assignments, store.Assignment{
-				Lease: store.Lease{Ref: store.LeaseRef{ID: t.leaseID(), Attempt: t.attempt}, ExpiresAt: t.expires, Duration: t.leaseDur},
-				Info:  s.info(t),
-				Spec:  t.spec,
+				Lease:  store.Lease{Ref: store.LeaseRef{ID: t.leaseID(), Attempt: t.attempt}, ExpiresAt: t.expires, Duration: t.leaseDur},
+				Info:   s.info(t),
+				Spec:   t.spec,
+				Waited: waited,
 			})
 		}
 		taken += n
@@ -792,7 +795,7 @@ func (b *backlog) claim(n int, now time.Time, h handlerSet) []*task {
 func (s *Store) info(t *task) store.LeaseInfo {
 	return store.LeaseInfo{Ref: store.LeaseRef{ID: t.leaseID(), Attempt: t.attempt}, Task: t.id, Run: t.r.spec.ID,
 		RunPolicy: t.r.spec.Policy, Queue: t.b.q.key, Pool: t.b.pool, Fingerprint: t.fp, Depth: t.depth, Parent: t.parent,
-		StrainAttempts: t.strained, Label: t.label}
+		Worker: t.worker, StrainAttempts: t.strained, Label: t.label}
 }
 
 // byLease finds the task of a lease. Accepted means the lease is the task's current
@@ -865,7 +868,7 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 		// The assignment never reached a worker: the attempt did not happen.
 		t.attempt--
 		r.stats.Attempts--
-		t.state, t.notBefore = store.TaskPending, now.Add(f.RetryIn)
+		t.state, t.notBefore, t.eligible = store.TaskPending, now.Add(f.RetryIn), now.Add(f.RetryIn)
 		if !t.expiresAt.IsZero() {
 			s.ttl[t] = struct{}{}
 		}
@@ -895,7 +898,7 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 	s.adapt(q, r, f, t.dispatch, now)
 	switch f.Result {
 	case store.ResultRetry:
-		t.state, t.notBefore = store.TaskPending, now.Add(f.RetryIn)
+		t.state, t.notBefore, t.eligible = store.TaskPending, now.Add(f.RetryIn), now.Add(f.RetryIn)
 		if !t.expiresAt.IsZero() {
 			s.ttl[t] = struct{}{}
 		}
@@ -1363,3 +1366,93 @@ func window(n int, page store.Page) (lo, hi int, next string) {
 }
 
 var _ store.Store = (*Store)(nil)
+
+// later is the later of two times.
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// PoolStats sums the work of every pool across all runs.
+func (s *Store) PoolStats(_ context.Context, dueLimit int) ([]store.PoolStats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	by := map[store.PoolName]*store.PoolStats{}
+	due := map[store.PoolName]map[store.QueueKey]time.Time{}
+	for _, q := range s.queues {
+		for _, b := range q.backlogs {
+			if len(b.pending) == 0 && b.inFlight == 0 {
+				continue
+			}
+			ps := by[b.pool]
+			if ps == nil {
+				ps = &store.PoolStats{Pool: b.pool}
+				by[b.pool], due[b.pool] = ps, map[store.QueueKey]time.Time{}
+			}
+			ps.InFlight += uint64(b.inFlight) //nolint:gosec // G115: counters are not negative
+			n := uint64(len(b.pending))
+			since, ok := s.readySince(q, b, now)
+			switch {
+			case n == 0:
+			case ok:
+				ps.Pending += n
+				if at, seen := due[b.pool][q.key]; !seen || since.Before(at) {
+					due[b.pool][q.key] = since
+				}
+			default:
+				ps.Delayed += n
+			}
+		}
+	}
+	out := make([]store.PoolStats, 0, len(by))
+	for pool, ps := range by {
+		for key, since := range due[pool] {
+			ps.Due = append(ps.Due, store.DueQueue{Queue: key, Since: since})
+		}
+		slices.SortFunc(ps.Due, func(a, b store.DueQueue) int {
+			return cmp.Or(a.Since.Compare(b.Since), cmp.Compare(a.Queue, b.Queue))
+		})
+		if dueLimit >= 0 && len(ps.Due) > dueLimit {
+			ps.Due = ps.Due[:dueLimit]
+		}
+		out = append(out, *ps)
+	}
+	slices.SortFunc(out, func(a, b store.PoolStats) int { return cmp.Compare(a.Pool, b.Pool) })
+	return out, nil
+}
+
+// readySince reports whether nothing but a worker keeps the backlog from being
+// dispatched from, and since when.
+func (s *Store) readySince(q *queue, b *backlog, now time.Time) (time.Time, bool) {
+	if !b.r.dispatchable() || now.Before(q.blockedUntil) {
+		return time.Time{}, false
+	}
+	var oldest time.Time
+	for _, t := range b.pending {
+		if !t.notBefore.After(now) && (oldest.IsZero() || t.eligible.Before(oldest)) {
+			oldest = t.eligible
+		}
+	}
+	if oldest.IsZero() {
+		return time.Time{}, false
+	}
+	// The pace is the one Dispatch applies: slowed while the queue is strained.
+	e := s.pol.For(b.r.spec.ID, b.r.spec.Policy, q.key)
+	strain := e.Adaptive.Decayed(q.strain, now)
+	slowed := e.Adaptive.Slowed(e.Queue, strain)
+	e.Queue, e.Limits = e.Adaptive.Apply(e.Queue, strain), e.Adaptive.Apply(e.Limits, strain)
+	admit, at := sched.Admitted(e.Queue, q.tat, now, q.inFlight), sched.EligibleAt(e.Queue, q.tat)
+	if e.Own {
+		admit, at = sched.Admitted(e.Limits, b.ownTat, now, b.inFlight), sched.EligibleAt(e.Limits, b.ownTat)
+		if slowed {
+			admit, at = min(admit, sched.Admitted(e.Queue, q.tat, now, q.inFlight)), latest(at, sched.EligibleAt(e.Queue, q.tat))
+		}
+	}
+	if admit == 0 {
+		return time.Time{}, false
+	}
+	return later(later(oldest, at), q.blockedUntil), true
+}

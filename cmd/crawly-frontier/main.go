@@ -44,6 +44,7 @@ const (
 
 type config struct {
 	listen, policies         string
+	metricsAddr              string
 	postgres, postgresListen string
 	migrationsTable          string
 	tlsCert, tlsKey          string
@@ -76,6 +77,8 @@ func main() {
 	var cfg config
 	migrationsTableFlag(flag.CommandLine, &cfg.migrationsTable)
 	flag.StringVar(&cfg.listen, "listen", ":7070", "gRPC listen address")
+	flag.StringVar(&cfg.metricsAddr, "metrics-addr", "",
+		"address to serve Prometheus metrics on, at /metrics, in plain HTTP (e.g. :9090); empty serves none")
 	flag.StringVar(&cfg.policies, "policies", "", `policy file: {"policies": [...]} in proto JSON; empty uses the built-in defaults`)
 	flag.StringVar(&cfg.postgres, "postgres", os.Getenv(envPostgres),
 		"PostgreSQL connection URL for the store (or $"+envPostgres+"); empty keeps the state in memory")
@@ -131,10 +134,18 @@ func run(cfg config, log *slog.Logger) error {
 		return err
 	}
 	defer closeStore()
+	reg := newRegistry()
 	srv, err := frontier.New(frontier.Config{Store: st, Policies: pol, Logger: log, NoHandlerGrace: cfg.noHandlerGrace,
-		MaxLabelsPerRun: cfg.maxLabels})
+		Metrics: reg, MaxLabelsPerRun: cfg.maxLabels})
 	if err != nil {
 		return err
+	}
+	if cfg.metricsAddr != "" {
+		stopMetrics, err := serveMetrics(cfg.metricsAddr, reg, log)
+		if err != nil {
+			return err
+		}
+		defer stopMetrics()
 	}
 	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", cfg.listen)
 	if err != nil {
@@ -142,7 +153,7 @@ func run(cfg config, log *slog.Logger) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	opts := frontier.ServerOptions()
+	opts := append(frontier.ServerOptions(), srv.MetricsOptions()...)
 	creds, err := transportCredentials(cfg)
 	if err != nil {
 		return err

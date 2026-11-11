@@ -113,6 +113,7 @@ func (r runService) AddTasks(stream grpc.BidiStreamingServer[runv1.AddTasksReque
 		if err != nil {
 			return grpcErr(err)
 		}
+		r.s.m.tasksAdded("seed", res)
 		if err := stream.Send(&runv1.AddTasksResponse{BatchId: req.GetBatchId(), Results: addResults(res)}); err != nil {
 			return err
 		}

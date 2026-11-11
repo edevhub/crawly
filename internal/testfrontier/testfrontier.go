@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 
 	"github.com/edevhub/crawly/internal/frontier"
@@ -29,6 +31,8 @@ const Policies = `{"policies": [{"name": "fast", "limits": {"ratePerSecond": 500
 type Frontier struct {
 	// Addr is the address the replica listens on.
 	Addr string
+	// Metrics is the registry the replica's metrics are in. Restart replaces it.
+	Metrics *prometheus.Registry
 	// ServerOptions are added to the gRPC server of the next Restart.
 	ServerOptions []grpc.ServerOption
 	// NoHandlerGrace is how long the next Restart lets a task wait for a session that
@@ -112,8 +116,9 @@ func (f *Frontier) Restart() {
 	if grace <= 0 {
 		grace = 5 * time.Second
 	}
-	srv, err := frontier.New(frontier.Config{Store: f.store, Policies: f.pol, NoHandlerGrace: grace, NoHandlerDelay: 50 * time.Millisecond,
-		ReaperInterval: 50 * time.Millisecond, MaintainInterval: 50 * time.Millisecond, PollInterval: 100 * time.Millisecond})
+	reg := prometheus.NewRegistry()
+	srv, err := frontier.New(frontier.Config{Store: f.store, Policies: f.pol, Metrics: reg, NoHandlerGrace: grace, NoHandlerDelay: 50 * time.Millisecond,
+		ReaperInterval: 50 * time.Millisecond, PoolStatsInterval: 50 * time.Millisecond, MaintainInterval: 50 * time.Millisecond, PollInterval: 100 * time.Millisecond})
 	if err != nil {
 		f.tb.Fatal(err)
 	}
@@ -122,10 +127,10 @@ func (f *Frontier) Restart() {
 		f.tb.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	g := grpc.NewServer(append(frontier.ServerOptions(), f.ServerOptions...)...)
+	g := grpc.NewServer(slices.Concat(frontier.ServerOptions(), srv.MetricsOptions(), f.ServerOptions)...)
 	srv.Register(g)
 	f.mu.Lock()
-	f.Addr, f.server, f.grpc, f.cancel = lis.Addr().String(), srv, g, cancel
+	f.Addr, f.Metrics, f.server, f.grpc, f.cancel = lis.Addr().String(), reg, srv, g, cancel
 	f.mu.Unlock()
 	f.stopped.Go(func() {
 		if err := srv.Run(ctx); err != nil {

@@ -104,7 +104,7 @@ func (s *Store) info(ctx context.Context, q querier, t *leased) (store.LeaseInfo
 	}
 	return store.LeaseInfo{Ref: t.lease().ref(), Task: t.key.ID(), Run: m.spec.ID, RunPolicy: m.spec.Policy,
 		Queue: t.queue, Pool: pool, Fingerprint: t.fingerprint, Depth: t.depth,
-		Parent: parentID(t.parent, t.parentBucket, t.key.day), StrainAttempts: t.strained, Label: t.label}, nil
+		Parent: parentID(t.parent, t.parentBucket, t.key.day), Worker: t.worker, StrainAttempts: t.strained, Label: t.label}, nil
 }
 
 // Lease returns the context of the task's current lease, or store.ErrNotFound if the

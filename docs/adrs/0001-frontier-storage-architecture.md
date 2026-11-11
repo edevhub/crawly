@@ -275,6 +275,10 @@ type Inspect interface {
 	// BlockQueue sets (or with a zero time, clears) an operator block for all runs.
 	// Clearing it also resets the queue's adaptive slowdown.
 	BlockQueue(ctx context.Context, key QueueKey, until time.Time, reason string) (Queue, error)
+	// PoolStats sums the work of every pool across all runs, for monitoring: tasks
+	// pending, delayed and in flight, and the queues whose work is ready, longest ready
+	// first, up to a limit. It never reads tasks.
+	PoolStats(ctx context.Context, dueLimit int) ([]PoolStats, error)
 }
 
 // Background serves replica startup, the dispatch loop and maintenance.
@@ -814,6 +818,40 @@ expired or cancelled, and for the failed ones the code of their last attempt.
   labels; a replica that predates them finishes tasks without counting them.
 - `ListTasks` can filter by label.
 
+### Monitoring
+
+The Frontier exports metrics, and an operator can list the connected sessions. Neither is
+part of scheduling.
+
+- **What is counted where.** Events (dispatches, outcomes, lease expiries, queue blocks,
+  hand-backs, tasks added, store calls, gRPC calls) are counted by the replica that handled
+  them: a metric is per replica, and a total is the sum over replicas. What a replica holds
+  in memory (sessions, credits, unfinished assignments) is per replica as well. What the
+  store holds (tasks per pool and state, the age of the longest ready work) is global: every
+  replica reads it through `PoolStats` in the background, on an interval, and reports the
+  same figure. A scrape never waits for the store. When a read fails the last good figures
+  stay, and the replica exports whether the last read succeeded and when it last did, so
+  that stale figures are visible and an alert on them does not resolve by itself.
+- **Bounded labels.** Queue keys are unbounded, so no metric carries one. A queue is
+  labelled by the most specific global policy that matches it, or by `builtin` when none
+  does, so the number of values is the number of policies plus one. A queue that needs a
+  series of its own gets a policy of its own. Values that workers choose (pool, outcome
+  code) are capped per process, and the values past the cap are counted as one `other`;
+  the codes the Frontier itself gives are reserved and never folded. A worker id labels
+  lease expiries only, and only while it is recent: an id not seen for a while is forgotten
+  with its series. Run, task and URL are never labels.
+- **What the store contributes.** A dispatched assignment carries how long its task was
+  eligible before the dispatch, by the store clock, and a lease names the worker it was
+  dispatched to, so the reaper can say whose lease expired. `PoolStats` reports readiness
+  as the store keeps it: a backlog is ready when nothing but a worker is missing, and its
+  ready time may be earlier than the true one, never later (see Politeness), so the age of
+  ready work may be too long and never too short. It lists a bounded number of queues per
+  pool, so a policy whose ready work is younger than all of them is not shown.
+- **Sessions.** A session is a stream held by one replica, and is kept nowhere else.
+  `ListSessions` answers for the replica that serves the call and names it. Keeping
+  sessions in the store would add a write for every session and a way to clean up after a
+  replica that died, for a view the metrics already give in aggregate.
+
 ### Locality rule
 
 Every write on the hot path (dispatch, finish, extend, add, reaper) goes to state owned by
@@ -1042,6 +1080,9 @@ implementation carries out an operation, and each fix stays inside the store or 
 - A looser run override can saturate a queue for other runs while it runs. That is the
   intended meaning of an override.
 - Policy changes need a deploy and are mixed during the rollout.
+- Metrics are per policy, not per queue: one misbehaving site among many that share a
+  policy is found with `ListQueues`, not with a series of its own.
+- The list of sessions is per replica. Seeing every worker means asking every replica.
 - Dedup is per run and queue (identical to per run with host-derived keys).
 - The default dedup key ignores headers, and keeps the case of path and query. Spiders
   for sites where headers matter, or where case does not, must set `dedup_key`.

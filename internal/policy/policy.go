@@ -155,6 +155,18 @@ func (s *Set) Get(name string) (*policyv1.Policy, bool) {
 	return nil, false
 }
 
+// Class names the group a queue belongs to for monitoring: the most specific global
+// policy that matches its key, or "builtin" when none does. A set has a fixed number of
+// policies, so the number of classes is bounded however many queues there are.
+func (s *Set) Class(queue string) string {
+	for _, p := range slices.Backward(s.policies) {
+		if Match(p.GetMatch().GetQueueKey(), queue) {
+			return p.GetName()
+		}
+	}
+	return builtin
+}
+
 // Resolved is the outcome of resolution for one run on one queue.
 type Resolved struct {
 	Limits     *policyv1.QueueLimits // what the run's tasks are admitted against

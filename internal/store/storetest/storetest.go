@@ -1171,6 +1171,107 @@ func Run(t *testing.T, f Factory) {
 			}
 		}
 	})
+	t.Run("PoolStats", func(t *testing.T) {
+		e := newEnv(t, f, oneRPS)
+		r := e.run("r")
+		start := e.clock.Now()
+		e.seed(r, "slow", "default", 3)
+		e.seed(r, "other", "browser", 2)
+		e.clock.Advance(10 * time.Second)
+		stats := poolStats(t, e)
+		if d := stats["default"]; d.Pending != 3 || d.Delayed != 0 || d.InFlight != 0 || len(d.Due) != 1 ||
+			d.Due[0].Queue != "slow" || !d.Due[0].Since.Equal(start) {
+			t.Fatalf("default before dispatch: %+v", d)
+		}
+		if b := stats["browser"]; b.Pending != 2 || len(b.Due) != 1 || b.Due[0].Queue != "other" {
+			t.Fatalf("browser before dispatch: %+v", b)
+		}
+		// One task goes out and the queue's pace holds the others back: they are delayed,
+		// not due, until the pace admits the next.
+		dispatched := e.clock.Now()
+		if as := e.dispatch("default", 5); len(as) != 1 {
+			t.Fatalf("dispatched %d", len(as))
+		}
+		if d := poolStats(t, e)["default"]; d.Pending != 0 || d.Delayed != 2 || d.InFlight != 1 || len(d.Due) != 0 {
+			t.Fatalf("default while paced: %+v", d)
+		}
+		e.clock.Advance(5 * time.Second)
+		d := poolStats(t, e)["default"]
+		if d.Pending != 2 || d.Delayed != 0 || len(d.Due) != 1 || !d.Due[0].Since.Equal(dispatched.Add(time.Second)) {
+			t.Fatalf("default after the pace: %+v (dispatched at %v)", d, dispatched)
+		}
+		// A paused run's work is neither ready nor due.
+		e.pause(r)
+		if d := poolStats(t, e)["default"]; d.Pending != 0 || d.Delayed != 2 || len(d.Due) != 0 {
+			t.Fatalf("default of a paused run: %+v", d)
+		}
+		if got, err := e.s.PoolStats(ctx, 0); err != nil || len(got) == 0 {
+			t.Fatalf("a zero limit still sums the pools: %v %v", got, err)
+		}
+	})
+
+	t.Run("PoolStatsDueLimit", func(t *testing.T) {
+		e := newEnv(t, f, store.Limits{})
+		r := e.run("r")
+		for i := range 4 {
+			e.seed(r, string(rune('a'+i)), "default", 1)
+			e.clock.Advance(time.Second)
+		}
+		stats, err := e.s.PoolStats(ctx, 2)
+		if err != nil || len(stats) != 1 {
+			t.Fatalf("%v %v", stats, err)
+		}
+		if d := stats[0]; d.Pending != 4 || len(d.Due) != 2 || d.Due[0].Queue != "a" || d.Due[1].Queue != "b" {
+			t.Fatalf("the two longest waiting queues are listed oldest first: %+v", d)
+		}
+	})
+
+	t.Run("DispatchReportsTheWaitAndTheWorker", func(t *testing.T) {
+		e := newEnv(t, f, store.Limits{})
+		r := e.run("r")
+		e.seed(r, "q", "default", 1)
+		e.clock.Advance(7 * time.Second)
+		res, err := e.s.Dispatch(ctx, store.DispatchRequest{Session: "s", Pool: "default", Slots: 1,
+			Worker: store.WorkerInfo{ID: "w1", Version: "v2"}})
+		if err != nil || len(res.Assignments) != 1 {
+			t.Fatalf("%v %v", res.Assignments, err)
+		}
+		a := res.Assignments[0]
+		if a.Waited != 7*time.Second || a.Info.Worker.ID != "w1" || a.Info.Worker.Version != "v2" {
+			t.Fatalf("waited %v, worker %+v", a.Waited, a.Info.Worker)
+		}
+		// A retry waits from the end of its delay, not from the task's creation.
+		e.clock.Advance(time.Second)
+		if st, _ := e.s.Finish(ctx, store.Finish{Lease: a.Lease.Ref, Source: store.SourceWorker, Result: store.ResultRetry, RetryIn: 10 * time.Second}); st != store.FinishAccepted {
+			t.Fatal(st)
+		}
+		e.clock.Advance(14 * time.Second)
+		res, _ = e.s.Dispatch(ctx, store.DispatchRequest{Session: "s", Pool: "default", Slots: 1, Worker: store.WorkerInfo{ID: "w2"}})
+		if len(res.Assignments) != 1 || res.Assignments[0].Waited != 4*time.Second {
+			t.Fatalf("retry: %+v", res.Assignments)
+		}
+		// The reaper sees the worker that held a lease that expired.
+		e.clock.Advance(2 * time.Minute)
+		exp, _ := e.s.ExpiredLeases(ctx, 10)
+		if len(exp) != 1 || exp[0].Worker.ID != "w2" {
+			t.Fatalf("expired: %+v", exp)
+		}
+	})
 
 	adaptivePacing(t, f)
+	poolStatsLanes(t, f)
+}
+
+// poolStats returns the pool statistics by pool name.
+func poolStats(t *testing.T, e *env) map[store.PoolName]store.PoolStats {
+	t.Helper()
+	got, err := e.s.PoolStats(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[store.PoolName]store.PoolStats{}
+	for _, ps := range got {
+		out[ps.Pool] = ps
+	}
+	return out
 }

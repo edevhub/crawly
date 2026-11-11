@@ -279,6 +279,8 @@ imported from outside the module.
 | `sdk/task` | Tasks | `task.Spec`, `task.Request`, `task.AddResult` |
 | `sdk/policy` | Policies | `policy.Client`, `policy.Run`, `policy.Limits`, `policy.Behaviour` |
 | `sdk/queue` | Queues | `queue.Client`, `queue.Queue` |
+| `sdk/session` | Connected sessions | `session.Client`, `session.Session` |
+| `sdk/worker/prom` | Worker metrics on Prometheus | `prom.New` |
 
 One package per API package, so a name reads without a prefix that repeats its package
 (`run.Limits`, not `sdk.RunLimits`). What a client must name is exported as **type
@@ -303,6 +305,21 @@ Frontier: the worker grants a credit for a free slot only when the interval sinc
 grant has passed, and one at a time, so unused time is not saved up into a burst. Credits
 do not carry over to a new session; after a reconnect the free slots are granted again at
 the same pace.
+
+### Metrics
+
+The worker reports what it observes (sessions, running handlers, how tasks ended, handler
+and fetch durations, leases lost) to a small interface, `worker.Metrics`, set with
+`WithMetrics`. The SDK does not import a metrics library, does not open a listener and does
+not touch a global registry. `sdk/worker/prom` implements the interface on Prometheus and
+registers on the registerer it is given, so the dependency reaches only the spiders that
+import that package. It is a package of the module, not a module of its own: the module's
+requirements list the client library, and only the packages that import it link it.
+
+Labels are pool, handler and outcome kind, which come from the worker's own registrations,
+and the outcome code, which handlers choose and the adapter caps. A task whose handler the
+worker lacks is counted under a fixed name, not under the name the task carries. The
+queue is not a label: the Frontier labels by policy, and the worker does not know policies.
 
 ### Drain and shutdown
 
@@ -363,6 +380,9 @@ choice in the caller's code.
   waiting forever for a worker that matches, after the time a rolling deploy is given.
 - Spiders never think about leases, heartbeats or ordering; the SDK does.
 - The Frontier keeps one inbound goroutine per session and one dispatch loop per pool.
+- An operator sees the sessions of a replica through `SessionService`, a service of its own
+  in the operator API: a session is not a queue, a run or a policy. The list is that of the
+  replica asked, and names it.
 
 ## Tests
 
