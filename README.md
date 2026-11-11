@@ -155,7 +155,7 @@ One worker can register any number of handlers. A task is routed by its handler 
 | | `WithMaxBodyBytes(n)` | Largest body accepted; a larger one fails with `body_too_large`. Default 10 MiB |
 | | `WithContentTypes(types...)` | Parse only these media types; another one fails with `unsupported_content_type`. Default: all |
 | | `WithStatus(parser, statuses...)` | Hand these statuses to a parser instead of the default classification: a 404 that is a result, a 403 that is a block |
-| | `WithRedirect(func)` | Adjust the task added for a redirect before it is added, e.g. set its `DedupKey` |
+| | `WithRedirect(func)` | Adjust the task added for a redirect before it is added, e.g. set its `DedupKey`. The function sees the redirect response |
 | | `WithSameHostRedirects()` | Follow redirects on the task's host inside the task. Each hop is a request on top of the site's rate limit, and it is not deduplicated |
 | | `WithCrossHostRedirects()` | Follow every redirect, also to other hosts, which are then fetched outside their own limits |
 
@@ -200,7 +200,10 @@ status 200 can return the same: `return worker.Blocked(d).Parse(ctx, t, r)`.
 A 307 or 308 repeats the request, so the task added for it keeps the method and the body.
 It keeps the task's headers only on the same host: to another host, or from https to http,
 only `Accept`, `Accept-Language`, `Content-Language`, `Content-Type` and `User-Agent` go
-along, so that a site cannot send a spider's credentials to a host of its choosing.
+along, so that a site cannot send a spider's credentials to a host of its choosing. The
+body goes along in every case, as it does in browsers; `WithRedirect` is the place to
+change the task when the body carries a secret. A redirect from https to http is never
+followed inside a task, also with `WithSameHostRedirects`: its target becomes a task.
 
 ### Delivery
 

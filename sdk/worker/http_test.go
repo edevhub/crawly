@@ -414,7 +414,10 @@ func TestHTTPWithRedirect(t *testing.T) {
 		http.Redirect(w, r, "/final?utm=1", http.StatusFound)
 	}))
 	defer site.Close()
-	h := HTTP(&echo{}, WithRedirect(func(t *Task, target *NewTask) {
+	h := HTTP(&echo{}, WithRedirect(func(t *Task, r *Response, target *NewTask) {
+		if r.StatusCode != http.StatusFound || r.Header.Get("Location") != "/final?utm=1" {
+			t.Handler = "wrong response"
+		}
 		target.DedupKey, target.Handler = "final", t.Handler+"_redirected"
 	}))
 	task := get(site.URL + "/start")
@@ -481,4 +484,85 @@ func TestHTTPContentTypes(t *testing.T) {
 	if _, err := HTTP(p).Handle(ctx, get(site.URL+"/pdf")); err != nil || p.calls != 3 {
 		t.Fatalf("the default: %d calls, %v", p.calls, err)
 	}
+}
+
+// TestHTTPRedirectHeaderIsACopy: the redirect task does not share its headers with
+// the task that was redirected, so a hook can change one without the other.
+func TestHTTPRedirectHeaderIsACopy(t *testing.T) {
+	for _, target := range []string{"/next", "https://other.example/next"} {
+		site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+		}))
+		task := &Task{Method: http.MethodPost, URL: site.URL, Header: http.Header{"Authorization": {"Bearer a"}, "Accept": {"text/html"}}}
+		h := HTTP(&echo{}, WithRedirect(func(_ *Task, _ *Response, next *NewTask) {
+			next.Header.Del("Authorization")
+			next.Header["Accept"][0] = "changed"
+		}))
+		_, err := h.Handle(context.Background(), task)
+		site.Close()
+		if err != nil || task.Header.Get("Authorization") != "Bearer a" || task.Header.Get("Accept") != "text/html" {
+			t.Fatalf("to %s: the task's own headers were changed: %v %v", target, task.Header, err)
+		}
+	}
+}
+
+// downgrade answers a request to https://a.example with a redirect to plain http, and
+// records what reaches the http side.
+type downgrade struct{ plain []*http.Request }
+
+func (d *downgrade) RoundTrip(r *http.Request) (*http.Response, error) {
+	res := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: r}
+	if r.URL.Scheme == "https" {
+		res.StatusCode = http.StatusFound
+		res.Header.Set("Location", "http://a.example/x")
+	} else {
+		d.plain = append(d.plain, r)
+	}
+	return res, nil
+}
+
+// TestHTTPNeverFollowsADowngrade: a redirect from https to http is not followed inside
+// a task, whatever the spider opted into: the client would send the task's headers in
+// the clear. The target becomes a task.
+func TestHTTPNeverFollowsADowngrade(t *testing.T) {
+	for name, opt := range map[string]HTTPOption{"same host": WithSameHostRedirects(), "cross host": WithCrossHostRedirects()} {
+		d := &downgrade{}
+		h := HTTP(&echo{}, opt, WithHTTPClient(&http.Client{Transport: d}))
+		res, err := h.Handle(context.Background(), &Task{Method: http.MethodGet, URL: "https://a.example/",
+			Header: http.Header{"Authorization": {"Bearer secret"}, "X-Api-Key": {"k"}}})
+		if err != nil || len(d.plain) != 0 || len(res.Tasks) != 1 || res.Tasks[0].URL != "http://a.example/x" || len(res.Tasks[0].Header) != 0 {
+			t.Fatalf("%s: %d plain requests, result %+v, %v", name, len(d.plain), res, err)
+		}
+	}
+}
+
+// TestHTTPLargeBodyOfAnUnparsedStatus: the size of a body nobody reads does not change
+// what its status means.
+func TestHTTPLargeBodyOfAnUnparsedStatus(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st, _ := strconv.Atoi(r.URL.Path[1:])
+		if st == http.StatusFound {
+			w.Header().Set("Location", "/next")
+		}
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(st)
+		_, _ = w.Write(make([]byte, 4096))
+	}))
+	defer site.Close()
+	ctx := context.Background()
+	h := HTTP(&echo{}, WithMaxBodyBytes(1024), WithStatus(&echo{}, http.StatusNotFound))
+	_, err := h.Handle(ctx, get(site.URL+"/503"))
+	requireFailure(t, err, KindRetry, "http_503")
+	_, err = h.Handle(ctx, get(site.URL+"/429"))
+	if e := failure(t, err, KindRetry, "http_429"); e.BlockQueueFor != 30*time.Second {
+		t.Fatalf("429: the queue block was lost: %+v", e)
+	}
+	if res, err := h.Handle(ctx, get(site.URL+"/302")); err != nil || len(res.Tasks) != 1 {
+		t.Fatalf("302: %+v %v", res, err)
+	}
+	// A status that goes to a parser is still held to the limit.
+	_, err = h.Handle(ctx, get(site.URL+"/404"))
+	requireFailure(t, err, KindFail, "body_too_large")
+	_, err = h.Handle(ctx, get(site.URL+"/200"))
+	requireFailure(t, err, KindFail, "body_too_large")
 }
