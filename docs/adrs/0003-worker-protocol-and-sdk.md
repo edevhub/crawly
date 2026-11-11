@@ -97,17 +97,26 @@ Unchanged: `SUCCESS`, `RETRY` (with optional `retry_after`), `FAILED`, any of th
 as Temporal's retry policy does, with `FAILED` in the place of a non-retryable error type.
 
 Codes the SDK reports itself: `no_handler` (`FAILED`), `panic` (a handler panicked:
-`RETRY`) and `redirect` (`SUCCESS`: the target on another host was added as a task).
+`RETRY`) and `redirect` (`SUCCESS`: the target of the redirect was added as a task).
 
 ### Redirects and dedup keys
 
 Both are the spider's side of the contract; the Frontier cannot see either.
 
-- **Redirects.** Politeness is enforced per queue at dispatch, so a fetch that follows a
-  redirect to another host runs outside that host's limits. By default the SDK's fetcher
-  does not follow a redirect to a different host: it adds the target as a discovered task
-  (the Frontier derives its queue) and completes the original with `SUCCESS`, code
-  `redirect`. Redirects on the same host are followed. A spider can override the default.
+- **Redirects.** Politeness is enforced per queue at dispatch and dedup when a task is
+  added, so a fetch that follows a redirect makes a request the Frontier neither paced nor
+  deduplicated. On the same host that request comes on top of the configured rate; on
+  another host it runs outside that host's limits altogether. By default the SDK's fetcher
+  follows no redirect: it adds the target as a discovered task (the Frontier derives its
+  queue and drops it when the page is known already) and completes the original with
+  `SUCCESS`, code `redirect`. The costs of this default:
+  - The target is one level deeper than its task, so it counts against `max_depth`.
+  - A page that redirects to its own URL, as a cookie gate does, would be dropped as a
+    duplicate of its own task. The fetcher reports it as `FAILED` with code
+    `redirect_loop` instead, so that it shows in the stats.
+
+  A spider can make the fetcher follow redirects on the same host, or all of them, for the
+  sites that need it, and accepts the extra requests with it.
 - **Dedup keys.** The Frontier's default dedup key is a simple normalisation of the URL
   (ADR 0001, Dedup). A spider sets `TaskSpec.dedup_key` whenever its site needs special
   rules: case-sensitive paths, tracking or session parameters, requests told apart by

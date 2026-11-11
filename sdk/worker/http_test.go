@@ -187,11 +187,27 @@ func TestHTTPRedirects(t *testing.T) {
 	defer site.Close()
 	ctx := context.Background()
 
-	// The same host: followed, and the parser sees the final URL.
+	// The same host: not followed either. The Frontier paces and deduplicates tasks, so
+	// the target becomes one.
 	p := &echo{}
 	res, err := HTTP(p).Handle(ctx, get(site.URL+"/same"))
+	if err != nil || p.calls != 0 || res.Code != "redirect" || len(res.Tasks) != 1 || res.Tasks[0].URL != site.URL+"/final" {
+		t.Fatalf("same-host redirect: %+v %v", res, err)
+	}
+	if res.Fetch.HTTPStatus != 302 || res.Fetch.FinalURL != site.URL+"/same" {
+		t.Fatalf("same-host redirect: fetch %+v", res.Fetch)
+	}
+
+	// Unless the spider opts in: followed, and the parser sees the final URL.
+	p = &echo{}
+	res, err = HTTP(p, WithSameHostRedirects()).Handle(ctx, get(site.URL+"/same"))
 	if err != nil || string(p.resp.Body) != "final" || p.resp.URL != site.URL+"/final" || res.Fetch.FinalURL != site.URL+"/final" {
-		t.Fatalf("same-host redirect: %+v %v", p.resp, err)
+		t.Fatalf("WithSameHostRedirects: %+v %v", p.resp, err)
+	}
+	// That does not follow a redirect to another host.
+	p = &echo{}
+	if res, err = HTTP(p, WithSameHostRedirects()).Handle(ctx, get(site.URL+"/away")); err != nil || p.calls != 0 || res.Code != "redirect" {
+		t.Fatalf("WithSameHostRedirects to another host: %+v %v", res, err)
 	}
 
 	// Another host: not fetched. The target becomes a discovered task so that it is
@@ -213,8 +229,12 @@ func TestHTTPRedirects(t *testing.T) {
 		t.Fatalf("WithCrossHostRedirects: %+v %v", p.resp, err)
 	}
 
-	// A redirect loop is a transport error: retried, never parsed.
+	// A page that redirects to itself would be dropped as a duplicate of its own task:
+	// it fails instead, where it can be seen.
 	_, err = HTTP(&echo{}).Handle(ctx, get(site.URL+"/loop"))
+	requireFailure(t, err, KindFail, "redirect_loop")
+	// When redirects are followed, a loop is a transport error: retried, never parsed.
+	_, err = HTTP(&echo{}, WithSameHostRedirects()).Handle(ctx, get(site.URL+"/loop"))
 	requireFailure(t, err, KindRetry, "fetch_error")
 
 	// A redirect without a Location is a permanent failure.
@@ -329,5 +349,49 @@ func TestRetryAfterIsBounded(t *testing.T) {
 		if d := retryAfter(v); d != 0 {
 			t.Errorf("%q: %v, want 0", v, d)
 		}
+	}
+}
+
+func TestHTTPContentTypes(t *testing.T) {
+	mux := http.NewServeMux()
+	serve := func(path, contentType string) {
+		mux.HandleFunc(path, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header()["Content-Type"] = nil // no sniffing
+			if contentType != "" {
+				w.Header().Set("Content-Type", contentType)
+			}
+			_, _ = fmt.Fprint(w, "body")
+		})
+	}
+	serve("/html", "Text/HTML; charset=utf-8")
+	serve("/pdf", "application/pdf")
+	serve("/untyped", "")
+	mux.HandleFunc("/missing", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+	})
+	site := httptest.NewServer(mux)
+	defer site.Close()
+	ctx := context.Background()
+
+	p := &echo{}
+	h := HTTP(p, WithContentTypes("text/html", "application/xhtml+xml"))
+	if _, err := h.Handle(ctx, get(site.URL+"/html")); err != nil || p.calls != 1 {
+		t.Fatalf("an accepted type: %d calls, %v", p.calls, err)
+	}
+	res, err := h.Handle(ctx, get(site.URL+"/pdf"))
+	requireFailure(t, err, KindFail, "unsupported_content_type")
+	if p.calls != 1 || res.Fetch.HTTPStatus != 200 {
+		t.Fatalf("another type: %d calls, fetch %+v", p.calls, res.Fetch)
+	}
+	if _, err := h.Handle(ctx, get(site.URL+"/untyped")); err != nil || p.calls != 2 {
+		t.Fatalf("no Content-Type: %d calls, %v", p.calls, err)
+	}
+	// The status decides first: a 404 stays a 404.
+	_, err = h.Handle(ctx, get(site.URL+"/missing"))
+	requireFailure(t, err, KindFail, "http_404")
+	// Without the option every type is parsed.
+	if _, err := HTTP(p).Handle(ctx, get(site.URL+"/pdf")); err != nil || p.calls != 3 {
+		t.Fatalf("the default: %d calls, %v", p.calls, err)
 	}
 }
