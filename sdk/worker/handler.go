@@ -12,12 +12,20 @@
 //
 // A minimal spider:
 //
-//	w, _ := worker.New("localhost:7070")
+//	w, _ := worker.New("localhost:7070", worker.WithInsecure())
 //	w.Register("page", worker.HTTP(worker.ParserFunc(
 //		func(ctx context.Context, t *worker.Task, r *worker.Response) (*worker.Result, error) {
 //			return &worker.Result{Items: 1}, nil
 //		})))
 //	w.Run(ctx)
+//
+// # Delivery
+//
+// A task is executed at least once. When a worker dies, or loses its lease, after the
+// handler did its work and before the Frontier recorded the result, the task is given
+// out again and the handler runs a second time. A handler that writes items
+// somewhere must therefore write them idempotently. Task.ID is the key for that: it is
+// the same for every attempt of a task, and Task.Attempt tells the attempts apart.
 package worker
 
 import (
@@ -46,7 +54,7 @@ func (f HandlerFunc) Handle(ctx context.Context, task *Task) (*Result, error) { 
 
 // Task is one unit of work handed to a handler.
 type Task struct {
-	ID       string
+	ID       string // the same for every attempt: the idempotency key for what the handler writes
 	RunID    string
 	QueueKey string // the politeness domain, usually the host
 	Handler  string // the name the task was routed by
@@ -69,7 +77,8 @@ type Task struct {
 type Result struct {
 	// Tasks are discovered tasks, added to the same run before the task completes.
 	Tasks []NewTask
-	// Items is how many items the spider emitted downstream.
+	// Items is how many items the spider emitted downstream. It is a count for the
+	// run's statistics; storing the items is the handler's own business.
 	Items int
 	// Code is an optional machine-readable code for stats, e.g. "http_200".
 	Code string

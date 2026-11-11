@@ -335,6 +335,55 @@ func testCancel(t *testing.T, start startFunc) { //nolint:thelper // a test body
 	t.Fatalf("the cancelled run did not drain: %v", last)
 }
 
+// TestBalance: work that trickles in is shared between idle workers, also when one of
+// them has fewer free slots than the other.
+func TestBalance(t *testing.T) {
+	ctx := t.Context()
+	addr := testfrontier.Start(t).Addr
+	rc := runClient(t, addr)
+
+	var counts [2]atomic.Int32
+	hold := make(chan struct{})
+	for i := range counts {
+		w, err := worker.New(addr, worker.WithInsecure(), worker.WithMaxConcurrentTasks(4), worker.WithShutdownGrace(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		register(t, w, "count", worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+			counts[i].Add(1)
+			return &worker.Result{}, nil
+		}))
+		// A long task: whoever takes it has one free slot fewer than the other worker.
+		register(t, w, "hold", worker.HandlerFunc(func(ctx context.Context, _ *worker.Task) (*worker.Result, error) {
+			select {
+			case <-hold:
+			case <-ctx.Done():
+			}
+			return &worker.Result{}, nil
+		}))
+		go func() { _ = w.Run(ctx) }()
+	}
+
+	if _, err := rc.CreateRun(ctx, &run.CreateRunRequest{RunId: "balance"}); err != nil {
+		t.Fatal(err)
+	}
+	seed(t, ctx, addr, "balance", &task.Spec{Request: &task.Request{Url: "https://a.example/hold"}, Handler: "hold"})
+	const n = 120
+	for i := range n {
+		seed(t, ctx, addr, "balance", &task.Spec{Request: &task.Request{Url: fmt.Sprintf("https://a.example/%d", i)}, Handler: "count"})
+		time.Sleep(3 * time.Millisecond)
+	}
+	close(hold)
+	if _, err := rc.SealRun(ctx, &run.SealRunRequest{RunId: "balance"}); err != nil {
+		t.Fatal(err)
+	}
+	waitRun(t, ctx, rc, "balance")
+	a, b := counts[0].Load(), counts[1].Load()
+	if a+b != n || min(a, b) < n*35/100 {
+		t.Fatalf("the workers ran %d and %d of %d tasks", a, b, n)
+	}
+}
+
 // TestHealth: the standard gRPC health service says whether the replica takes work.
 func TestHealth(t *testing.T) {
 	f := testfrontier.Start(t)

@@ -19,8 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	"google.golang.org/protobuf/types/known/durationpb"
-
 	"github.com/edevhub/crawly/sdk"
 	"github.com/edevhub/crawly/sdk/run"
 	"github.com/edevhub/crawly/sdk/task"
@@ -86,27 +84,18 @@ func crawl() error {
 		Limits: &run.Limits{MaxDepth: uint32(min(*depth, math.MaxUint32)), MaxTasks: 500}}); err != nil {
 		return err
 	}
-	watch, err := c.Runs.WatchRuns(ctx, &run.WatchRunsRequest{RunId: runID, StatsInterval: durationpb.New(2 * time.Second)})
-	if err != nil {
-		return err
-	}
 	if _, err := c.Seed(ctx, runID, &task.Spec{Request: &task.Request{Url: *start}, Handler: "page"}); err != nil {
 		return err
 	}
 	if _, err := c.Runs.SealRun(ctx, &run.SealRunRequest{RunId: runID}); err != nil {
 		return err
 	}
-	for {
-		ev, err := watch.Recv()
-		if err != nil {
-			break
-		}
-		st := ev.GetEvent().GetRun().GetStats()
-		log.Printf("%-15s pending %d  delayed %d  in flight %d  ok %d  failed %d  codes %v", ev.GetEvent().GetType(),
+	if _, err := c.Wait(ctx, runID, sdk.StatsEvery(2*time.Second), sdk.OnEvent(func(ev *run.Event) {
+		st := ev.GetRun().GetStats()
+		log.Printf("%-15s pending %d  delayed %d  in flight %d  ok %d  failed %d  codes %v", ev.GetType(),
 			st.GetPending(), st.GetDelayed(), st.GetInFlight(), st.GetSucceeded(), st.GetFailed(), st.GetByCode())
-		if ev.GetEvent().GetType() == run.EventCompleted {
-			break
-		}
+	})); err != nil && ctx.Err() == nil { // interrupted: stop the worker below
+		return err
 	}
 	stop()
 	if err := <-workerDone; err != nil {

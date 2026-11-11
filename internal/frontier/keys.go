@@ -16,15 +16,21 @@ import (
 )
 
 // DedupKey is the default normalisation of a request URL (ADR 0001, Dedup): scheme +
-// host + path + query parameters sorted ascending, all lowercased. The host keeps an
-// explicit non-default port. Fragment, method, headers and body are not part of it.
+// host + path + query parameters sorted ascending. Scheme and host are lowercased;
+// path and query keep their case, because it carries meaning on many sites. The host
+// keeps an explicit non-default port, and an empty path is "/". Fragment, method,
+// headers and body are not part of it.
 func DedupKey(rawURL string) (string, error) {
 	u, err := parseURL(rawURL)
 	if err != nil {
 		return "", err
 	}
 	var b strings.Builder
-	b.WriteString(u.Scheme + "://" + hostPort(u) + u.EscapedPath())
+	path := u.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	b.WriteString(u.Scheme + "://" + hostPort(u) + path)
 	if q := u.Query(); len(q) > 0 {
 		pairs := make([]string, 0, len(q))
 		for k, vs := range q {
@@ -35,7 +41,7 @@ func DedupKey(rawURL string) (string, error) {
 		slices.Sort(pairs)
 		b.WriteString("?" + strings.Join(pairs, "&"))
 	}
-	return strings.ToLower(b.String()), nil
+	return b.String(), nil
 }
 
 // QueueKey derives a task's queue from the run's key rule.
