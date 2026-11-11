@@ -55,7 +55,7 @@ message Outcome {
   google.protobuf.Duration retry_after = 4;
   // Any kind: block the task's whole queue (all runs) for this long, e.g. from a
   // Retry-After header on a 429. Extends, never shortens, an existing block.
-  // Capped at 24 hours per outcome.
+  // Capped by the queue's policy (Behaviour.max_queue_block, 24 hours by default).
   google.protobuf.Duration block_queue_for = 5;
 }
 

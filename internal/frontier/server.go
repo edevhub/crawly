@@ -368,11 +368,6 @@ func ServerOptions() []grpc.ServerOption {
 	}
 }
 
-// maxQueueBlock bounds how long one outcome can block a queue. A block stops every run
-// on the queue, so a site's Retry-After, or a spider's mistake, must not stop it for
-// good; a site that is still refusing after a day blocks the queue again.
-const maxQueueBlock = 24 * time.Hour
-
 // CodeNoHandler is the code of a task no worker has a handler for.
 const CodeNoHandler = "no_handler"
 
@@ -424,7 +419,11 @@ func (s *Server) served(info store.LeaseInfo, w store.WorkerInfo, o *taskv1.Outc
 // spider classifies, the Frontier applies max_attempts and backoff.
 func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.FetchInfo) store.Finish {
 	beh := s.pol.Resolve(info.RunPolicy, string(info.Queue)).Behaviour
-	f := store.Finish{Lease: info.Ref, Source: store.SourceWorker, Block: min(o.GetBlockQueueFor().AsDuration(), maxQueueBlock),
+	// One outcome blocks the queue for as long as the queue's policy allows. A block
+	// stops every run on the queue, so a site's Retry-After, or a spider's mistake, must
+	// not stop it for good; a site that is still refusing when the block ends blocks the
+	// queue again. The ceiling is the queue's: Resolve keeps a run's policy out of it.
+	f := store.Finish{Lease: info.Ref, Source: store.SourceWorker, Block: min(o.GetBlockQueueFor().AsDuration(), beh.GetMaxQueueBlock().AsDuration()),
 		Record: store.AttemptRecord{Kind: int32(o.GetKind()), Code: o.GetCode(), Message: o.GetMessage(), PolicySet: s.pol.Hash(),
 			HTTPStatus: fetch.GetHttpStatus(), FinalURL: fetch.GetFinalUrl(), Latency: fetch.GetLatency().AsDuration(),
 			Bytes: fetch.GetBytes(), ResponseRef: fetch.GetResponseRef(), ContentHash: fetch.GetContentHash(), ItemsEmitted: fetch.GetItemsEmitted()}}

@@ -247,7 +247,12 @@ type Behaviour struct {
 	// Upper bound on a lease including extensions.
 	MaxLeaseDuration *durationpb.Duration `protobuf:"bytes,6,opt,name=max_lease_duration,json=maxLeaseDuration,proto3" json:"max_lease_duration,omitempty"`
 	// Tasks not dispatched within ttl of being added expire.
-	TaskTtl       *durationpb.Duration `protobuf:"bytes,7,opt,name=task_ttl,json=taskTtl,proto3" json:"task_ttl,omitempty"`
+	TaskTtl *durationpb.Duration `protobuf:"bytes,7,opt,name=task_ttl,json=taskTtl,proto3" json:"task_ttl,omitempty"`
+	// The longest one outcome can block the queue for (Outcome.block_queue_for). A block
+	// stops every run on the queue, so the ceiling belongs to the queue: it is read from
+	// the global policies only, and a run that sets it is rejected. Must be positive.
+	// Default 24h.
+	MaxQueueBlock *durationpb.Duration `protobuf:"bytes,8,opt,name=max_queue_block,json=maxQueueBlock,proto3" json:"max_queue_block,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -320,6 +325,13 @@ func (x *Behaviour) GetMaxLeaseDuration() *durationpb.Duration {
 func (x *Behaviour) GetTaskTtl() *durationpb.Duration {
 	if x != nil {
 		return x.TaskTtl
+	}
+	return nil
+}
+
+func (x *Behaviour) GetMaxQueueBlock() *durationpb.Duration {
+	if x != nil {
+		return x.MaxQueueBlock
 	}
 	return nil
 }
@@ -555,14 +567,15 @@ const file_crawly_frontier_policy_v1_policy_proto_rawDesc = "" +
 	"\tmin_delay\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\bminDelayB\x12\n" +
 	"\x10_max_concurrencyB\x12\n" +
 	"\x10_rate_per_secondB\b\n" +
-	"\x06_burstJ\x04\b\x05\x10\x06\"\x89\x03\n" +
+	"\x06_burstJ\x04\b\x05\x10\x06\"\xcc\x03\n" +
 	"\tBehaviour\x12&\n" +
 	"\fmax_attempts\x18\x01 \x01(\rH\x00R\vmaxAttempts\x88\x01\x01\x12<\n" +
 	"\abackoff\x18\x02 \x01(\v2\".crawly.frontier.policy.v1.BackoffR\abackoff\x12>\n" +
 	"\rfetch_timeout\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\ffetchTimeout\x12@\n" +
 	"\x0elease_duration\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\rleaseDuration\x12G\n" +
 	"\x12max_lease_duration\x18\x06 \x01(\v2\x19.google.protobuf.DurationR\x10maxLeaseDuration\x124\n" +
-	"\btask_ttl\x18\a \x01(\v2\x19.google.protobuf.DurationR\ataskTtlB\x0f\n" +
+	"\btask_ttl\x18\a \x01(\v2\x19.google.protobuf.DurationR\ataskTtl\x12A\n" +
+	"\x0fmax_queue_block\x18\b \x01(\v2\x19.google.protobuf.DurationR\rmaxQueueBlockB\x0f\n" +
 	"\r_max_attemptsJ\x04\b\x03\x10\x04\"\xc7\x01\n" +
 	"\aBackoff\x123\n" +
 	"\ainitial\x18\x01 \x01(\v2\x19.google.protobuf.DurationR\ainitial\x12#\n" +
@@ -619,18 +632,19 @@ var file_crawly_frontier_policy_v1_policy_proto_depIdxs = []int32{
 	7,  // 6: crawly.frontier.policy.v1.Behaviour.lease_duration:type_name -> google.protobuf.Duration
 	7,  // 7: crawly.frontier.policy.v1.Behaviour.max_lease_duration:type_name -> google.protobuf.Duration
 	7,  // 8: crawly.frontier.policy.v1.Behaviour.task_ttl:type_name -> google.protobuf.Duration
-	7,  // 9: crawly.frontier.policy.v1.Backoff.initial:type_name -> google.protobuf.Duration
-	7,  // 10: crawly.frontier.policy.v1.Backoff.max:type_name -> google.protobuf.Duration
-	2,  // 11: crawly.frontier.policy.v1.RunPolicy.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
-	3,  // 12: crawly.frontier.policy.v1.RunPolicy.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
-	6,  // 13: crawly.frontier.policy.v1.RunPolicy.overrides:type_name -> crawly.frontier.policy.v1.RunQueueOverride
-	2,  // 14: crawly.frontier.policy.v1.RunQueueOverride.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
-	3,  // 15: crawly.frontier.policy.v1.RunQueueOverride.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
-	16, // [16:16] is the sub-list for method output_type
-	16, // [16:16] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	7,  // 9: crawly.frontier.policy.v1.Behaviour.max_queue_block:type_name -> google.protobuf.Duration
+	7,  // 10: crawly.frontier.policy.v1.Backoff.initial:type_name -> google.protobuf.Duration
+	7,  // 11: crawly.frontier.policy.v1.Backoff.max:type_name -> google.protobuf.Duration
+	2,  // 12: crawly.frontier.policy.v1.RunPolicy.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
+	3,  // 13: crawly.frontier.policy.v1.RunPolicy.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
+	6,  // 14: crawly.frontier.policy.v1.RunPolicy.overrides:type_name -> crawly.frontier.policy.v1.RunQueueOverride
+	2,  // 15: crawly.frontier.policy.v1.RunQueueOverride.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
+	3,  // 16: crawly.frontier.policy.v1.RunQueueOverride.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
+	17, // [17:17] is the sub-list for method output_type
+	17, // [17:17] is the sub-list for method input_type
+	17, // [17:17] is the sub-list for extension type_name
+	17, // [17:17] is the sub-list for extension extendee
+	0,  // [0:17] is the sub-list for field type_name
 }
 
 func init() { file_crawly_frontier_policy_v1_policy_proto_init() }

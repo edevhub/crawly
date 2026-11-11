@@ -18,6 +18,7 @@ import (
 	queuev1 "github.com/edevhub/crawly/internal/gen/frontier/queue/v1"
 	runv1 "github.com/edevhub/crawly/internal/gen/frontier/run/v1"
 	taskv1 "github.com/edevhub/crawly/internal/gen/frontier/task/v1"
+	"github.com/edevhub/crawly/internal/policy"
 	"github.com/edevhub/crawly/internal/safeconv"
 	"github.com/edevhub/crawly/internal/store"
 )
@@ -32,6 +33,9 @@ type runService struct {
 func (r runService) CreateRun(ctx context.Context, req *runv1.CreateRunRequest) (*runv1.CreateRunResponse, error) {
 	if req.GetRunId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "run_id is required")
+	}
+	if err := policy.ValidateRun(req.GetPolicy()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "policy: "+err.Error())
 	}
 	spec := store.RunSpec{ID: store.RunID(req.GetRunId()), Labels: req.GetLabels(), Policy: req.GetPolicy(),
 		Paused: req.GetStartPaused(), Hash: specHash(req), KeyRule: store.KeyHost,
