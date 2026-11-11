@@ -395,3 +395,26 @@ func TestHTTPContentTypes(t *testing.T) {
 		t.Fatalf("the default: %d calls, %v", p.calls, err)
 	}
 }
+
+// TestHTTPRedirectToOwnURL: a redirect to the task's own URL is a loop only when it
+// asks for the request the task just made.
+func TestHTTPRedirectToOwnURL(t *testing.T) {
+	var status int
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", r.URL.Path)
+		w.WriteHeader(status)
+	}))
+	defer site.Close()
+	post := func() *Task { return &Task{Method: http.MethodPost, URL: site.URL + "/form", Body: []byte("q=1")} }
+
+	// Post, then redirect to the same URL: the GET is another request.
+	status = http.StatusSeeOther
+	res, err := HTTP(&echo{}).Handle(context.Background(), post())
+	if err != nil || len(res.Tasks) != 1 || res.Tasks[0].URL != site.URL+"/form" || res.Tasks[0].Method != "" || res.Tasks[0].Body != nil {
+		t.Fatalf("303 of a POST to its own URL: %+v %v", res, err)
+	}
+	// A 307 repeats the POST: that is the same request again.
+	status = http.StatusTemporaryRedirect
+	_, err = HTTP(&echo{}).Handle(context.Background(), post())
+	requireFailure(t, err, KindFail, "redirect_loop")
+}

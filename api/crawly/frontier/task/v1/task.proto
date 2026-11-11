@@ -70,8 +70,9 @@ message TaskSpec {
   // Dedup key. Empty: the default key of the request. For a GET that is the normalised
   // request.url: scheme + host + path + query parameters sorted alphanumerically
   // ascending. Scheme and host are lowercased, path and query keep their case, the
-  // fragment is ignored. For any other method it is the method, that URL and the SHA-256
-  // of the body. Headers are never part of it. Set it whenever a site needs special
+  // fragment is ignored. A method other than GET is put in front of it, in upper case
+  // (an empty method is a GET), and the SHA-256 of a body that is not empty behind it.
+  // Headers are never part of it. Set it whenever a site needs special
   // rules, e.g. case-insensitive paths, tracking parameters, or requests told apart by
   // a header.
   // Dedup is scoped to the run and the queue key (the fingerprint includes the queue key).
@@ -112,7 +113,7 @@ message Task {
 
 message Request {
   string url = 1;
-  string method = 2;               // default GET
+  string method = 2;               // default GET; stored and sent in upper case
   repeated Header headers = 3;     // repeated, to allow duplicate header names
   bytes body = 4;                  // keep small; reference large payloads via context
 }

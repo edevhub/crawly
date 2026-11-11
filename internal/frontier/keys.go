@@ -15,17 +15,20 @@ import (
 	"github.com/edevhub/crawly/internal/store"
 )
 
-// DedupKey is the default dedup key of a request (ADR 0001, Dedup). For a GET it is
-// the normalised URL. Any other method is told apart by the method and by the body:
-// APIs page through one URL with a cursor in the body, and merging those requests
-// would drop pages without a signal. Headers are not part of the key.
+// DedupKey is the default dedup key of a request (ADR 0001, Dedup): the normalised
+// URL, with the method in front unless it is GET, and the hash of the body behind it
+// unless the body is empty. APIs page through one URL with a cursor in the body, and
+// merging those requests would drop pages without a signal. A GET without a body is
+// its URL alone. The method counts in upper case, which is how it is stored and sent.
+// Headers are not part of the key.
 func DedupKey(r *taskv1.Request) (string, error) {
 	key, err := urlKey(r.GetUrl())
-	method := strings.ToUpper(r.GetMethod())
-	if err != nil || method == "" || method == "GET" {
-		return key, err
+	if err != nil {
+		return "", err
 	}
-	key = method + " " + key
+	if method := strings.ToUpper(r.GetMethod()); method != "" && method != "GET" {
+		key = method + " " + key
+	}
 	if body := r.GetBody(); len(body) > 0 {
 		key += fmt.Sprintf(" sha256:%x", sha256.Sum256(body))
 	}

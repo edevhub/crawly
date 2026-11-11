@@ -559,9 +559,11 @@ The dedup key is `TaskSpec.dedup_key` when the client sets it. Otherwise it is t
 **default key** of the request. For a GET that is the normalised URL: scheme + host + path
 + query parameters, with the parameters sorted alphanumerically ascending. Scheme and host
 are lowercased; path and query keep their case. The host keeps an explicit non-default
-port, and an empty path is `/`. The fragment is not part of it. For any other method the
-key is the method, the normalised URL and the SHA-256 of the body. Headers are never part
-of it.
+port, and an empty path is `/`. The fragment is not part of it. A method other than GET
+is put in front of the URL, in upper case, and the SHA-256 of a body that is not empty
+behind it. A GET without a body is therefore its URL alone, and an empty method is a GET.
+Headers are never part of the key. The Frontier stores the method in upper case, so the
+request that is sent is the one the key counts.
 
 Path and query are not lowercased because the two possible mistakes are not equal. A key
 that is too loose merges two pages, and one of them is never crawled, with no signal but
@@ -823,6 +825,9 @@ implementation carries out an operation, and each fix stays inside the store or 
 - Dedup is per run and queue (identical to per run with host-derived keys).
 - The default dedup key ignores headers, and keeps the case of path and query. Spiders
   for sites where headers matter, or where case does not, must set `dedup_key`.
+- A change of the default key applies from the replica that has it. A run that is open
+  across such an upgrade can fetch once more a request it had added under the old key, and
+  replicas of both versions disagree on the key while the rollout lasts.
 - `max_tasks` can be overshot by up to one second of concurrent additions.
 - Opaque `task_id` and `lease_id` encodings belong to the implementation and must not be
   parsed by clients.

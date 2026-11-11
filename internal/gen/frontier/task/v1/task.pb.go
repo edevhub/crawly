@@ -341,8 +341,9 @@ type TaskSpec struct {
 	// Dedup key. Empty: the default key of the request. For a GET that is the normalised
 	// request.url: scheme + host + path + query parameters sorted alphanumerically
 	// ascending. Scheme and host are lowercased, path and query keep their case, the
-	// fragment is ignored. For any other method it is the method, that URL and the SHA-256
-	// of the body. Headers are never part of it. Set it whenever a site needs special
+	// fragment is ignored. A method other than GET is put in front of it, in upper case
+	// (an empty method is a GET), and the SHA-256 of a body that is not empty behind it.
+	// Headers are never part of it. Set it whenever a site needs special
 	// rules, e.g. case-insensitive paths, tracking parameters, or requests told apart by
 	// a header.
 	// Dedup is scoped to the run and the queue key (the fingerprint includes the queue key).
@@ -577,7 +578,7 @@ func (x *Task) GetPool() string {
 type Request struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Url           string                 `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
-	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`   // default GET
+	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`   // default GET; stored and sent in upper case
 	Headers       []*Header              `protobuf:"bytes,3,rep,name=headers,proto3" json:"headers,omitempty"` // repeated, to allow duplicate header names
 	Body          []byte                 `protobuf:"bytes,4,opt,name=body,proto3" json:"body,omitempty"`       // keep small; reference large payloads via context
 	unknownFields protoimpl.UnknownFields

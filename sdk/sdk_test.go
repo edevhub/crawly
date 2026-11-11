@@ -98,6 +98,22 @@ func TestSeed(t *testing.T) {
 		t.Fatalf("state: %v", got.GetRun().GetState())
 	}
 
+	// Requests to one URL that differ in body or method are separate tasks, and the
+	// spelling of the method does not make two of one.
+	api := func(method, body string) *task.Spec {
+		return &task.Spec{Request: &task.Request{Url: "https://api.example/search", Method: method, Body: []byte(body)}, Handler: "page"}
+	}
+	res, err = c.Seed(ctx, "seed", api("POST", `{"page":1}`), api("POST", `{"page":2}`), api("POST", `{"page":3}`),
+		api("post", `{"page":1}`), api("", ""), api("GET", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []task.AddStatus{task.StatusAdded, task.StatusAdded, task.StatusAdded, task.StatusDuplicate, task.StatusAdded, task.StatusDuplicate} {
+		if res[i].GetStatus() != want {
+			t.Fatalf("api request %d: %v, want %v", i, res[i].GetStatus(), want)
+		}
+	}
+
 	// Seeding nothing is not an error.
 	if res, err := c.Seed(ctx, "seed"); err != nil || len(res) != 0 {
 		t.Fatalf("empty seed: %v %v", res, err)

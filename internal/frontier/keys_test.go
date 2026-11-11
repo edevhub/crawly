@@ -44,8 +44,15 @@ func TestDedupKeyOfRequests(t *testing.T) {
 		}
 		return k
 	}
-	if key("", "") != url || key("GET", "") != url || key("get", "ignored") != url {
-		t.Errorf("a GET must keep the URL as its key: %q %q %q", key("", ""), key("GET", ""), key("get", "ignored"))
+	if key("", "") != url || key("GET", "") != url || key("get", "") != url {
+		t.Errorf("a GET without a body must keep the URL as its key: %q %q %q", key("", ""), key("GET", ""), key("get", ""))
+	}
+	// Some search APIs take a GET with a body.
+	if got := key("GET", `{"after":1}`); got == url || got == key("GET", `{"after":2}`) || got == key("POST", `{"after":1}`) {
+		t.Errorf("a GET with a body: %q", got)
+	}
+	if nilBody, _ := DedupKey(&taskv1.Request{Url: url, Method: "POST"}); nilBody != key("POST", "") {
+		t.Errorf("a nil body and an empty one must be one request: %q", nilBody)
 	}
 	if key("POST", "") != "POST "+url || key("post", "") != key("POST", "") {
 		t.Errorf("POST without a body: %q", key("POST", ""))
