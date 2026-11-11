@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/edevhub/crawly/internal/testfrontier"
 	"github.com/edevhub/crawly/sdk"
 	"github.com/edevhub/crawly/sdk/run"
@@ -181,6 +184,9 @@ func (e *env) wait(id string) *run.Stats {
 	var last *run.Run
 	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
 		res, err := e.c.Runs.GetRun(context.Background(), &run.GetRunRequest{RunId: id})
+		if status.Code(err) == codes.Unavailable {
+			continue // the Frontier was restarted and the connection has not noticed yet
+		}
 		if err != nil {
 			e.t.Fatal(err)
 		}
