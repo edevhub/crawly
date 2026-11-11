@@ -273,7 +273,8 @@ func (s *Store) ensureMonth(ctx context.Context, t time.Time) error {
 }
 
 // dropOldPartitions drops the tasks and attempts partitions whose every run was
-// created before the cut-off.
+// created before the cut-off. A month is kept while one of its runs is open or
+// sealed, or still has tasks to drain: their tasks live in the partition.
 func (s *Store) dropOldPartitions(ctx context.Context, cutoff time.Time) error {
 	rows, err := s.db.Query(ctx, `SELECT c.relname FROM pg_inherits i
 		JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class p ON p.oid = i.inhparent
@@ -294,6 +295,16 @@ func (s *Store) dropOldPartitions(ctx context.Context, cutoff time.Time) error {
 		}
 		m, err := time.Parse("2006m01", rest)
 		if err != nil || !m.AddDate(0, 1, 0).Before(cutoff) {
+			continue
+		}
+		var busy bool
+		if err := s.db.QueryRow(ctx, `SELECT
+			EXISTS (SELECT 1 FROM runs WHERE created_on >= $1 AND created_on < $2 AND state IN ('open', 'sealed'))
+			OR EXISTS (SELECT 1 FROM backlogs WHERE run_created_on >= $1 AND run_created_on < $2 AND (pending > 0 OR in_flight > 0))`,
+			m, m.AddDate(0, 1, 0)).Scan(&busy); err != nil {
+			return err
+		}
+		if busy {
 			continue
 		}
 		if _, err := s.db.Exec(ctx, "DROP TABLE IF EXISTS "+pgx.Identifier{name}.Sanitize()); err != nil {

@@ -643,9 +643,12 @@ number of rows, whatever the size of the run, and the effect on backlogs is even
 - **ResumeRun:** clear `paused`, set `resuming`. The replica that served the call then runs
   the resume sweep, and `Maintain` finishes it if that replica dies: in batches, each its
   own transaction in primary key order,
-  `UPDATE backlogs SET ready_at = now() WHERE run_no = $r AND pending > 0 AND ready_at IS NULL`,
+  `UPDATE backlogs SET ready_at = now() WHERE run_no = $r AND pending > 0`,
   with a `NOTIFY` per pool. Each batch re-reads the run and stops if it was paused again.
-  The last batch clears `resuming`.
+  The last batch clears `resuming`. The sweep resets every backlog with pending tasks and
+  not only the ones with `NULL`: nothing keeps the readiness of a paused run up to date,
+  so a backlog may still wait (`'infinity'`) for a slot that was freed during the pause,
+  or for a block that was lifted. Dispatch works out the readiness again.
 - **CancelRun:** `state = 'cancelled'`, `finished_at = now()`. Returns at once; dispatch
   skips the run's backlogs as for a paused run, and `Maintain` drains them.
 - **Deadline:** `Maintain` finds runs past `deadline` (`runs_active`) and ends them like
@@ -664,7 +667,7 @@ with `SKIP LOCKED`, or `pg_try_advisory_xact_lock` per job):
 | Task TTL | Per backlog with expired pending tasks (`tasks_ttl`): lock queue, backlog, expire tasks `SKIP LOCKED`, adjust `pending` / `expired`, recompute `ready_at`, completion check |
 | Resume sweep | For runs with `resuming` (`runs_resuming`): the batches described under ResumeRun |
 | Cancel and deadline drain | Per backlog of a `cancelled` / `expired` run (`runs_draining`, `backlogs_active`): pending tasks to `cancelled` / `expired`; in-flight tasks to the same state with a `revoked` attempt; release `queues.in_flight`; adjust the ledger |
-| Partitions | Create next month's `tasks` and `attempts` partitions; detach and drop partitions past retention |
+| Partitions | Create next month's `tasks` and `attempts` partitions; drop partitions past retention, except in months where a run is still `open` / `sealed` or has tasks to drain |
 | Queues | Delete `queues` rows with no backlog rows and `last_used_at` older than a day: lock the candidates `FOR UPDATE SKIP LOCKED` (an add holding `KEY SHARE` makes the row skipped), re-check that no backlog exists, then delete |
 | Replicas | Delete replicas not seen for an hour |
 | Ledger audit | Compare a sample of backlogs' `pending` / `in_flight` with counts from `tasks`, and count backlogs without a `queues` row; report both (they should be zero). One statement, so it sees one snapshot and can run under load |
@@ -683,7 +686,9 @@ backlogs of paused and ended runs keep `NULL` on purpose) and `NOTIFY` every poo
 ## Retention
 
 - `tasks` and `attempts`: monthly partitions by `run_created_on`, dropped (or archived)
-  after the retention period. No bulk `DELETE`.
+  after the retention period. No bulk `DELETE`. A month is kept while one of its runs is
+  not ended or still has pending or in-flight tasks, because their tasks live in that
+  partition and a lease of a dropped task could never be finished.
 - `runs`, `run_events`, `backlogs`, `backlog_codes`: deleted with the run after a longer
   retention, kept for run comparisons.
 - Raw responses live in object storage (`response_ref`) under their own retention.

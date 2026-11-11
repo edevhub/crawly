@@ -382,20 +382,86 @@ func TestRetention(t *testing.T) {
 	// The queue comes back with the next task for it, and the run ID is free again.
 	again := createRun(t, s, "r")
 	must(s.AddTasks(ctx, store.AddRequest{Run: again, Tasks: tasks("q", 1)}))(t)
-	if got := dispatch(t, s, 1); len(got) != 1 {
-		t.Fatalf("dispatched %d from the queue that was created again", len(got))
-	}
-
 	// The partitions of a month are dropped once every run in it is older than the
-	// task retention.
+	// task retention, but not while one of them still has work: its tasks live there.
+	held := dispatch(t, s, 1)
+	if len(held) != 1 {
+		t.Fatalf("dispatched %d from the queue that was created again", len(held))
+	}
+	succeed(t, s, held[0])
 	clock.Advance(200 * 24 * time.Hour)
 	if err := s.Maintain(ctx); err != nil {
 		t.Fatal(err)
 	}
 	conn := must(pgx.Connect(ctx, dsn))(t)
 	defer func() { _ = conn.Close(ctx) }()
-	var old bool
-	if err := conn.QueryRow(ctx, "SELECT to_regclass('tasks_y2026m01') IS NOT NULL").Scan(&old); err != nil || old {
-		t.Fatalf("the partition of January is still there: %v %v", old, err)
+	january := func() bool {
+		var there bool
+		if err := conn.QueryRow(ctx, "SELECT to_regclass('tasks_y2026m01') IS NOT NULL").Scan(&there); err != nil {
+			t.Fatal(err)
+		}
+		return there
+	}
+	if !january() {
+		t.Fatal("the partition of January was dropped under a run that is still open")
+	}
+	if run := must(s.SealRun(ctx, again))(t); run.State != store.RunCompleted {
+		t.Fatal(run.State)
+	}
+	if err := s.Maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if january() {
+		t.Fatal("the partition of January is still there")
+	}
+}
+
+// A backlog that waited for a slot when its run was paused is dispatched after the
+// resume, although the slot was freed during the pause.
+func TestResumeAfterSlotFreedDuringPause(t *testing.T) {
+	s := open(t, pgtest.Schema(t), limits(store.Limits{MaxConcurrency: 1}))
+	a, b := createRun(t, s, "a"), createRun(t, s, "b")
+	must(s.AddTasks(ctx, store.AddRequest{Run: a, Tasks: tasks("q", 1)}))(t)
+	must(s.AddTasks(ctx, store.AddRequest{Run: b, Tasks: tasks("q", 1)}))(t)
+	held := dispatch(t, s, 10)
+	if len(held) != 1 {
+		t.Fatalf("dispatched %d with one slot on the queue", len(held))
+	}
+	if got := dispatch(t, s, 10); len(got) != 0 { // the other backlog now waits for the slot
+		t.Fatalf("dispatched %d more", len(got))
+	}
+	waiting := a
+	if held[0].Info.Run == a {
+		waiting = b
+	}
+	must(s.PauseRun(ctx, waiting))(t)
+	succeed(t, s, held[0])
+	must(s.ResumeRun(ctx, waiting))(t)
+	if err := s.Maintain(ctx); err != nil { // finishes the sweep if the resume left it
+		t.Fatal(err)
+	}
+	if got := dispatch(t, s, 10); len(got) != 1 || got[0].Info.Run != waiting {
+		t.Fatalf("after the resume: %+v", got)
+	}
+}
+
+// A block that is lifted while a run is paused does not hold the run back after the
+// resume.
+func TestResumeAfterBlockLiftedDuringPause(t *testing.T) {
+	s := open(t, pgtest.Schema(t), limits(store.Limits{}))
+	r := createRun(t, s, "r")
+	must(s.AddTasks(ctx, store.AddRequest{Run: r, Tasks: tasks("q", 1)}))(t)
+	must(s.BlockQueue(ctx, "q", time.Now().Add(time.Hour), "test"))(t)
+	if got := dispatch(t, s, 10); len(got) != 0 {
+		t.Fatalf("dispatched %d from a blocked queue", len(got))
+	}
+	must(s.PauseRun(ctx, r))(t)
+	must(s.BlockQueue(ctx, "q", time.Time{}, ""))(t)
+	must(s.ResumeRun(ctx, r))(t)
+	if err := s.Maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatch(t, s, 10); len(got) != 1 {
+		t.Fatalf("dispatched %d after the block was lifted and the run resumed", len(got))
 	}
 }

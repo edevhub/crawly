@@ -501,13 +501,25 @@ func (s *Store) finishSweeps(ctx context.Context, _ time.Time) error {
 // cleanQueues deletes queues that no backlog refers to and that were not used for a
 // day. A queue an AddTasks holds is skipped, and one it locks later is created again.
 func (s *Store) cleanQueues(ctx context.Context, now time.Time) error {
-	_, err := s.db.Exec(ctx, `DELETE FROM queues q USING (
-			SELECT key FROM queues c
+	return s.tx(ctx, func(tx pgx.Tx, _ time.Time) error {
+		rows, err := tx.Query(ctx, `SELECT key FROM queues c
 			WHERE last_used_at < $1 AND in_flight = 0 AND (blocked_until IS NULL OR blocked_until < $2)
 				AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.queue_key = c.key)
-			ORDER BY key LIMIT $3 FOR UPDATE SKIP LOCKED) d
-		WHERE q.key = d.key`, now.Add(-queueIdle), now, maintainBacklogs)
-	return wrap(err)
+			ORDER BY key LIMIT $3 FOR UPDATE SKIP LOCKED`, now.Add(-queueIdle), now, maintainBacklogs)
+		if err != nil {
+			return err
+		}
+		keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil || len(keys) == 0 {
+			return err
+		}
+		// The check is repeated in a statement of its own: it sees the backlogs of an
+		// AddTasks that committed after the first statement began and before the row
+		// was locked. An AddTasks that comes later waits for this delete.
+		_, err = tx.Exec(ctx, `DELETE FROM queues q WHERE q.key = ANY($1)
+			AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.queue_key = q.key)`, keys)
+		return err
+	})
 }
 
 // reportReplica records that this replica is alive and forgets the ones that are not.

@@ -185,7 +185,13 @@ const sweepBatch = 500
 
 // resumeSweep makes the backlogs of a resumed run ready again, in batches. It stops
 // when the run is paused again, and clears the run's resuming mark when it is done.
+//
+// Every backlog with pending tasks is reset, not only the ones dispatch took out of
+// the readiness index: while the run was paused nothing kept the others up to date, so
+// one may still wait for a slot that was freed or for a block that was lifted.
 func (s *Store) resumeSweep(ctx context.Context, no int64) error {
+	var queue string // the sweep's position: the last backlog it reset
+	var pool int16
 	for {
 		done := false
 		err := s.tx(ctx, func(tx pgx.Tx, now time.Time) error {
@@ -201,27 +207,38 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 				return err
 			}
 			rows, err := tx.Query(ctx, `WITH c AS (
-					SELECT queue_key, pool_id FROM backlogs WHERE run_no = $1 AND pending > 0 AND ready_at IS NULL
+					SELECT queue_key, pool_id FROM backlogs
+					WHERE run_no = $1 AND pending > 0 AND (queue_key, pool_id) > ($4, $5)
 					ORDER BY queue_key, pool_id LIMIT $3 FOR UPDATE)
 				UPDATE backlogs b SET ready_at = $2 FROM c
-				WHERE b.queue_key = c.queue_key AND b.run_no = $1 AND b.pool_id = c.pool_id RETURNING b.pool_id`, no, now, sweepBatch)
+				WHERE b.queue_key = c.queue_key AND b.run_no = $1 AND b.pool_id = c.pool_id
+				RETURNING b.queue_key, b.pool_id`, no, now, sweepBatch, queue, pool)
 			if err != nil {
 				return err
 			}
-			ids, err := pgx.CollectRows(rows, pgx.RowTo[int16])
-			if err != nil {
+			pools := map[int16]bool{}
+			nextQueue, nextPool := queue, pool
+			var k string
+			var p int16
+			if _, err := pgx.ForEachRow(rows, []any{&k, &p}, func() error {
+				pools[p] = true
+				if k > nextQueue || (k == nextQueue && p > nextPool) {
+					nextQueue, nextPool = k, p
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
-			if len(ids) == 0 {
+			if len(pools) == 0 {
 				done = true
 				_, err := tx.Exec(ctx, "UPDATE runs SET resuming = false WHERE run_no = $1 AND NOT paused", no)
 				return err
 			}
-			pools := map[int16]bool{}
-			for _, id := range ids {
-				pools[id] = true
+			if err := s.wake(ctx, tx, pools); err != nil {
+				return err
 			}
-			return s.wake(ctx, tx, pools)
+			queue, pool = nextQueue, nextPool
+			return nil
 		})
 		if err != nil || done {
 			return err
