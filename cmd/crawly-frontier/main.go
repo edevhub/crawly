@@ -46,6 +46,9 @@ type config struct {
 	listen, policies         string
 	postgres, postgresListen string
 	migrationsTable          string
+	tlsCert, tlsKey          string
+	tlsClientCA              string
+	retainRuns, retainTasks  time.Duration
 }
 
 // migrationsTableFlag is shared by the server, which reads the table, and the migrate
@@ -76,6 +79,14 @@ func main() {
 		"PostgreSQL connection URL for the store (or $"+envPostgres+"); empty keeps the state in memory")
 	flag.StringVar(&cfg.postgresListen, "postgres-listen", os.Getenv(envPostgresListen),
 		"direct PostgreSQL connection URL for LISTEN, when -postgres goes through a transaction pooler (or $"+envPostgresListen+")")
+	flag.StringVar(&cfg.tlsCert, "tls-cert", "", "certificate file (PEM) of the server; with -tls-key it turns TLS on")
+	flag.StringVar(&cfg.tlsKey, "tls-key", "", "private key file (PEM) of the server")
+	flag.StringVar(&cfg.tlsClientCA, "tls-client-ca", "",
+		"CA file (PEM): when set, every client must present a certificate signed by it (mutual TLS)")
+	flag.DurationVar(&cfg.retainRuns, "retain-runs", 0,
+		"how long an ended run is kept before it is deleted with its statistics; 0 keeps runs for ever")
+	flag.DurationVar(&cfg.retainTasks, "retain-tasks", 0,
+		"PostgreSQL only: how long tasks and attempts are kept, counted from the creation of their run; 0 keeps them for ever")
 	flag.Parse()
 	if err := run(cfg, log); err != nil {
 		log.Error("frontier stopped", "err", err)
@@ -87,9 +98,10 @@ func main() {
 func openStore(ctx context.Context, cfg config, pol store.Policies, log *slog.Logger) (store.Store, func(), error) {
 	if cfg.postgres == "" {
 		log.Warn("the store is in memory: the state is lost on restart")
-		return memstore.New(pol), func() {}, nil
+		return memstore.New(pol, memstore.WithRetention(cfg.retainRuns)), func() {}, nil
 	}
-	opts := []pgstore.Option{pgstore.WithLogger(log), pgstore.WithMigrationsTable(cfg.migrationsTable)}
+	opts := []pgstore.Option{pgstore.WithLogger(log), pgstore.WithMigrationsTable(cfg.migrationsTable),
+		pgstore.WithRetention(cfg.retainTasks, cfg.retainRuns)}
 	if cfg.postgresListen != "" {
 		opts = append(opts, pgstore.WithListenDSN(cfg.postgresListen))
 	}
@@ -123,7 +135,17 @@ func run(cfg config, log *slog.Logger) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	g := grpc.NewServer(frontier.ServerOptions()...)
+	opts := frontier.ServerOptions()
+	creds, err := transportCredentials(cfg)
+	if err != nil {
+		return err
+	}
+	if creds != nil {
+		opts = append(opts, grpc.Creds(creds))
+	} else {
+		log.Warn("TLS is off: anyone who can reach the port can use the API")
+	}
+	g := grpc.NewServer(opts...)
 	srv.Register(g)
 	reflection.Register(g)
 	// The background loops outlive the signal: they keep serving the streams that are
@@ -143,7 +165,8 @@ func run(cfg config, log *slog.Logger) error {
 		defer cancel()
 		srv.Shutdown(grace, g)
 	}()
-	log.Info("frontier listening", "addr", lis.Addr().String(), "policy_set", pol.Hash(), "policies", len(pol.Policies()))
+	log.Info("frontier listening", "addr", lis.Addr().String(), "policy_set", pol.Hash(), "policies", len(pol.Policies()),
+		"tls", creds != nil, "client_certificates", cfg.tlsClientCA != "")
 	return g.Serve(lis)
 }
 

@@ -18,6 +18,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -59,6 +61,7 @@ type Server struct {
 	sessions uint64
 	loops    context.Context // set by Run: the lifetime of the dispatch loops
 	draining chan struct{}   // closed by Drain
+	health   *health.Server
 }
 
 // New builds a replica. Call Register to expose it and Run to start its loops.
@@ -77,12 +80,31 @@ func New(cfg Config) (*Server, error) {
 			*d = time.Second
 		}
 	}
-	return &Server{store: cfg.Store, pol: cfg.Policies, log: cfg.Logger, cfg: cfg,
-		pools: map[store.PoolName]*pool{}, draining: make(chan struct{})}, nil
+	s := &Server{store: cfg.Store, pol: cfg.Policies, log: cfg.Logger, cfg: cfg,
+		pools: map[store.PoolName]*pool{}, draining: make(chan struct{}), health: health.NewServer()}
+	s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING) // until Run
+	return s, nil
 }
 
-// Register exposes the four services on a gRPC server.
+// serving sets what the health service answers: whether this replica can take work
+// now. It is not serving before its loops run, while the store cannot be reached, and
+// from the moment it drains.
+func (s *Server) serving(ok bool) {
+	state := healthpb.HealthCheckResponse_NOT_SERVING
+	select {
+	case <-s.draining:
+	default:
+		if ok {
+			state = healthpb.HealthCheckResponse_SERVING
+		}
+	}
+	s.health.SetServingStatus("", state)
+}
+
+// Register exposes the four services and the standard gRPC health service on a gRPC
+// server.
 func (s *Server) Register(g grpc.ServiceRegistrar) {
+	healthpb.RegisterHealthServer(g, s.health)
 	workerv1.RegisterWorkerServiceServer(g, workerService{s: s})
 	runv1.RegisterRunServiceServer(g, runService{s: s})
 	policyv1.RegisterPolicyServiceServer(g, policyService{s: s})
@@ -102,6 +124,8 @@ func (s *Server) Run(ctx context.Context) error {
 	s.mu.Lock()
 	s.loops = ctx
 	s.mu.Unlock()
+	s.serving(true)
+	defer s.serving(false)
 	var wg sync.WaitGroup
 	for _, loop := range []func(context.Context){
 		func(ctx context.Context) { s.notifications(ctx, notes) },
@@ -153,8 +177,14 @@ func (s *Server) reaper(ctx context.Context) {
 			info := &expired[i]
 			f := s.decide(*info, &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "lease_expired"}, nil)
 			f.Source = store.SourceReaper
-			if _, err := s.store.Finish(ctx, f); err != nil {
+			done, err := s.store.Finish(ctx, f)
+			switch {
+			case err != nil:
 				s.log.Warn("reaper: finishing lease", "lease", info.Ref.ID, "err", err)
+			case done == store.FinishAccepted:
+				// The worker that held the task is gone or stuck: worth a line.
+				s.log.Warn("lease expired", "run", info.Run, "task", info.Task, "queue", info.Queue,
+					"pool", info.Pool, "attempt", info.Ref.Attempt, "retry", f.Result == store.ResultRetry)
 			}
 			s.leases.Delete(info.Ref.ID)
 		}
@@ -169,9 +199,12 @@ func (s *Server) maintain(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			if err := s.store.Maintain(ctx); err != nil {
+			err := s.store.Maintain(ctx)
+			if err != nil {
 				s.log.Warn("maintain", "err", err)
 			}
+			// Maintain runs every tick, so it doubles as the probe of the store.
+			s.serving(!errors.Is(err, store.ErrUnavailable))
 		}
 	}
 }
@@ -272,6 +305,7 @@ func (s *Server) Drain() {
 	default:
 		close(s.draining)
 	}
+	s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
 	pools := slices.Collect(maps.Values(s.pools))
 	s.mu.Unlock()
 	var sessions []*session

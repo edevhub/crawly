@@ -131,6 +131,14 @@ func (f *Frontier) Stop() {
 	f.stopped.Wait()
 }
 
+// Drain makes the replica stop taking work, as the first step of a shutdown does.
+func (f *Frontier) Drain() {
+	f.mu.Lock()
+	srv := f.server
+	f.mu.Unlock()
+	srv.Drain()
+}
+
 // Shutdown stops the replica the way a deployment does: it drains the sessions, then
 // stops serving. It reports whether that finished before the timeout.
 func (f *Frontier) Shutdown(timeout time.Duration) bool {

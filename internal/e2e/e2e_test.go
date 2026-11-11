@@ -12,6 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+
 	"github.com/edevhub/crawly/internal/testfrontier"
 	"github.com/edevhub/crawly/sdk"
 	"github.com/edevhub/crawly/sdk/run"
@@ -377,5 +381,33 @@ func TestBalance(t *testing.T) {
 	a, b := counts[0].Load(), counts[1].Load()
 	if a+b != n || min(a, b) < n*35/100 {
 		t.Fatalf("the workers ran %d and %d of %d tasks", a, b, n)
+	}
+}
+
+// TestHealth: the standard gRPC health service says whether the replica takes work.
+func TestHealth(t *testing.T) {
+	f := testfrontier.Start(t)
+	conn, err := grpc.NewClient(f.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	check := func() healthpb.HealthCheckResponse_ServingStatus {
+		res, err := healthpb.NewHealthClient(conn).Check(t.Context(), &healthpb.HealthCheckRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.GetStatus()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for check() != healthpb.HealthCheckResponse_SERVING {
+		if time.Now().After(deadline) {
+			t.Fatalf("a running replica reports %v", check())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	f.Drain()
+	if got := check(); got != healthpb.HealthCheckResponse_NOT_SERVING {
+		t.Fatalf("a draining replica reports %v", got)
 	}
 }

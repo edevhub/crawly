@@ -38,6 +38,7 @@ type Store struct {
 	subs   map[chan store.Notification]struct{}
 	seq    uint64
 	served uint64
+	keep   time.Duration // how long ended runs are kept; 0: for ever
 }
 
 // Option configures a Store.
@@ -45,6 +46,10 @@ type Option func(*Store)
 
 // WithClock replaces the store clock, for tests.
 func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = now } }
+
+// WithRetention makes Maintain delete ended runs, with their tasks, once they have
+// been ended for this long. The default keeps them for ever.
+func WithRetention(runs time.Duration) Option { return func(s *Store) { s.keep = runs } }
 
 // New creates an empty store that resolves limits through pol.
 func New(pol store.Policies, opts ...Option) *Store {
@@ -953,7 +958,41 @@ func (s *Store) Maintain(context.Context) error {
 			s.end(r, store.RunExpired)
 		}
 	}
+	s.retain(now)
 	return nil
+}
+
+// retain deletes the runs that ended longer ago than the retention, with their tasks
+// and backlogs, and the queues nothing refers to any more.
+func (s *Store) retain(now time.Time) {
+	if s.keep <= 0 {
+		return
+	}
+	kept := s.order[:0]
+	for _, r := range s.order {
+		if !r.state.Ended() || now.Sub(r.finished) < s.keep {
+			kept = append(kept, r)
+			continue
+		}
+		delete(s.runs, r.spec.ID)
+		for _, t := range r.tasks {
+			delete(s.tasks, t.id)
+		}
+		for _, b := range r.backlogs {
+			q := b.q
+			q.backlogs = slices.DeleteFunc(q.backlogs, func(o *backlog) bool { return o == b })
+			if q.offer != nil && q.offer.b == b {
+				q.offer = nil
+			}
+			// A queue is dropped only when it carries no state a later task needs:
+			// nothing in flight, no block and no rate limit still counting.
+			if len(q.backlogs) == 0 && q.inFlight == 0 && !q.blockedUntil.After(now) && !q.tat.After(now) {
+				delete(s.queues, q.key)
+			}
+		}
+	}
+	clear(s.order[len(kept):])
+	s.order = kept
 }
 
 // Now returns the store clock.
