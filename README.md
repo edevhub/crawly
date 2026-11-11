@@ -24,8 +24,10 @@ Early. What exists today:
 | PostgreSQL store (`internal/store/pgstore`, ADR 0002) | Passes the conformance suite. State survives restarts; several replicas share one database. Not benchmarked yet |
 | Conformance suite (`internal/store/storetest`) | Covers politeness, overrides, blocks, fairness, pools, fencing, termination, lifecycle |
 
-Not implemented yet: bucket ownership, the per-replica store call budget, Frontier metrics,
-and the SDK's resource-based tuner.
+Not implemented yet: robots.txt handling, Frontier and worker metrics, a view of the
+connected workers, roles for API callers (TLS and client certificates are there), an
+operator CLI, bucket ownership, the per-replica store call budget, and the SDK's
+resource-based tuner.
 
 ## Try it
 
@@ -293,6 +295,43 @@ per second, 2 concurrent).
 ```
 
 These are the global policies. A run's own policy is given at `CreateRun` (see above).
+
+## Running the Frontier
+
+**Transport security.** Without flags the Frontier serves plaintext, which suits a trial
+on one machine only: anyone who can reach the port can use the whole API.
+
+```sh
+crawly-frontier -tls-cert server.pem -tls-key server-key.pem -tls-client-ca clients-ca.pem
+```
+
+- `-tls-cert` and `-tls-key` turn TLS on. The files are read again for every new
+  connection, so a renewed certificate needs no restart.
+- `-tls-client-ca` makes every caller present a certificate signed by that CA (mutual
+  TLS). Every holder of such a certificate may call every service: the Frontier has no
+  roles yet, so keep worker and operator networks apart where that matters.
+
+Workers and schedulers pass gRPC credentials instead of `WithInsecure()`:
+
+```go
+creds := credentials.NewTLS(&tls.Config{RootCAs: roots, Certificates: []tls.Certificate{clientCert}})
+w, err := worker.New("frontier:7070", worker.WithDialOptions(grpc.WithTransportCredentials(creds)))
+c, err := sdk.NewClient("frontier:7070", grpc.WithTransportCredentials(creds))
+```
+
+**Health.** The Frontier serves the standard gRPC health service (`grpc.health.v1`). It
+answers `SERVING` while the replica takes work, and `NOT_SERVING` before its background
+loops run, while it cannot reach the store, and from the moment it drains for a shutdown.
+Use it for readiness, e.g. with `grpc_health_probe` or a Kubernetes gRPC probe.
+
+**Retention.** By default nothing is deleted. `-retain-runs 720h` deletes a run, with its
+statistics, that long after it ended. With PostgreSQL the tasks and attempts live in
+monthly partitions, and `-retain-tasks 2160h` drops a partition once every run in it is
+older than that and has no work left; the in-memory store deletes a run's tasks with the
+run.
+
+**Logs.** A lease that expires is logged at `WARN` with its run, task and queue: the worker
+that held it has died or is stuck.
 
 ## Development
 
