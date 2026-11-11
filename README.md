@@ -368,6 +368,19 @@ c.Runs.CreateRun(ctx, &run.CreateRunRequest{
   of a run one at a time, and "in a row" is that order, which with several workers is not
   the order in which the pages were fetched.
 
+Lease expiries are not counted by `MaxFailed` or `MaxConsecutiveFailures`: a task whose last
+attempt ended because its worker vanished did not fail because of the site, and an outage of
+the worker fleet must not end the run. List `lease_expired` in `AbortOnCodes` to end it on
+one anyway.
+
+**Rollout.** Use the rules only after every Frontier replica runs a build that has them,
+then upgrade the schedulers. Older Frontiers ignore the fields, and an older replica takes
+an aborted run for a live one. With PostgreSQL, `CreateRun` with rules is refused while a
+replica that does not know them is still reporting, and the SDK fails `CreateRun` with
+`FailedPrecondition` when the answer lacks the rules it sent (the run then exists without
+them: cancel it and create it again). To go back to an older Frontier, run the migration's
+Down step first; it turns aborted runs into cancelled ones. See ADR 0002.
+
 `CreateRun` rejects an empty or repeated code, more than 64 codes, and the codes `revoked`
 and `shutdown`, which no recorded attempt carries. When two rules trip at once the code rule
 wins, then the streak, then the total; workers that trip a rule at the same moment give one

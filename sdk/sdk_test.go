@@ -5,14 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"runtime"
 	"slices"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	runv1 "github.com/edevhub/crawly/internal/gen/frontier/run/v1"
 	"github.com/edevhub/crawly/internal/testfrontier"
 	"github.com/edevhub/crawly/sdk"
 	"github.com/edevhub/crawly/sdk/policy"
@@ -373,5 +376,52 @@ func TestWaitSurvivesRestart(t *testing.T) {
 	}
 	if got := <-done; got.GetState() != run.StateCompleted {
 		t.Fatalf("the final state: %v", got.GetState())
+	}
+}
+
+// ruleless answers CreateRun as a Frontier does that predates the abort rules: the run is
+// created and its limits come back without them.
+type ruleless struct {
+	runv1.UnimplementedRunServiceServer
+}
+
+func (ruleless) CreateRun(_ context.Context, req *runv1.CreateRunRequest) (*runv1.CreateRunResponse, error) {
+	return &runv1.CreateRunResponse{Run: &runv1.Run{RunId: req.GetRunId(),
+		Limits: &runv1.RunLimits{MaxTasks: req.GetLimits().GetMaxTasks()}}}, nil
+}
+
+// TestCreateRunNeedsTheRulesBack: a Frontier that drops the abort rules is an error at
+// CreateRun, and one that keeps them, or a run that sets none, is not.
+func TestCreateRunNeedsTheRulesBack(t *testing.T) {
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := grpc.NewServer()
+	runv1.RegisterRunServiceServer(g, ruleless{})
+	go func() { _ = g.Serve(lis) }()
+	t.Cleanup(g.Stop)
+	old, err := sdk.NewClient(lis.Addr().String(), sdk.WithInsecure())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = old.Close() }()
+	for name, lim := range map[string]*run.Limits{
+		"codes":       {AbortOnCodes: []string{"blocked"}},
+		"max failed":  {MaxFailed: 3},
+		"consecutive": {MaxConsecutiveFailures: 3},
+	} {
+		_, err := old.Runs.CreateRun(t.Context(), &run.CreateRunRequest{RunId: "r", Limits: lim})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("%s dropped by the Frontier: %v", name, err)
+		}
+	}
+	if _, err := old.Runs.CreateRun(t.Context(), &run.CreateRunRequest{RunId: "r", Limits: &run.Limits{MaxTasks: 5}}); err != nil {
+		t.Errorf("a run without rules: %v", err)
+	}
+
+	c := client(t) // a current Frontier keeps them
+	if _, err := c.Runs.CreateRun(t.Context(), &run.CreateRunRequest{RunId: "kept", Limits: &run.Limits{AbortOnCodes: []string{"blocked"}, MaxFailed: 2}}); err != nil {
+		t.Errorf("a Frontier that keeps the rules: %v", err)
 	}
 }

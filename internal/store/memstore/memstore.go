@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"strconv"
@@ -39,6 +40,7 @@ type Store struct {
 	seq    uint64
 	served uint64
 	keep   time.Duration // how long ended runs are kept; 0: for ever
+	log    *slog.Logger
 }
 
 // Option configures a Store.
@@ -46,6 +48,9 @@ type Option func(*Store)
 
 // WithClock replaces the store clock, for tests.
 func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = now } }
+
+// WithLogger sets the logger the store reports aborted runs to. Default: none.
+func WithLogger(l *slog.Logger) Option { return func(s *Store) { s.log = l } }
 
 // WithRetention makes Maintain delete ended runs, with their tasks, once they have
 // been ended for this long. The default keeps them for ever.
@@ -62,6 +67,7 @@ func New(pol store.Policies, opts ...Option) *Store {
 		ttl:    map[*task]struct{}{},
 		leased: map[*task]struct{}{},
 		subs:   map[chan store.Notification]struct{}{},
+		log:    slog.New(slog.DiscardHandler),
 	}
 	for _, o := range opts {
 		o(s)
@@ -80,7 +86,7 @@ type run struct {
 	tasks                     []*task
 	backlogs                  []*backlog
 	stats                     store.RunStats // counters only; ledger figures are computed
-	streak                    uint64         // tasks failed for good in a row, for the abort rule
+	failures, streak          uint64         // the abort rules' counters: tasks failed for good, and in a row
 	abort                     *store.AbortReason
 }
 
@@ -336,7 +342,9 @@ func (s *Store) LastEventCursor(context.Context) (store.EventCursor, error) {
 }
 
 func (s *Store) event(r *run, typ store.RunEventType) {
-	s.events = append(s.events, store.RunEvent{Cursor: store.EventCursor(len(s.events) + 1), Type: typ, Run: s.view(r), At: s.now()})
+	v := s.view(r)
+	v.Stats.BlockedQueues = nil // lifecycle events carry no list of blocked queues, as in the other store
+	s.events = append(s.events, store.RunEvent{Cursor: store.EventCursor(len(s.events) + 1), Type: typ, Run: v, At: s.now()})
 	s.send(store.Notification{Runs: true})
 }
 
@@ -765,7 +773,10 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 	case store.ResultFailed:
 		t.state = store.TaskFailed
 		r.stats.Failed++
-		r.streak++
+		if f.Source != store.SourceReaper { // a lease that expired is the fleet's failure, not the site's
+			r.failures++
+			r.streak++
+		}
 		r.active--
 	default:
 		t.state = store.TaskSucceeded
@@ -773,9 +784,10 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 		r.streak = 0
 		r.active--
 	}
-	if rule, ok := r.spec.Limits.Trip(f.Record.Code, r.stats.Failed, r.streak); ok {
+	if rule, ok := r.spec.Limits.Trip(f.Record.Code, r.failures, r.streak); ok {
 		// The outcome is applied: now the rule ends the run, in the same critical section.
 		r.abort = &store.AbortReason{Rule: rule, Code: f.Record.Code, Task: t.id}
+		s.log.Warn("run aborted", "run", r.spec.ID, "rule", rule, "code", f.Record.Code, "task", t.id)
 		s.end(r, store.RunAborted)
 		s.wakeQueue(q)
 		return store.FinishAccepted, nil

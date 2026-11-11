@@ -90,7 +90,8 @@ message RunStats {
   // Queues that are blocked now and hold pending or delayed tasks of this run, so that
   // the run's tasks wait for them. At most 20 are listed, the ones with the most waiting
   // tasks first (ties by queue key); a run that waits on more has more than this list
-  // shows. Empty for a run that has ended.
+  // shows. Empty for a run that has ended. Best effort: when it cannot be read the run
+  // is returned without it. Lifecycle events (not STATS events) do not carry it.
   repeated BlockedQueue blocked_queues = 14;
 }
 
@@ -124,12 +125,15 @@ message RunLimits {
   // carries.
   repeated string abort_on_codes = 4;
   // The run ends when this many of its tasks have failed for good (no attempts left, or
-  // a failure that is not retried). Retries, expiries and drops do not count.
+  // a failure that is not retried). Retries, expiries and drops do not count, and neither
+  // does a task whose last attempt ended because its lease expired: that is a failure of
+  // the worker fleet, not of the site, and a fleet outage must not end the run. (A run
+  // can still list the code lease_expired in abort_on_codes.)
   uint64 max_failed = 5;
   // The run ends when this many tasks have failed for good in a row. The order is the
   // order in which the Frontier applies outcomes of the run, one at a time: a task that
   // fails for good adds one, a task that succeeds resets the count to zero, and nothing
-  // else (a retry, a release, an expiry) changes it. Outcomes of tasks that run at the
+  // else (a retry, a release, an expiry, a lease that expired) changes it. Outcomes of tasks that run at the
   // same time count in the order they are applied, so with concurrent workers "in a row"
   // means in the order of application, not in the order the pages were fetched.
   uint32 max_consecutive_failures = 6;

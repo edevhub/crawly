@@ -1,9 +1,12 @@
 package frontier
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	policyv1 "github.com/edevhub/crawly/internal/gen/frontier/policy/v1"
@@ -84,5 +87,14 @@ func TestValidateAbortRules(t *testing.T) {
 		if err := validateAbortRules(tc.limits); (err == nil) != tc.ok {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+}
+
+// TestUnsupportedIsAFailedPrecondition: a deployment that cannot take abort rules yet is
+// reported as a condition the caller can fix, not as an internal error.
+func TestUnsupportedIsAFailedPrecondition(t *testing.T) {
+	err := grpcErr(fmt.Errorf("%w: a replica is old", store.ErrUnsupported))
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("%v", err)
 	}
 }

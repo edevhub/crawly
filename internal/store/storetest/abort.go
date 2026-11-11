@@ -282,8 +282,9 @@ func abortSuite(t *testing.T, f Factory) {
 	})
 
 	t.Run("ConcurrentSuccessesAndFailures", func(t *testing.T) {
-		// Half the outcomes fail and half succeed, at once: the counters of the rules
-		// stay exact, and a streak limit above the number of failures is never tripped.
+		// Half the outcomes fail and half succeed, at once, with limits no order can
+		// reach: nothing is tripped by mistake and every outcome is counted. (The reset
+		// of the streak is tested in order, in AbortMaxConsecutiveFailures.)
 		e := newEnv(t, f, store.Limits{})
 		r := e.runLimited(store.RunLimits{MaxConsecutiveFailures: 100})
 		const n = 12
@@ -305,6 +306,44 @@ func abortSuite(t *testing.T, f Factory) {
 		if got := e.state(r); got.State != store.RunOpen || got.Stats.Failed != n/2 || got.Stats.Succeeded != n/2 {
 			t.Fatalf("%v %+v", got.State, got.Stats)
 		}
+	})
+
+	t.Run("LeaseExpiriesAreNotTheSitesFailures", func(t *testing.T) {
+		// A task that fails for good because its lease expired is the worker fleet's
+		// failure: it counts toward neither failure limit, so a fleet outage does not end
+		// the run, but a code the run lists still does.
+		e := newEnv(t, f, store.Limits{})
+		r := e.runLimited(store.RunLimits{MaxFailed: 1, MaxConsecutiveFailures: 1})
+		e.seed(r, "q", "default", 4)
+		as := e.dispatch("default", 2)
+		e.clock.Advance(2 * time.Minute) // past the lease
+		for i := range as {
+			st, err := e.s.Finish(ctx, store.Finish{Lease: as[i].Lease.Ref, Source: store.SourceReaper, Result: store.ResultFailed,
+				Record: store.AttemptRecord{Code: "lease_expired"}})
+			if err != nil || st != store.FinishAccepted {
+				t.Fatalf("reaper: %v %v", st, err)
+			}
+		}
+		if got := e.state(r); got.State != store.RunOpen || got.Stats.Failed != 2 {
+			t.Fatalf("lease expiries ended the run or went uncounted: %v %+v", got.State, got.Stats)
+		}
+		// A task the worker fails for good does count: the one still pending, dispatched now.
+		last := e.dispatch("default", 1)[0]
+		e.finishWith(last, store.ResultFailed, "x", 0)
+		e.wantAborted(r, store.AbortConsecutiveFailures, "x", last.Info.Task)
+	})
+
+	t.Run("LeaseExpiredCodeCanBeListed", func(t *testing.T) {
+		e := newEnv(t, f, store.Limits{})
+		r := e.runLimited(store.RunLimits{AbortOnCodes: []string{"lease_expired"}})
+		e.seed(r, "q", "default", 2)
+		a := e.dispatch("default", 1)[0]
+		e.clock.Advance(2 * time.Minute)
+		if st, err := e.s.Finish(ctx, store.Finish{Lease: a.Lease.Ref, Source: store.SourceReaper, Result: store.ResultRetry,
+			Record: store.AttemptRecord{Code: "lease_expired"}}); err != nil || st != store.FinishAccepted {
+			t.Fatalf("reaper: %v %v", st, err)
+		}
+		e.wantAborted(r, store.AbortOnCode, "lease_expired", a.Info.Task)
 	})
 
 	t.Run("BlockedQueuesOnTheRun", func(t *testing.T) {

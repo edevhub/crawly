@@ -545,7 +545,7 @@ func grpcErr(err error) error {
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, store.ErrConflict):
 		return status.Error(codes.AlreadyExists, err.Error())
-	case errors.Is(err, store.ErrRunClosed):
+	case errors.Is(err, store.ErrRunClosed), errors.Is(err, store.ErrUnsupported):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, store.ErrUnavailable):
 		return status.Error(codes.Unavailable, err.Error())

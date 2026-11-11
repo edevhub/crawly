@@ -13,10 +13,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	_ "github.com/jackc/pgx/v5/stdlib" // the database/sql driver goose runs on
+	"github.com/jackc/pgx/v5/stdlib" // the database/sql driver goose runs on
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
 )
+
+// migrationLockTimeout is how long a migration statement waits for a lock.
+const migrationLockTimeout = "3s"
 
 // DefaultMigrationsTable is the table that records which migrations were applied.
 const DefaultMigrationsTable = "crawly_migrations"
@@ -72,10 +75,16 @@ func NewMigrator(dsn, table string, log *slog.Logger) (*Migrator, error) {
 	if _, err := tableIdent(table); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("pgx", dsn)
+	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("pgstore: %w", err)
 	}
+	// A migration that needs a lock the live Frontier holds gives up and is run again,
+	// instead of queueing every query of the Frontier behind its request.
+	if _, set := cfg.RuntimeParams["lock_timeout"]; !set {
+		cfg.RuntimeParams["lock_timeout"] = migrationLockTimeout
+	}
+	db := stdlib.OpenDB(*cfg)
 	locker, err := lock.NewPostgresSessionLocker()
 	if err == nil {
 		opts := []goose.ProviderOption{goose.WithTableName(table), goose.WithSessionLocker(locker)}

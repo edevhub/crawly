@@ -44,6 +44,9 @@ var (
 	ErrConflict    = errors.New("store: conflict")
 	ErrRunClosed   = errors.New("store: run closed")
 	ErrUnavailable = errors.New("store: unavailable")
+	// ErrUnsupported means the deployment cannot do what was asked yet: for the abort rules,
+	// a replica that does not know them is still running.
+	ErrUnsupported = errors.New("store: not supported by every replica")
 	// ErrLeaseStale and ErrLeaseUnknown reject discovered tasks whose parent lease is
 	// not live.
 	ErrLeaseStale   = errors.New("store: lease is fenced or expired")

@@ -473,6 +473,17 @@ var runStates = map[string]store.RunState{
 	"cancelled": store.RunCancelled, "expired": store.RunExpired, "aborted": store.RunAborted,
 }
 
+// parseRunState reads a run state. A name this build does not know was written by a newer
+// one, and a run in a state nobody here knows must not be crawled: it reads as cancelled,
+// which is final and drains its tasks.
+func (s *Store) parseRunState(name string) store.RunState {
+	if st, ok := runStates[name]; ok {
+		return st
+	}
+	s.log.Error("pgstore: a run is in a state this build does not know; treating it as cancelled", "state", name)
+	return store.RunCancelled
+}
+
 func runStateName(st store.RunState) string {
 	for name, v := range runStates {
 		if v == st {
@@ -684,7 +695,7 @@ func (s *Store) loadRuns(ctx context.Context, tx pgx.Tx, key store.QueueKey, bs 
 	var name string
 	var paused bool
 	if _, err := pgx.ForEachRow(rows, []any{&no, &name, &paused}, func() error {
-		states[no] = state{st: runStates[name], paused: paused}
+		states[no] = state{st: s.parseRunState(name), paused: paused}
 		return nil
 	}); err != nil {
 		return err

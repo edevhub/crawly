@@ -551,7 +551,11 @@ prevent. `TaskSpec.priority` orders tasks inside one run's backlog only.
     records no attempt and never counts. The block that comes with the outcome is applied
     first, so the queue stays blocked after the run is gone.
   - `max_failed`: the run ends when that many of its tasks have failed for good. Retries,
-    expiries and drops do not count.
+    expiries and drops do not count. Neither does a task whose last attempt ended because
+    its lease expired (a `Source = Reaper` outcome): that is the worker fleet failing, and
+    an outage of the fleet must not end the run. The same holds for the streak below,
+    which such an outcome neither adds to nor resets. The code `lease_expired` can still be
+    listed in `abort_on_codes`.
   - `max_consecutive_failures`: the run ends when that many tasks have failed for good in a
     row. "In a row" is the order in which the store applies the outcomes of the run, one at
     a time: a task that fails for good adds one, a task that succeeds resets the count, and
@@ -564,6 +568,16 @@ prevent. `TaskSpec.priority` orders tasks inside one run's backlog only.
   - A run without abort rules pays nothing for them. A run with them keeps its failure
     counters on its own row, and the outcomes that change them are applied one at a time
     through that row's lock; a success takes it only when there is a streak to reset.
+  - **Rollout.** A build that predates the rules takes an `ABORTED` run for a live one: it
+    dispatches it, extends its leases and does not drain it. So the rules are used only
+    after every Frontier replica runs a build that has them, then the schedulers that set
+    them. A store that registers its replicas enforces this: `CreateRun` with rules is
+    refused (`FAILED_PRECONDITION`) while a replica that does not know them has reported
+    within the last minute. The SDK checks that the answer to `CreateRun` carries the rules
+    that were sent, which catches a Frontier too old to know them. Going back to an
+    earlier build first turns aborted runs into cancelled ones (the Down step of the
+    migration). A state name a build does not know reads as cancelled, so a later state
+    added the same way is final in this build.
 - **Pause, resume and cancel change the run's state in one small step and take effect
   eventually.** They never touch the run's backlogs in the same operation, so their cost
   does not depend on the size of the run.

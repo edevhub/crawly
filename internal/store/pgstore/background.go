@@ -37,9 +37,9 @@ func (s *Store) Start(ctx context.Context, r store.Replica) error {
 				return err
 			}
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO replicas (replica_id, policy_hash, started_at, seen_at) VALUES ($1, $2, $3, $3)
+		_, err = tx.Exec(ctx, `INSERT INTO replicas (replica_id, policy_hash, started_at, seen_at, abort_rules) VALUES ($1, $2, $3, $3, true)
 			ON CONFLICT (replica_id) DO UPDATE SET policy_hash = EXCLUDED.policy_hash, started_at = EXCLUDED.started_at,
-				seen_at = EXCLUDED.seen_at`, r.ID, r.PolicyHash, now)
+				seen_at = EXCLUDED.seen_at, abort_rules = true`, r.ID, r.PolicyHash, now)
 		return err
 	})
 	if err != nil || !changed {
@@ -259,6 +259,9 @@ const (
 	queueIdle = 24 * time.Hour
 	// replicaIdle is how long a replica that stopped reporting is kept.
 	replicaIdle = time.Hour
+	// replicaLive is how recently a replica must have reported to count as running when
+	// the abort rules are accepted. Replicas report every Maintain round.
+	replicaLive = time.Minute
 	// auditEvery is how many rounds pass between two ledger audits.
 	auditEvery = 60
 	// auditSample is how many backlogs an audit checks.
@@ -304,7 +307,8 @@ func (s *Store) expireRuns(ctx context.Context, now time.Time) error {
 				if st.Ended() {
 					return nil
 				}
-				return s.end(ctx, tx, m.no, store.RunExpired, now)
+				_, err := s.end(ctx, tx, m.no, store.RunExpired, nil, now)
+				return err
 			})
 		}
 		if err != nil && !errors.Is(err, store.ErrNotFound) {

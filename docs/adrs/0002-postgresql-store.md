@@ -96,7 +96,7 @@ CREATE TABLE runs (
   max_failed  bigint,
   max_consecutive_failures int,
   failed_count  bigint    NOT NULL DEFAULT 0,                       -- counters of the abort rules,
-  failed_streak bigint    NOT NULL DEFAULT 0,                       -- kept only for runs that have such rules
+  failed_streak bigint    NOT NULL DEFAULT 0,                       -- kept only for runs that have such rules; fillfactor 70
   abort_rule  smallint,                                             -- why the run was aborted
   abort_code  text,
   abort_task  text,
@@ -589,26 +589,47 @@ run that was over). The rules are those of `RunLimits` (ADR 0001); `store.RunLim
 evaluates them for both stores. A run with no rules is not touched.
 
 1. Needed only when the attempt can change a counter or trip the code rule: a final failure
-   of a run with `max_failed` or `max_consecutive_failures`, or an attempt with a listed
-   code. A success of a run with `max_consecutive_failures` reads `failed_streak`
-   without a lock, and goes on to step 2 only if it is not zero.
-2. `pg_advisory_xact_lock(1, $run_no)`, the lock of every lifecycle change and of the
-   completion check, so that the order of locks is the same.
-3. `SELECT state, failed_count, failed_streak FROM runs WHERE run_no = $r FOR UPDATE`. If
-   the run is over, stop: another outcome ended it first.
-4. A final failure: `failed_count += 1`, `failed_streak += 1`. A success: `failed_streak = 0`.
-5. If a rule trips: `state = 'aborted'`, `finished_at`, `resuming = false`, and the rule, the
-   code and the task of the attempt; append `ABORTED` to `run_events`. The completion check
-   of step 9 is skipped.
+   of a run with `max_failed` or `max_consecutive_failures` (not one of the reaper's), a
+   success of a run with `max_consecutive_failures`, or an attempt with a listed code.
+2. If the completion check of step 9 is due (the backlog is empty),
+   `pg_advisory_xact_lock(1, $run_no)` first: `complete` takes it, and the order of every
+   lifecycle change is the lock, then the row. Otherwise this lock is not taken, so a
+   failure storm does not queue ahead of `AddTasks`, which takes it in shared mode.
+3. A final failure: `UPDATE runs SET failed_count = failed_count + 1, failed_streak =
+   failed_streak + 1 WHERE run_no = $r AND state IN ('open', 'sealed') RETURNING ...`. A
+   success: `SET failed_streak = 0 WHERE ... AND failed_streak <> 0`, which locks the row
+   only when there is a streak. No row means the run is over: another outcome ended it first.
+4. If `Trip` says a rule trips: `UPDATE runs SET state = 'aborted', finished_at,
+   resuming = false, abort_rule, abort_code, abort_task WHERE run_no = $r AND state IN
+   ('open', 'sealed')`, and `ABORTED` is appended to `run_events` only if a row changed.
+   `end` does this for cancel and deadline too. The completion check of step 9 is skipped,
+   and `complete` itself updates only a run that is still `sealed`.
 
-The advisory lock and the row lock make the outcomes of a run that change a counter
-strictly ordered, whichever queues they come from, which is what "in a row" means.
-Two outcomes that trip a rule at once give one abort: the second finds the run over. The
-locks are taken after the queue and backlog locks, as the completion check takes them, and
-no path takes them in the other order. The drain handles an aborted run like a cancelled
+The row lock, held from the counter update to the commit, orders the outcomes of a run that
+change a counter, whichever queues they come from, which is what "in a row" means. Two
+outcomes that trip a rule at once give one abort: the second finds the run over. No path
+takes the advisory lock while it holds the run's row, so the order cannot be reversed. The
+cost of a failure storm is one row update per final failure on one row, and the table is
+created with `fillfactor = 70` so that these updates stay on their page. Waiting for that
+row counts against the pool's `lock_timeout`: a storm slower than that fails Finish, which
+is retried; `TestFailureStormOnOneRun` runs 64 queues against it. The drain handles an aborted run like a cancelled
 one. Adding the `aborted` value to `run_state` and to the draining index is a migration that
 runs outside a transaction, because PostgreSQL cannot use a new enum value in the
-transaction that adds it.
+transaction that adds it. The migrator sets a `lock_timeout` of three seconds, so a
+statement that needs a lock the live Frontier holds fails and is run again instead of
+queueing every query behind it, and the index is built `CONCURRENTLY` next to the old one.
+
+**Rollout and rollback.** A build without the rules reads `aborted` as no known state, which
+is not final: it would dispatch the run, extend its leases and never drain it. The
+Frontier gates on this. `replicas.abort_rules` is set by a replica that knows the rules
+(the column defaults to false for any other), and `CreateRun` with rules, for a run that
+does not exist yet, is refused with `store.ErrUnsupported` while a replica without it has
+reported within the last minute. The order is: migrate, upgrade every replica, then let
+schedulers use the rules. A replica that keeps its ID across a downgrade keeps its flag, so
+give replicas fresh IDs, or clear it, when going back. To go back to a build without the
+rules, run the Down step of the migration first: it turns `aborted` runs into `cancelled`
+ones. The enum value stays. Within this build an unknown run state name reads as
+`cancelled` and is logged, so a later state is final here too.
 
 ### Extend lease
 
