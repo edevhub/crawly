@@ -3,8 +3,11 @@ package frontier
 import (
 	"testing"
 
+	taskv1 "github.com/edevhub/crawly/internal/gen/frontier/task/v1"
 	"github.com/edevhub/crawly/internal/store"
 )
+
+func get(url string) *taskv1.Request { return &taskv1.Request{Url: url} }
 
 func TestDedupKey(t *testing.T) {
 	for in, want := range map[string]string{
@@ -15,17 +18,53 @@ func TestDedupKey(t *testing.T) {
 		"https://example.com:8443/x?z=1&Z=0":      "https://example.com:8443/x?Z=0&z=1",
 		"http://example.com":                      "http://example.com/",
 	} {
-		got, err := DedupKey(in)
+		got, err := DedupKey(get(in))
 		if err != nil || got != want {
 			t.Errorf("DedupKey(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	a, _ := DedupKey("https://example.com/p/aB3x")
-	b, _ := DedupKey("https://example.com/p/Ab3X")
+	a, _ := DedupKey(get("https://example.com/p/aB3x"))
+	b, _ := DedupKey(get("https://example.com/p/Ab3X"))
 	if a == b {
 		t.Error("paths that differ in case must not be one task")
 	}
-	if _, err := DedupKey("/relative"); err == nil {
+	if _, err := DedupKey(get("/relative")); err == nil {
+		t.Error("a relative URL must be rejected")
+	}
+}
+
+// TestDedupKeyOfRequests: a GET is its URL; other methods are told apart by method
+// and body, so the pages of an API behind one URL are separate tasks.
+func TestDedupKeyOfRequests(t *testing.T) {
+	const url = "https://example.com/api/search"
+	key := func(method, body string) string {
+		k, err := DedupKey(&taskv1.Request{Url: url, Method: method, Body: []byte(body)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	if key("", "") != url || key("GET", "") != url || key("get", "") != url {
+		t.Errorf("a GET without a body must keep the URL as its key: %q %q %q", key("", ""), key("GET", ""), key("get", ""))
+	}
+	// Some search APIs take a GET with a body.
+	if got := key("GET", `{"after":1}`); got == url || got == key("GET", `{"after":2}`) || got == key("POST", `{"after":1}`) {
+		t.Errorf("a GET with a body: %q", got)
+	}
+	if nilBody, _ := DedupKey(&taskv1.Request{Url: url, Method: "POST"}); nilBody != key("POST", "") {
+		t.Errorf("a nil body and an empty one must be one request: %q", nilBody)
+	}
+	if key("POST", "") != "POST "+url || key("post", "") != key("POST", "") {
+		t.Errorf("POST without a body: %q", key("POST", ""))
+	}
+	page1, page2 := key("POST", `{"page":1}`), key("POST", `{"page":2}`)
+	if page1 == page2 || page1 == key("POST", "") || page1 != key("POST", `{"page":1}`) {
+		t.Errorf("bodies must tell requests apart: %q %q", page1, page2)
+	}
+	if key("PUT", `{"page":1}`) == page1 || key("HEAD", "") == url {
+		t.Error("the method must tell requests apart")
+	}
+	if _, err := DedupKey(&taskv1.Request{Url: "/relative", Method: "POST"}); err == nil {
 		t.Error("a relative URL must be rejected")
 	}
 }

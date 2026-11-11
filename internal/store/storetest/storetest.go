@@ -394,6 +394,31 @@ func Run(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("ReleaseDelayed", func(t *testing.T) {
+		// A task a worker hands back can be held for a while: it is not dispatched
+		// before the delay passed, and still costs no attempt.
+		e := newEnv(t, f, store.Limits{})
+		r := e.run("r")
+		e.seed(r, "q", "default", 1)
+		first := e.dispatch("default", 1)[0]
+		st, err := e.s.Finish(ctx, store.Finish{Lease: first.Lease.Ref, Source: store.SourceWorker,
+			Result: store.ResultReleased, RetryIn: 30 * time.Second})
+		if err != nil || st != store.FinishAccepted {
+			t.Fatalf("release: %v %v", st, err)
+		}
+		if got := e.dispatch("default", 1); len(got) != 0 {
+			t.Fatalf("dispatched before the delay passed: %+v", got)
+		}
+		e.clock.Advance(31 * time.Second)
+		again := e.dispatch("default", 1)
+		if len(again) != 1 || again[0].Lease.Ref.Attempt != first.Lease.Ref.Attempt {
+			t.Fatalf("after the delay: %+v, want attempt %d again", again, first.Lease.Ref.Attempt)
+		}
+		if st := e.state(r).Stats; st.Attempts != 1 || st.InFlight != 1 {
+			t.Fatalf("stats: %+v", st)
+		}
+	})
+
 	t.Run("ReleaseUndelivered", func(t *testing.T) {
 		// An assignment that never reached a worker is undone: the task is dispatchable
 		// at once, no attempt is recorded and the attempt number is used again.

@@ -49,6 +49,7 @@ type config struct {
 	tlsCert, tlsKey          string
 	tlsClientCA              string
 	retainRuns, retainTasks  time.Duration
+	noHandlerGrace           time.Duration
 }
 
 // migrationsTableFlag is shared by the server, which reads the table, and the migrate
@@ -87,6 +88,8 @@ func main() {
 		"how long an ended run is kept before it is deleted with its statistics; 0 keeps runs for ever")
 	flag.DurationVar(&cfg.retainTasks, "retain-tasks", 0,
 		"PostgreSQL only: how long tasks and attempts are kept, counted from the creation of their run; 0 keeps them for ever")
+	flag.DurationVar(&cfg.noHandlerGrace, "no-handler-grace", time.Hour,
+		`how long a task waits for a worker that has its handler, e.g. during a rolling deploy, before it fails with code "no_handler"`)
 	flag.Parse()
 	if err := run(cfg, log); err != nil {
 		log.Error("frontier stopped", "err", err)
@@ -125,7 +128,7 @@ func run(cfg config, log *slog.Logger) error {
 		return err
 	}
 	defer closeStore()
-	srv, err := frontier.New(frontier.Config{Store: st, Policies: pol, Logger: log})
+	srv, err := frontier.New(frontier.Config{Store: st, Policies: pol, Logger: log, NoHandlerGrace: cfg.noHandlerGrace})
 	if err != nil {
 		return err
 	}

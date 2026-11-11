@@ -13,6 +13,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/policy"
 	"github.com/edevhub/crawly/internal/store"
+	"github.com/edevhub/crawly/internal/wire"
 )
 
 // Config configures a Frontier replica.
@@ -44,6 +46,13 @@ type Config struct {
 	ReaperInterval   time.Duration
 	MaintainInterval time.Duration
 	PollInterval     time.Duration
+	// NoHandlerGrace is how long a task is handed from worker to worker while none of
+	// them has its handler, before it fails with code "no_handler". Zero: one hour.
+	NoHandlerGrace time.Duration
+	// NoHandlerDelay is how long such a task waits before it is given out again. Each
+	// round takes a politeness slot of its queue, so the delay bounds what a pool
+	// without the handler costs the queue's other tasks. Zero: five seconds.
+	NoHandlerDelay time.Duration
 }
 
 // Server is one Frontier replica.
@@ -53,15 +62,17 @@ type Server struct {
 	log   *slog.Logger
 	cfg   Config
 
-	mu       sync.Mutex
-	pools    map[store.PoolName]*pool
-	runSpecs sync.Map // store.RunID -> store.RunSpec; a run's spec never changes
-	leases   sync.Map // store.LeaseID -> store.LeaseInfo, for leases this replica dispatched
-	events   signal   // broadcast: a run event was appended
-	sessions uint64
-	loops    context.Context // set by Run: the lifetime of the dispatch loops
-	draining chan struct{}   // closed by Drain
-	health   *health.Server
+	mu        sync.Mutex
+	pools     map[store.PoolName]*pool
+	runSpecs  sync.Map // store.RunID -> store.RunSpec; a run's spec never changes
+	leases    sync.Map // store.LeaseID -> store.LeaseInfo, for leases this replica dispatched
+	events    signal   // broadcast: a run event was appended
+	sessions  uint64
+	loops     context.Context // set by Run: the lifetime of the dispatch loops
+	draining  chan struct{}   // closed by Drain
+	health    *health.Server
+	unserved  sync.Map  // store.TaskID -> time.Time: since when no worker that got the task had its handler
+	forgotten time.Time // guarded by mu: when forgetUnserved last looked at unserved
 }
 
 // New builds a replica. Call Register to expose it and Run to start its loops.
@@ -79,6 +90,12 @@ func New(cfg Config) (*Server, error) {
 		if *d <= 0 {
 			*d = time.Second
 		}
+	}
+	if cfg.NoHandlerGrace <= 0 {
+		cfg.NoHandlerGrace = time.Hour
+	}
+	if cfg.NoHandlerDelay <= 0 {
+		cfg.NoHandlerDelay = 5 * time.Second
 	}
 	s := &Server{store: cfg.Store, pol: cfg.Policies, log: cfg.Logger, cfg: cfg,
 		pools: map[store.PoolName]*pool{}, draining: make(chan struct{}), health: health.NewServer()}
@@ -182,6 +199,7 @@ func (s *Server) reaper(ctx context.Context) {
 			case err != nil:
 				s.log.Warn("reaper: finishing lease", "lease", info.Ref.ID, "err", err)
 			case done == store.FinishAccepted:
+				s.unserved.Delete(info.Task) // a worker took the task and ran its handler
 				// The worker that held the task is gone or stuck: worth a line.
 				s.log.Warn("lease expired", "run", info.Run, "task", info.Task, "queue", info.Queue,
 					"pool", info.Pool, "attempt", info.Ref.Attempt, "retry", f.Result == store.ResultRetry)
@@ -200,6 +218,7 @@ func (s *Server) maintain(ctx context.Context) {
 			return
 		case <-tick.C:
 			err := s.store.Maintain(ctx)
+			s.forgetUnserved()
 			if err != nil {
 				s.log.Warn("maintain", "err", err)
 			}
@@ -354,6 +373,53 @@ func ServerOptions() []grpc.ServerOption {
 // good; a site that is still refusing after a day blocks the queue again.
 const maxQueueBlock = 24 * time.Hour
 
+// CodeNoHandler is the code of a task no worker has a handler for.
+const CodeNoHandler = "no_handler"
+
+// CodeShutdown is the code of a task a worker handed back because it shut down.
+const CodeShutdown = "shutdown"
+
+// forgetUnserved drops the tasks that were handed back long ago and not since: they
+// ended with their run, or their record was left behind by a store error. It looks at
+// every record, so it runs a few times per grace period, not on every tick.
+func (s *Server) forgetUnserved() {
+	s.mu.Lock()
+	due := time.Since(s.forgotten) >= s.cfg.NoHandlerGrace/4
+	if due {
+		s.forgotten = time.Now()
+	}
+	s.mu.Unlock()
+	if !due {
+		return
+	}
+	s.unserved.Range(func(k, v any) bool {
+		if first, ok := v.(time.Time); ok && time.Since(first) > 2*s.cfg.NoHandlerGrace {
+			s.unserved.Delete(k)
+		}
+		return true
+	})
+}
+
+// served keeps the record of the tasks no worker has a handler for, once the store
+// took the outcome. The record of a task starts with the first worker that lacked its
+// handler and ends with the first that ran it, whatever the result: the grace counts
+// the time nobody could run the task, not the time since a deploy began.
+func (s *Server) served(info store.LeaseInfo, w store.WorkerInfo, o *taskv1.Outcome, f store.Finish) {
+	if f.Result != store.ResultReleased || o.GetCode() != CodeNoHandler {
+		s.unserved.Delete(info.Task)
+		if o.GetKind() == taskv1.Outcome_KIND_RELEASED && o.GetCode() == CodeNoHandler {
+			s.log.Warn("no worker had the task's handler for the grace period: the task failed",
+				"task", info.Task, "run", info.Run, "pool", info.Pool, "grace", s.cfg.NoHandlerGrace)
+		}
+		return
+	}
+	if _, known := s.unserved.LoadOrStore(info.Task, time.Now()); !known {
+		// Once per task: the sign of a rolling deploy, or of a handler nobody has.
+		s.log.Info("a worker lacks the task's handler: the task is handed to the next worker",
+			"task", info.Task, "run", info.Run, "pool", info.Pool, "worker", w.ID, "build", w.Version)
+	}
+}
+
 // decide turns a worker's outcome into a transition (ADR 0001, Responsibilities): the
 // spider classifies, the Frontier applies max_attempts and backoff.
 func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.FetchInfo) store.Finish {
@@ -365,6 +431,27 @@ func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.F
 	switch o.GetKind() {
 	case taskv1.Outcome_KIND_SUCCESS:
 		f.Result = store.ResultSucceeded
+	case taskv1.Outcome_KIND_RELEASED:
+		// The task was not run: nothing of the outcome but the hand-back applies.
+		f.Block = 0
+		switch o.GetCode() {
+		case CodeShutdown:
+			f.Result = store.ResultReleased
+		case CodeNoHandler:
+			// A worker of an older build shares a pool with the build that knows the
+			// handler, as in a rolling deploy. The task goes round until a worker has
+			// its handler, and fails only when none turned up for long enough.
+			f.Result, f.RetryIn = store.ResultReleased, s.cfg.NoHandlerDelay
+			if since, ok := s.unserved.Load(info.Task); ok {
+				if first, ok := since.(time.Time); ok && time.Since(first) >= s.cfg.NoHandlerGrace {
+					f.Result, f.RetryIn, f.Record.Kind = store.ResultFailed, 0, int32(taskv1.Outcome_KIND_FAILED)
+				}
+			}
+		default:
+			// Only the SDK's own reasons hand a task back. Anything else could keep
+			// a task going round for ever, at no cost to its attempts.
+			f.Result, f.Record.Kind = store.ResultFailed, int32(taskv1.Outcome_KIND_FAILED)
+		}
 	case taskv1.Outcome_KIND_RETRY:
 		if limit := beh.GetMaxAttempts(); limit > 0 && info.Ref.Attempt >= limit {
 			f.Result = store.ResultFailed
@@ -418,12 +505,17 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 	out := make([]store.NewTask, len(specs))
 	for i, ts := range specs {
 		pool, queue, fp, err := identify(spec.KeyRule, ts)
-		if err != nil {
+		if err != nil || proto.Size(ts) > wire.MaxTaskBytes {
 			out[i].Invalid = true
 			continue
 		}
 		stored := proto.CloneOf(ts)
 		stored.QueueKey, stored.Pool = queue, string(pool)
+		if stored.GetRequest().GetMethod() != "" {
+			// Methods are case-sensitive on the wire. One spelling is stored and sent,
+			// the one the dedup key counts, so that "post" and "POST" are one request.
+			stored.Request.Method = strings.ToUpper(stored.GetRequest().GetMethod())
+		}
 		raw, err := proto.Marshal(stored)
 		if err != nil {
 			out[i].Invalid = true

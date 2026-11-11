@@ -707,7 +707,7 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 		// The assignment never reached a worker: the attempt did not happen.
 		t.attempt--
 		r.stats.Attempts--
-		t.state, t.notBefore = store.TaskPending, now
+		t.state, t.notBefore = store.TaskPending, now.Add(f.RetryIn)
 		if !t.expiresAt.IsZero() {
 			s.ttl[t] = struct{}{}
 		}
