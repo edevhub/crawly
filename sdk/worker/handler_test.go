@@ -27,6 +27,33 @@ func TestErrors(t *testing.T) {
 	}
 }
 
+func TestStrainOption(t *testing.T) {
+	var e *Error
+	if err := Retry("slow", nil, Strain()); !errors.As(err, &e) || !e.Strain {
+		t.Fatalf("Strain must mark the failure: %+v", e)
+	}
+	if err := Retry("slow", nil); !errors.As(err, &e) || e.Strain {
+		t.Fatalf("a failure is no sign of strain unless it says so: %+v", e)
+	}
+}
+
+// TestReportStrain: the signal goes to the Frontier with a failure, but not with a
+// task that is handed back.
+func TestReportStrain(t *testing.T) {
+	a := &active{leaseID: "l", attempt: 1}
+	poolFor := func(string) string { return "" }
+	err := Retry("http_503", nil, Strain())
+	if rep := buildReport(a, &Task{}, nil, err, "", poolFor); !rep.complete.GetOutcome().GetStrain() {
+		t.Error("a failure that signals strain must carry it")
+	}
+	if rep := buildReport(a, &Task{}, nil, err, codeShutdown, poolFor); rep.complete.GetOutcome().GetStrain() {
+		t.Error("a task handed back says nothing about the site")
+	}
+	if rep := buildReport(a, &Task{}, nil, Retry("x", nil), "", poolFor); rep.complete.GetOutcome().GetStrain() {
+		t.Error("strain must be opt-in")
+	}
+}
+
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		name string
@@ -43,6 +70,9 @@ func TestClassify(t *testing.T) {
 		if e := classify(c.err); e.Kind != c.kind || e.Code != c.code {
 			t.Errorf("%s: got kind %d code %q", c.name, e.Kind, e.Code)
 		}
+	}
+	if e := classify(context.DeadlineExceeded); !e.Strain {
+		t.Error("a timeout is a sign of strain")
 	}
 }
 

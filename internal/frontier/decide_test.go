@@ -58,3 +58,43 @@ func TestQueueBlockCeiling(t *testing.T) {
 		t.Errorf("a block under the ceiling: %v", got)
 	}
 }
+
+// TestStrainRetries: a failure that is a sign of strain is judged against
+// max_strain_attempts, not max_attempts, while adaptive pacing is on; with it off the
+// signal means nothing, and a task that was handed back is never a sign of strain.
+func TestStrainRetries(t *testing.T) {
+	pol, err := policy.Parse([]byte(`{"policies": [
+		{"name": "default", "behaviour": {"maxAttempts": 3, "maxStrainAttempts": 6}},
+		{"name": "fixed", "match": {"queueKey": "fixed.example"}, "limits": {"adaptive": {"enabled": false}}},
+		{"name": "short", "match": {"queueKey": "short.example"}, "behaviour": {"maxStrainAttempts": 2}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Config{Store: memstore.New(pol), Policies: pol})
+	if err != nil {
+		t.Fatal(err)
+	}
+	strained := &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_503", Strain: true}
+	plain := &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "parse"}
+	cases := []struct {
+		name    string
+		queue   store.QueueKey
+		o       *taskv1.Outcome
+		attempt uint32
+		result  store.TaskResult
+		strain  bool
+	}{
+		{"strain: past max_attempts", "a.example", strained, 5, store.ResultRetry, true},
+		{"strain: the ceiling ends it", "a.example", strained, 6, store.ResultFailed, true},
+		{"no strain: max_attempts", "a.example", plain, 3, store.ResultFailed, false},
+		{"adaptive off: the signal is ignored", "fixed.example", strained, 3, store.ResultFailed, false},
+		{"the ceiling is never below max_attempts", "short.example", strained, 2, store.ResultRetry, true},
+		{"handed back", "a.example", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RELEASED, Code: "shutdown", Strain: true}, 1, store.ResultReleased, false},
+	}
+	for _, c := range cases {
+		f := s.decide(store.LeaseInfo{Queue: c.queue, Ref: store.LeaseRef{Attempt: c.attempt}}, c.o, nil)
+		if f.Result != c.result || f.Strain != c.strain {
+			t.Errorf("%s: result %v strain %v, want %v %v", c.name, f.Result, f.Strain, c.result, c.strain)
+		}
+	}
+}

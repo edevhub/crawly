@@ -93,6 +93,7 @@ type queue struct {
 	vclock       float64
 	blockedUntil time.Time
 	blockReason  string
+	strain       store.Strain
 	backlogs     []*backlog
 	offer        *offer
 	served       uint64
@@ -529,6 +530,7 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, slots int, no
 				continue
 			}
 			e := s.pol.For(b.r.spec.ID, b.r.spec.Policy, q.key)
+			e.Queue, e.Limits = e.Adaptive.Apply(e.Queue, q.strain), e.Adaptive.Apply(e.Limits, q.strain)
 			admit, at := sched.Admitted(e.Queue, q.tat, now, q.inFlight), sched.EligibleAt(e.Queue, q.tat)
 			if e.Own {
 				admit, at = sched.Admitted(e.Limits, b.ownTat, now, b.inFlight), sched.EligibleAt(e.Limits, b.ownTat)
@@ -726,6 +728,7 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 		}
 		r.stats.QueueBlocks++
 	}
+	s.adapt(q, r, f, t.dispatch, now)
 	switch f.Result {
 	case store.ResultRetry:
 		t.state, t.notBefore = store.TaskPending, now.Add(f.RetryIn)
@@ -745,6 +748,29 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 	s.complete(r)
 	s.wakeQueue(q)
 	return store.FinishAccepted, nil
+}
+
+func latest(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// adapt moves the queue's adaptive state with an attempt that ended.
+func (s *Store) adapt(q *queue, r *run, f store.Finish, dispatched, now time.Time) {
+	e := s.pol.For(r.spec.ID, r.spec.Policy, q.key)
+	before := q.strain
+	switch {
+	case f.Strain:
+		q.strain = e.Adaptive.Strained(e.Queue.Interval, q.strain, now, dispatched)
+	case f.Result == store.ResultSucceeded:
+		q.strain = e.Adaptive.Succeeded(e.Queue.Interval, q.strain, now, dispatched)
+	}
+	if q.strain.Interval > before.Interval {
+		// The next request waits a whole new interval, counted from now.
+		q.tat = latest(q.tat, now.Add(q.strain.Interval))
+	}
 }
 
 // ExpiredLeases returns up to limit leases past their expiry, oldest first.
@@ -852,9 +878,13 @@ func (s *Store) ListTasks(_ context.Context, f store.TaskFilter, page store.Page
 }
 
 func (s *Store) queueView(q *queue, now time.Time) store.Queue {
-	lim := s.pol.For("", nil, q.key).Queue
+	e := s.pol.For("", nil, q.key)
+	lim := e.Adaptive.Apply(e.Queue, q.strain)
 	v := store.Queue{Key: q.key, InFlight: q.inFlight, NextEligibleAt: sched.EligibleAt(lim, q.tat),
-		AdmissibleNow: sched.Admitted(lim, q.tat, now, q.inFlight), BlockReason: q.blockReason}
+		AdmissibleNow: sched.Admitted(lim, q.tat, now, q.inFlight), BlockReason: q.blockReason, Strain: q.strain}
+	if !e.Adaptive.Enabled {
+		v.Strain.Interval = 0
+	}
 	if now.Before(q.blockedUntil) {
 		v.BlockedUntil, v.AdmissibleNow = q.blockedUntil, 0
 	} else {
@@ -923,6 +953,13 @@ func (s *Store) BlockQueue(_ context.Context, key store.QueueKey, until time.Tim
 	defer s.mu.Unlock()
 	q := s.queue(key)
 	q.blockedUntil, q.blockReason = until, reason
+	if now := s.now(); until.IsZero() && q.strain.Interval > 0 {
+		// Back to the policy's rate: what the slowdown made the queue wait is cancelled.
+		q.strain.Interval, q.strain.At = 0, now
+		if q.tat.After(now) {
+			q.tat = now
+		}
+	}
 	s.wakeQueue(q)
 	return s.queueView(q, s.now()), nil
 }
@@ -986,7 +1023,7 @@ func (s *Store) retain(now time.Time) {
 			}
 			// A queue is dropped only when it carries no state a later task needs:
 			// nothing in flight, no block and no rate limit still counting.
-			if len(q.backlogs) == 0 && q.inFlight == 0 && !q.blockedUntil.After(now) && !q.tat.After(now) {
+			if len(q.backlogs) == 0 && q.inFlight == 0 && !q.blockedUntil.After(now) && !q.tat.After(now) && q.strain.Interval == 0 {
 				delete(s.queues, q.key)
 			}
 		}

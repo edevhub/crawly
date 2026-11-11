@@ -307,8 +307,8 @@ func (q queueService) ListQueues(ctx context.Context, req *queuev1.ListQueuesReq
 		return nil, grpcErr(err)
 	}
 	out := &queuev1.ListQueuesResponse{NextPageToken: next}
-	for _, v := range qs {
-		out.Queues = append(out.Queues, q.queueProto(v))
+	for i := range qs {
+		out.Queues = append(out.Queues, q.queueProto(qs[i]))
 	}
 	return out, nil
 }
@@ -339,7 +339,11 @@ func (q queueService) BlockQueue(ctx context.Context, req *queuev1.BlockQueueReq
 func (q queueService) queueProto(v store.Queue) *queuev1.Queue {
 	out := &queuev1.Queue{Key: string(v.Key), EffectiveLimits: q.s.pol.Resolve(nil, string(v.Key)).Queue,
 		Limiter: &queuev1.LimiterState{InFlight: safeconv.Uint32(v.InFlight), NextEligibleTime: ts(v.NextEligibleAt),
-			AdmissibleNow: safeconv.Uint32(v.AdmissibleNow), UnblockTime: ts(v.BlockedUntil), BlockReason: v.BlockReason}}
+			AdmissibleNow: safeconv.Uint32(v.AdmissibleNow), UnblockTime: ts(v.BlockedUntil), BlockReason: v.BlockReason,
+			StrainSteps: v.Strain.Steps, LastStrainTime: ts(v.Strain.Last)}}
+	if v.Strain.Interval > 0 {
+		out.Limiter.CurrentInterval = durationpb.New(v.Strain.Interval)
+	}
 	for _, b := range v.Backlogs {
 		out.Backlogs = append(out.Backlogs, &queuev1.RunBacklog{RunId: string(b.Run), Pool: string(b.Pool),
 			Pending: b.Pending, Delayed: b.Delayed, InFlight: safeconv.Uint32(b.InFlight), Weight: uint32(b.Weight)})

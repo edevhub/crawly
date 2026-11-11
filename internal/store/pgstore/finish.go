@@ -293,6 +293,9 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 			}
 			own.blocks++
 		}
+		if narrowed := adapt(q, own, f, t.dispatched, now); narrowed {
+			quicken(q, bs, now)
+		}
 		if f.Record.Code != "" {
 			batch.Queue(`INSERT INTO backlog_codes (queue_key, run_no, code, count) VALUES ($1, $2, $3, 1)
 				ON CONFLICT (queue_key, run_no, code) DO UPDATE SET count = backlog_codes.count + 1`, string(t.queue), t.run, f.Record.Code)
@@ -313,6 +316,39 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 		}
 	}
 	return status, s.wakeWaiting(ctx, tx, bs)
+}
+
+// adapt moves the queue's adaptive state with an attempt that ended, and reports
+// whether the queue's interval got shorter.
+func adapt(q *qrow, b *brow, f store.Finish, dispatched, now time.Time) (narrowed bool) {
+	was := q.strain.Interval
+	switch {
+	case f.Strain:
+		q.strain = b.eff.Adaptive.Strained(b.eff.Queue.Interval, q.strain, now, dispatched)
+	case f.Result == store.ResultSucceeded:
+		q.strain = b.eff.Adaptive.Succeeded(b.eff.Queue.Interval, q.strain, now, dispatched)
+	}
+	if q.strain.Interval > was {
+		// The next request waits a whole new interval, counted from now.
+		q.tat = latest(q.tat, now.Add(q.strain.Interval))
+	}
+	return q.strain.Interval < was
+}
+
+// quicken brings the readiness of the backlogs that wait for the rate limit forward,
+// after the queue's interval got shorter: their readiness was set for the longer one.
+// Early is allowed, late is not.
+func quicken(q *qrow, bs []*brow, now time.Time) {
+	for _, b := range bs {
+		if b.pending == 0 || !b.live || b.ready.IsZero() || b.ready.Equal(forever) || !b.ready.After(now) {
+			continue
+		}
+		if admit, at := admission(q, b, now); admit > 0 {
+			b.setReady(now)
+		} else if at.Before(b.ready) {
+			b.setReady(at)
+		}
+	}
 }
 
 // refresh brings the readiness of a queue's locked backlogs up to date after a slot

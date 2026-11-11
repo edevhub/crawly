@@ -146,6 +146,73 @@ func TestHTTPStatusClassification(t *testing.T) {
 	}
 }
 
+// TestHTTPStrainSignal: the statuses and failures that are signs of strain on the site
+// carry the strain signal; a 429 with a Retry-After blocks the queue instead, and the
+// other failures say nothing about the site.
+func TestHTTPStrainSignal(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		retryAfter string
+		strain     bool
+	}{
+		{"502", 502, "", true}, {"503", 503, "", true}, {"504", 504, "", true},
+		{"429 without Retry-After", 429, "", true}, {"429 with Retry-After", 429, "30", false},
+		{"500", 500, "", false}, {"408", 408, "", false}, {"404", 404, "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if c.retryAfter != "" {
+					w.Header().Set("Retry-After", c.retryAfter)
+				}
+				w.WriteHeader(c.status)
+			}))
+			defer site.Close()
+			_, err := HTTP(&echo{}).Handle(context.Background(), get(site.URL))
+			var e *Error
+			if !errors.As(err, &e) {
+				t.Fatalf("want a classified failure, got %v", err)
+			}
+			if e.Strain != c.strain {
+				t.Fatalf("strain = %v, want %v", e.Strain, c.strain)
+			}
+		})
+	}
+}
+
+// TestHTTPStrainOnTransportFailures: a timeout and a refused connection are signs of strain.
+func TestHTTPStrainOnTransportFailures(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	defer slow.Close()
+	task := get(slow.URL)
+	task.FetchTimeout = 50 * time.Millisecond
+	_, err := HTTP(&echo{}).Handle(context.Background(), task)
+	if e := failure(t, err, KindRetry, "fetch_error"); !e.Strain {
+		t.Error("a fetch timeout must signal strain")
+	}
+	dead := httptest.NewServer(http.NotFoundHandler())
+	dead.Close()
+	_, err = HTTP(&echo{}).Handle(context.Background(), get(dead.URL))
+	if e := failure(t, err, KindRetry, "fetch_error"); !e.Strain {
+		t.Error("a refused connection must signal strain")
+	}
+}
+
+// TestHTTPWithStatusOverridesStrain: a parser for a status decides its own outcome, so a
+// 503 that the spider says is no sign of strain is none.
+func TestHTTPWithStatusOverridesStrain(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	defer site.Close()
+	maintenance := ParserFunc(func(context.Context, *Task, *Response) (*Result, error) {
+		return nil, Retry("maintenance", errors.New("planned"), After(time.Hour))
+	})
+	_, err := HTTP(&echo{}, WithStatus(maintenance, 503)).Handle(context.Background(), get(site.URL))
+	if e := failure(t, err, KindRetry, "maintenance"); e.Strain {
+		t.Error("the spider's own classification must stand")
+	}
+}
+
 func TestHTTPRetryAfterBlocksQueue(t *testing.T) {
 	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "120")
@@ -153,8 +220,8 @@ func TestHTTPRetryAfterBlocksQueue(t *testing.T) {
 	}))
 	defer site.Close()
 	_, err := HTTP(&echo{}).Handle(context.Background(), get(site.URL))
-	if e := failure(t, err, KindRetry, "http_429"); e.BlockQueueFor != 2*time.Minute {
-		t.Fatalf("block for %v, want 2m", e.BlockQueueFor)
+	if e := failure(t, err, KindRetry, "http_429"); e.BlockQueueFor != 2*time.Minute || e.Strain {
+		t.Fatalf("block for %v, strain %v: want 2m and no strain", e.BlockQueueFor, e.Strain)
 	}
 }
 

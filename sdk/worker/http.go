@@ -158,9 +158,11 @@ type httpHandler struct {
 //     would only be dropped as a duplicate, so it is a permanent failure with code
 //     "redirect_loop";
 //   - 429: retry, and the queue is blocked for the Retry-After delay when the site sent one;
-//   - 408 and 5xx: retry;
+//     without one the failure is a sign of strain on the site (see Strain);
+//   - 502, 503 and 504: retry, as a sign of strain;
+//   - 408 and the other 5xx: retry;
 //   - any other status: permanent failure;
-//   - transport errors and timeouts: retry.
+//   - transport errors and timeouts: retry, as a sign of strain.
 //
 // Codes are "http_<status>" or "fetch_error".
 //
@@ -211,7 +213,7 @@ func (h *httpHandler) Handle(ctx context.Context, t *Task) (*Result, error) {
 	start := time.Now()
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return nil, Retry("fetch_error", err)
+		return nil, Retry("fetch_error", err, Strain())
 	}
 	defer func() { _ = resp.Body.Close() }() // the body was read; a close error changes nothing
 	if ok := resp.StatusCode >= 200 && resp.StatusCode < 300; ok && !h.accepts(resp.Header.Get("Content-Type")) {
@@ -221,7 +223,7 @@ func (h *httpHandler) Handle(ctx context.Context, t *Task) (*Result, error) {
 	// One byte more than the cap is read, to tell a body at the cap from one over it.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, h.maxBody+1))
 	if err != nil {
-		return nil, Retry("fetch_error", err)
+		return nil, Retry("fetch_error", err, Strain())
 	}
 	parser := h.byStatus[resp.StatusCode]
 	if parser == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -278,11 +280,15 @@ func (h *httpHandler) Handle(ctx context.Context, t *Task) (*Result, error) {
 		}
 		return &Result{Code: "redirect", Fetch: fetch, Tasks: []NewTask{next}}, nil
 	case resp.StatusCode == http.StatusTooManyRequests:
-		var opts []ErrorOption
+		// With a Retry-After the site says how long to wait, and the queue is blocked
+		// for that long; without one it only says to slow down.
+		opt := Strain()
 		if d := retryAfter(resp.Header.Get("Retry-After")); d > 0 {
-			opts = append(opts, BlockQueue(d))
+			opt = BlockQueue(d)
 		}
-		return &Result{Fetch: fetch}, Retry(code, status, opts...)
+		return &Result{Fetch: fetch}, Retry(code, status, opt)
+	case resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout:
+		return &Result{Fetch: fetch}, Retry(code, status, Strain())
 	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= 500:
 		return &Result{Fetch: fetch}, Retry(code, status)
 	default:

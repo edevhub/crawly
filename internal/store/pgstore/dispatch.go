@@ -177,11 +177,12 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 			return nil, err
 		}
 		if n := len(got); n > 0 {
+			queue, own := best.limits(q)
 			if best.eff.Own {
-				best.ownTat = sched.Advance(best.eff.Limits, best.ownTat, now, n)
-				q.tat = sched.AdvanceCapped(best.eff.Queue, q.tat, now, n)
+				best.ownTat = sched.Advance(own, best.ownTat, now, n)
+				q.tat = sched.AdvanceCapped(queue, q.tat, now, n)
 			} else {
-				q.tat = sched.Advance(best.eff.Queue, q.tat, now, n)
+				q.tat = sched.Advance(queue, q.tat, now, n)
 			}
 			best.vtime, q.vclock = sched.Charge(bestStart, q.vclock, best.eff.Weight, n)
 			best.pending -= int64(n)

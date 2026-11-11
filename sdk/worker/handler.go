@@ -148,6 +148,7 @@ type Error struct {
 	Code          string        // machine-readable, for stats and alerting
 	RetryAfter    time.Duration // KindRetry: not before this delay; zero uses policy backoff
 	BlockQueueFor time.Duration // stop the whole queue, for every run, for this long
+	Strain        bool          // the failure is a sign of strain on the site: slow the queue down
 	Err           error
 }
 
@@ -170,6 +171,14 @@ func After(d time.Duration) ErrorOption { return func(e *Error) { e.RetryAfter =
 // duration, e.g. from a Retry-After header on a 429. The queue's policy bounds it
 // (max_queue_block, 24 hours by default).
 func BlockQueue(d time.Duration) ErrorOption { return func(e *Error) { e.BlockQueueFor = d } }
+
+// Strain marks a failure as a sign that the site is under strain, such as a 503, a
+// timeout or answers that got slower: the Frontier slows the task's queue down, for
+// every run, and gives the task more attempts than max_attempts while it does
+// (max_strain_attempts). It is for a handler that does its own fetching; the HTTP
+// adapter sets it for the statuses and errors that mean it. A failure that is the
+// task's own, such as a page that does not parse, must not carry it.
+func Strain() ErrorOption { return func(e *Error) { e.Strain = true } }
 
 // Retry reports a transient failure.
 func Retry(code string, err error, opts ...ErrorOption) error {
@@ -195,7 +204,7 @@ func classify(err error) *Error {
 		return e
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return &Error{Kind: KindRetry, Code: "timeout", Err: err}
+		return &Error{Kind: KindRetry, Code: "timeout", Strain: true, Err: err}
 	}
 	return &Error{Kind: KindRetry, Code: "error", Err: err}
 }

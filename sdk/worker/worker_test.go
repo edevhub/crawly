@@ -287,7 +287,8 @@ func TestTaskFields(t *testing.T) {
 }
 
 // TestHandlerTimeout: WithTimeout bounds a handler, and a handler that runs out of
-// time is a retryable failure.
+// time is a retryable failure and a sign of strain: it is given max_strain_attempts (10
+// by default) attempts, not max_attempts.
 func TestHandlerTimeout(t *testing.T) {
 	e := newEnv(t)
 	var calls atomic.Int32
@@ -300,7 +301,7 @@ func TestHandlerTimeout(t *testing.T) {
 	e.start(w)
 
 	st := e.crawl("timeout", nil, spec("https://a.example/", "stuck"))
-	if st.GetFailed() != 1 || st.GetByCode()["timeout"] != 3 || calls.Load() != 3 {
+	if st.GetFailed() != 1 || st.GetByCode()["timeout"] != 10 || calls.Load() != 10 {
 		t.Fatalf("stats: %v, calls %d", st, calls.Load())
 	}
 }

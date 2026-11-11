@@ -55,7 +55,7 @@ func Start(tb testing.TB) *Frontier {
 // StartAt is Start on a given address.
 func StartAt(tb testing.TB, addr string) *Frontier {
 	tb.Helper()
-	pol := policies(tb)
+	pol := policiesFrom(tb, Policies)
 	return start(tb, addr, pol, memstore.New(pol))
 }
 
@@ -63,8 +63,21 @@ func StartAt(tb testing.TB, addr string) *Frontier {
 // is skipped when no PostgreSQL is configured (see pgtest).
 func StartPostgres(tb testing.TB) *Frontier {
 	tb.Helper()
+	return StartPostgresWith(tb, Policies)
+}
+
+// StartWith is Start with the policies in the given JSON, instead of Policies.
+func StartWith(tb testing.TB, policies string) *Frontier {
+	tb.Helper()
+	pol := policiesFrom(tb, policies)
+	return start(tb, "127.0.0.1:0", pol, memstore.New(pol))
+}
+
+// StartPostgresWith is StartPostgres with the policies in the given JSON.
+func StartPostgresWith(tb testing.TB, policies string) *Frontier {
+	tb.Helper()
 	dsn := pgtest.Schema(tb)
-	pol := policies(tb)
+	pol := policiesFrom(tb, policies)
 	st, err := pgstore.New(context.Background(), dsn, pol)
 	if err != nil {
 		tb.Fatal(err)
@@ -74,9 +87,9 @@ func StartPostgres(tb testing.TB) *Frontier {
 	return f
 }
 
-func policies(tb testing.TB) *policy.Set {
+func policiesFrom(tb testing.TB, src string) *policy.Set {
 	tb.Helper()
-	pol, err := policy.Parse([]byte(Policies))
+	pol, err := policy.Parse([]byte(src))
 	if err != nil {
 		tb.Fatal(err)
 	}

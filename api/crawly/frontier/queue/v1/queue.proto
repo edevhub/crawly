@@ -7,6 +7,7 @@ syntax = "proto3";
 package crawly.frontier.queue.v1;
 
 import "crawly/frontier/policy/v1/policy.proto";
+import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/edevhub/crawly/internal/gen/frontier/queue/v1;queuev1";
@@ -28,6 +29,15 @@ message LimiterState {
   uint32 admissible_now = 6;
   google.protobuf.Timestamp unblock_time = 4;
   string block_reason = 5;
+  // The interval between requests the queue is slowed to by adaptive limits. Unset
+  // while the queue runs at its policy's rate. A BlockQueue call that lifts the block
+  // also resets it.
+  google.protobuf.Duration current_interval = 7;
+  // Strain steps taken since the queue's state was created, and when the last outcome
+  // that signalled strain arrived (it is later than the last step when the queue was at
+  // its ceiling or the outcome fell in the same epoch).
+  uint64 strain_steps = 8;
+  google.protobuf.Timestamp last_strain_time = 9;
 }
 
 message RunBacklog {

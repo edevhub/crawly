@@ -73,7 +73,12 @@ func seed(t *testing.T, ctx context.Context, addr, runID string, specs ...*task.
 
 func waitRun(t *testing.T, ctx context.Context, rc run.Client, runID string) *run.Run {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	return waitRunWithin(t, ctx, rc, runID, 20*time.Second)
+}
+
+func waitRunWithin(t *testing.T, ctx context.Context, rc run.Client, runID string, limit time.Duration) *run.Run {
+	t.Helper()
+	deadline := time.Now().Add(limit)
 	for time.Now().Before(deadline) {
 		res, err := rc.GetRun(ctx, &run.GetRunRequest{RunId: runID})
 		if err != nil {

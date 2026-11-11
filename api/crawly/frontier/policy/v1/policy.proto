@@ -17,7 +17,10 @@
 //     traffic only. Its traffic still counts towards the queue's shared state, so other
 //     runs back off while it runs and resume at most one interval after it stops;
 //   - a queue block (Outcome.block_queue_for, BlockQueue) stops every run, with or without
-//     run limits.
+//     run limits;
+//   - adaptive limits (QueueLimits.adaptive) belong to the queue and slow every run on it,
+//     with or without run limits: the interval in force is the longer of the run's and
+//     the queue's current one.
 //
 // Fairness is per queue: runs with work on the same queue share its admitted dispatches by
 // weight, per (queue, run, pool) backlog. There is no fleet-wide share of worker slots
@@ -54,8 +57,33 @@ message QueueLimits {
   optional double rate_per_second = 2;
   optional uint32 burst = 3;
   google.protobuf.Duration min_delay = 4;
-  // Field 5 reserved for adaptive (AIMD) limits.
-  reserved 5;
+  // Slows the queue down while its site is under strain. It belongs to the queue: it is
+  // read from the global policies only, and a run that sets it is rejected. See
+  // AdaptiveLimits.
+  AdaptiveLimits adaptive = 5;
+}
+
+// Adaptive pacing of a queue (AIMD on its rate). A task outcome that carries
+// Outcome.strain cuts the queue's rate by decrease_factor, down to max_interval; each
+// later success raises it again by recovery_step of the policy's rate, up to the
+// policy's rate. At most one step is taken per epoch: an outcome counts only if its
+// attempt was dispatched after the last step, so a burst of requests that fail together
+// is one step. While the queue is slower than its limits, one request is in flight at a
+// time, and the interval applies to run limits that replace the queue's as well: a run
+// can be slower than the queue but not faster than the site allows. The state is the
+// queue's, shared by all runs and replicas. It is inert on a queue without a rate limit.
+// Unset fields inherit; with nothing configured it is on.
+message AdaptiveLimits {
+  // false switches it off for the queue. Default true.
+  optional bool enabled = 1;
+  // The slowest interval between requests the queue is slowed to. A queue whose own
+  // interval is longer is never slowed. Default 1m.
+  google.protobuf.Duration max_interval = 2;
+  // Factor the rate is multiplied by on a strain step, in (0, 1). Default 0.5.
+  optional double decrease_factor = 3;
+  // Share of the policy's rate that is added back on a recovery step, in (0, 1].
+  // Default 0.1.
+  optional double recovery_step = 4;
 }
 
 message Behaviour {
@@ -73,6 +101,11 @@ message Behaviour {
   // the global policies only, and a run that sets it is rejected. Must be positive.
   // Default 24h.
   google.protobuf.Duration max_queue_block = 8;
+  // Attempts a task gets when its failures are signs of strain on the site
+  // (Outcome.strain), instead of max_attempts: the queue is slowed down meanwhile, so
+  // these failures say little about the task. Never less than max_attempts. Has no
+  // effect on a queue whose adaptive limits are off. Default 10.
+  optional uint32 max_strain_attempts = 9;
 }
 
 message Backoff {

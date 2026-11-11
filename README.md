@@ -169,6 +169,7 @@ Outcomes are plain Go errors:
 | `worker.Retry(code, err)` | Transient failure; retried with backoff up to the policy's `max_attempts` |
 | `worker.Retry(code, err, worker.After(d))` | The same, and not before `d` |
 | `worker.Retry(code, err, worker.BlockQueue(d))` | The same, and the whole site is paused for `d`, for every run |
+| `worker.Retry(code, err, worker.Strain())` | The same, and the failure says the site is under strain: its queue slows down (see Policies) |
 | `worker.Fail(code, err)` | Permanent failure; never retried |
 | any other error | Transient failure, code `error` (`timeout` for a deadline) |
 | a panic | Transient failure, code `panic` |
@@ -177,7 +178,9 @@ Outcomes are plain Go errors:
 The codes end up in the run's stats (`Stats.ByCode`), so they are what you alert on.
 
 The HTTP adapter classifies responses itself: 2xx is parsed, 429 retries and blocks the
-site for the `Retry-After` delay, 408 and 5xx retry, other statuses fail, and a redirect is
+site for the `Retry-After` delay (without one it signals strain, see Policies), 502, 503
+and 504 retry and signal strain, 408 and the other 5xx retry, other statuses fail, timeouts
+and failed connections retry and signal strain, and a redirect is
 not followed: its target is added as a new task, so that the Frontier paces and deduplicates
 it like any other page. A parser can still return
 `worker.Retry` or `worker.Fail` for a 2xx page, for example a captcha served with status 200.
@@ -368,6 +371,32 @@ per second, 2 concurrent).
 ```
 
 These are the global policies. A run's own policy is given at `CreateRun` (see above).
+
+### Slowing down a site that is struggling
+
+A fixed rate does not follow the site. When a spider reports a failure as a sign of strain
+(the HTTP adapter does for 502, 503 and 504, a 429 without `Retry-After`, timeouts and
+failed connections; `worker.Strain()` does for a handler that fetches by itself), the site's
+queue halves its rate, down to one request a minute, and one request at a time is in flight
+while it is slowed. Requests that fail together are one step. Each success then raises the
+rate again by a tenth of the policy's rate, until the queue is back at the policy. A task
+that fails because of strain is given `maxStrainAttempts` attempts (10) instead of
+`maxAttempts`, so a site that was down for a while does not cost pages; a site that stays
+down still ends its tasks. The queue's state is shared by all runs and all Frontier
+replicas, and `GetQueue` shows it (`current_interval`, `strain_steps`, `last_strain_time`).
+`BlockQueue` with no time, the operator's unblock, resets it.
+
+It is on by default, and a global policy tunes or switches it off per site:
+
+```json
+{"name": "fragile", "match": {"queueKey": "*.example.com"},
+ "limits": {"ratePerSecond": 5, "adaptive": {"maxInterval": "300s", "decreaseFactor": 0.5, "recoveryStep": 0.1}},
+ "behaviour": {"maxStrainAttempts": 20}}
+```
+
+`"adaptive": {"enabled": false}` keeps the rate fixed. The settings belong to the site, so a
+run that sets `adaptive` is rejected. A run's own limits do not escape it: they are held to
+the queue's interval while it is slowed. A queue without a rate limit is never slowed.
 
 A spider that finds the crawler blocked asks the Frontier to leave the site alone
 (`worker.Blocked(d)`, or `worker.BlockQueue(d)` on any outcome). One outcome blocks a site

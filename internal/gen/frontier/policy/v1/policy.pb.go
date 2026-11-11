@@ -17,7 +17,10 @@
 //     traffic only. Its traffic still counts towards the queue's shared state, so other
 //     runs back off while it runs and resume at most one interval after it stops;
 //   - a queue block (Outcome.block_queue_for, BlockQueue) stops every run, with or without
-//     run limits.
+//     run limits;
+//   - adaptive limits (QueueLimits.adaptive) belong to the queue and slow every run on it,
+//     with or without run limits: the interval in force is the longer of the run's and
+//     the queue's current one.
 //
 // Fairness is per queue: runs with work on the same queue share its admitted dispatches by
 // weight, per (queue, run, pool) backlog. There is no fleet-wide share of worker slots
@@ -176,8 +179,12 @@ type QueueLimits struct {
 	RatePerSecond  *float64               `protobuf:"fixed64,2,opt,name=rate_per_second,json=ratePerSecond,proto3,oneof" json:"rate_per_second,omitempty"`
 	Burst          *uint32                `protobuf:"varint,3,opt,name=burst,proto3,oneof" json:"burst,omitempty"`
 	MinDelay       *durationpb.Duration   `protobuf:"bytes,4,opt,name=min_delay,json=minDelay,proto3" json:"min_delay,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Slows the queue down while its site is under strain. It belongs to the queue: it is
+	// read from the global policies only, and a run that sets it is rejected. See
+	// AdaptiveLimits.
+	Adaptive      *AdaptiveLimits `protobuf:"bytes,5,opt,name=adaptive,proto3" json:"adaptive,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *QueueLimits) Reset() {
@@ -238,6 +245,97 @@ func (x *QueueLimits) GetMinDelay() *durationpb.Duration {
 	return nil
 }
 
+func (x *QueueLimits) GetAdaptive() *AdaptiveLimits {
+	if x != nil {
+		return x.Adaptive
+	}
+	return nil
+}
+
+// Adaptive pacing of a queue (AIMD on its rate). A task outcome that carries
+// Outcome.strain cuts the queue's rate by decrease_factor, down to max_interval; each
+// later success raises it again by recovery_step of the policy's rate, up to the
+// policy's rate. At most one step is taken per epoch: an outcome counts only if its
+// attempt was dispatched after the last step, so a burst of requests that fail together
+// is one step. While the queue is slower than its limits, one request is in flight at a
+// time, and the interval applies to run limits that replace the queue's as well: a run
+// can be slower than the queue but not faster than the site allows. The state is the
+// queue's, shared by all runs and replicas. It is inert on a queue without a rate limit.
+// Unset fields inherit; with nothing configured it is on.
+type AdaptiveLimits struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// false switches it off for the queue. Default true.
+	Enabled *bool `protobuf:"varint,1,opt,name=enabled,proto3,oneof" json:"enabled,omitempty"`
+	// The slowest interval between requests the queue is slowed to. A queue whose own
+	// interval is longer is never slowed. Default 1m.
+	MaxInterval *durationpb.Duration `protobuf:"bytes,2,opt,name=max_interval,json=maxInterval,proto3" json:"max_interval,omitempty"`
+	// Factor the rate is multiplied by on a strain step, in (0, 1). Default 0.5.
+	DecreaseFactor *float64 `protobuf:"fixed64,3,opt,name=decrease_factor,json=decreaseFactor,proto3,oneof" json:"decrease_factor,omitempty"`
+	// Share of the policy's rate that is added back on a recovery step, in (0, 1].
+	// Default 0.1.
+	RecoveryStep  *float64 `protobuf:"fixed64,4,opt,name=recovery_step,json=recoveryStep,proto3,oneof" json:"recovery_step,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AdaptiveLimits) Reset() {
+	*x = AdaptiveLimits{}
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AdaptiveLimits) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AdaptiveLimits) ProtoMessage() {}
+
+func (x *AdaptiveLimits) ProtoReflect() protoreflect.Message {
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AdaptiveLimits.ProtoReflect.Descriptor instead.
+func (*AdaptiveLimits) Descriptor() ([]byte, []int) {
+	return file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *AdaptiveLimits) GetEnabled() bool {
+	if x != nil && x.Enabled != nil {
+		return *x.Enabled
+	}
+	return false
+}
+
+func (x *AdaptiveLimits) GetMaxInterval() *durationpb.Duration {
+	if x != nil {
+		return x.MaxInterval
+	}
+	return nil
+}
+
+func (x *AdaptiveLimits) GetDecreaseFactor() float64 {
+	if x != nil && x.DecreaseFactor != nil {
+		return *x.DecreaseFactor
+	}
+	return 0
+}
+
+func (x *AdaptiveLimits) GetRecoveryStep() float64 {
+	if x != nil && x.RecoveryStep != nil {
+		return *x.RecoveryStep
+	}
+	return 0
+}
+
 type Behaviour struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MaxAttempts   *uint32                `protobuf:"varint,1,opt,name=max_attempts,json=maxAttempts,proto3,oneof" json:"max_attempts,omitempty"`
@@ -253,13 +351,18 @@ type Behaviour struct {
 	// the global policies only, and a run that sets it is rejected. Must be positive.
 	// Default 24h.
 	MaxQueueBlock *durationpb.Duration `protobuf:"bytes,8,opt,name=max_queue_block,json=maxQueueBlock,proto3" json:"max_queue_block,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Attempts a task gets when its failures are signs of strain on the site
+	// (Outcome.strain), instead of max_attempts: the queue is slowed down meanwhile, so
+	// these failures say little about the task. Never less than max_attempts. Has no
+	// effect on a queue whose adaptive limits are off. Default 10.
+	MaxStrainAttempts *uint32 `protobuf:"varint,9,opt,name=max_strain_attempts,json=maxStrainAttempts,proto3,oneof" json:"max_strain_attempts,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Behaviour) Reset() {
 	*x = Behaviour{}
-	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[3]
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -271,7 +374,7 @@ func (x *Behaviour) String() string {
 func (*Behaviour) ProtoMessage() {}
 
 func (x *Behaviour) ProtoReflect() protoreflect.Message {
-	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[3]
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -284,7 +387,7 @@ func (x *Behaviour) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Behaviour.ProtoReflect.Descriptor instead.
 func (*Behaviour) Descriptor() ([]byte, []int) {
-	return file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP(), []int{3}
+	return file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Behaviour) GetMaxAttempts() uint32 {
@@ -336,6 +439,13 @@ func (x *Behaviour) GetMaxQueueBlock() *durationpb.Duration {
 	return nil
 }
 
+func (x *Behaviour) GetMaxStrainAttempts() uint32 {
+	if x != nil && x.MaxStrainAttempts != nil {
+		return *x.MaxStrainAttempts
+	}
+	return 0
+}
+
 type Backoff struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Initial       *durationpb.Duration   `protobuf:"bytes,1,opt,name=initial,proto3" json:"initial,omitempty"`
@@ -348,7 +458,7 @@ type Backoff struct {
 
 func (x *Backoff) Reset() {
 	*x = Backoff{}
-	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[4]
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -360,7 +470,7 @@ func (x *Backoff) String() string {
 func (*Backoff) ProtoMessage() {}
 
 func (x *Backoff) ProtoReflect() protoreflect.Message {
-	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[4]
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -373,7 +483,7 @@ func (x *Backoff) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Backoff.ProtoReflect.Descriptor instead.
 func (*Backoff) Descriptor() ([]byte, []int) {
-	return file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP(), []int{4}
+	return file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Backoff) GetInitial() *durationpb.Duration {
@@ -419,7 +529,7 @@ type RunPolicy struct {
 
 func (x *RunPolicy) Reset() {
 	*x = RunPolicy{}
-	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[5]
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -431,7 +541,7 @@ func (x *RunPolicy) String() string {
 func (*RunPolicy) ProtoMessage() {}
 
 func (x *RunPolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[5]
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -444,7 +554,7 @@ func (x *RunPolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunPolicy.ProtoReflect.Descriptor instead.
 func (*RunPolicy) Descriptor() ([]byte, []int) {
-	return file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP(), []int{5}
+	return file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *RunPolicy) GetWeight() uint32 {
@@ -489,7 +599,7 @@ type RunQueueOverride struct {
 
 func (x *RunQueueOverride) Reset() {
 	*x = RunQueueOverride{}
-	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[6]
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -501,7 +611,7 @@ func (x *RunQueueOverride) String() string {
 func (*RunQueueOverride) ProtoMessage() {}
 
 func (x *RunQueueOverride) ProtoReflect() protoreflect.Message {
-	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[6]
+	mi := &file_crawly_frontier_policy_v1_policy_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -514,7 +624,7 @@ func (x *RunQueueOverride) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunQueueOverride.ProtoReflect.Descriptor instead.
 func (*RunQueueOverride) Descriptor() ([]byte, []int) {
-	return file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP(), []int{6}
+	return file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *RunQueueOverride) GetQueueKey() string {
@@ -559,15 +669,25 @@ const file_crawly_frontier_policy_v1_policy_proto_rawDesc = "" +
 	"\x06limits\x18\x06 \x01(\v2&.crawly.frontier.policy.v1.QueueLimitsR\x06limits\x12B\n" +
 	"\tbehaviour\x18\a \x01(\v2$.crawly.frontier.policy.v1.BehaviourR\tbehaviourJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04\"3\n" +
 	"\x0ePolicySelector\x12\x1b\n" +
-	"\tqueue_key\x18\x01 \x01(\tR\bqueueKeyJ\x04\b\x02\x10\x03\"\xf3\x01\n" +
+	"\tqueue_key\x18\x01 \x01(\tR\bqueueKeyJ\x04\b\x02\x10\x03\"\xb4\x02\n" +
 	"\vQueueLimits\x12,\n" +
 	"\x0fmax_concurrency\x18\x01 \x01(\rH\x00R\x0emaxConcurrency\x88\x01\x01\x12+\n" +
 	"\x0frate_per_second\x18\x02 \x01(\x01H\x01R\rratePerSecond\x88\x01\x01\x12\x19\n" +
 	"\x05burst\x18\x03 \x01(\rH\x02R\x05burst\x88\x01\x01\x126\n" +
-	"\tmin_delay\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\bminDelayB\x12\n" +
+	"\tmin_delay\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\bminDelay\x12E\n" +
+	"\badaptive\x18\x05 \x01(\v2).crawly.frontier.policy.v1.AdaptiveLimitsR\badaptiveB\x12\n" +
 	"\x10_max_concurrencyB\x12\n" +
 	"\x10_rate_per_secondB\b\n" +
-	"\x06_burstJ\x04\b\x05\x10\x06\"\xcc\x03\n" +
+	"\x06_burst\"\xf7\x01\n" +
+	"\x0eAdaptiveLimits\x12\x1d\n" +
+	"\aenabled\x18\x01 \x01(\bH\x00R\aenabled\x88\x01\x01\x12<\n" +
+	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\x12,\n" +
+	"\x0fdecrease_factor\x18\x03 \x01(\x01H\x01R\x0edecreaseFactor\x88\x01\x01\x12(\n" +
+	"\rrecovery_step\x18\x04 \x01(\x01H\x02R\frecoveryStep\x88\x01\x01B\n" +
+	"\n" +
+	"\b_enabledB\x12\n" +
+	"\x10_decrease_factorB\x10\n" +
+	"\x0e_recovery_step\"\x99\x04\n" +
 	"\tBehaviour\x12&\n" +
 	"\fmax_attempts\x18\x01 \x01(\rH\x00R\vmaxAttempts\x88\x01\x01\x12<\n" +
 	"\abackoff\x18\x02 \x01(\v2\".crawly.frontier.policy.v1.BackoffR\abackoff\x12>\n" +
@@ -575,8 +695,10 @@ const file_crawly_frontier_policy_v1_policy_proto_rawDesc = "" +
 	"\x0elease_duration\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\rleaseDuration\x12G\n" +
 	"\x12max_lease_duration\x18\x06 \x01(\v2\x19.google.protobuf.DurationR\x10maxLeaseDuration\x124\n" +
 	"\btask_ttl\x18\a \x01(\v2\x19.google.protobuf.DurationR\ataskTtl\x12A\n" +
-	"\x0fmax_queue_block\x18\b \x01(\v2\x19.google.protobuf.DurationR\rmaxQueueBlockB\x0f\n" +
-	"\r_max_attemptsJ\x04\b\x03\x10\x04\"\xc7\x01\n" +
+	"\x0fmax_queue_block\x18\b \x01(\v2\x19.google.protobuf.DurationR\rmaxQueueBlock\x123\n" +
+	"\x13max_strain_attempts\x18\t \x01(\rH\x01R\x11maxStrainAttempts\x88\x01\x01B\x0f\n" +
+	"\r_max_attemptsB\x16\n" +
+	"\x14_max_strain_attemptsJ\x04\b\x03\x10\x04\"\xc7\x01\n" +
 	"\aBackoff\x123\n" +
 	"\ainitial\x18\x01 \x01(\v2\x19.google.protobuf.DurationR\ainitial\x12#\n" +
 	"\n" +
@@ -611,40 +733,43 @@ func file_crawly_frontier_policy_v1_policy_proto_rawDescGZIP() []byte {
 	return file_crawly_frontier_policy_v1_policy_proto_rawDescData
 }
 
-var file_crawly_frontier_policy_v1_policy_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_crawly_frontier_policy_v1_policy_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_crawly_frontier_policy_v1_policy_proto_goTypes = []any{
 	(*Policy)(nil),              // 0: crawly.frontier.policy.v1.Policy
 	(*PolicySelector)(nil),      // 1: crawly.frontier.policy.v1.PolicySelector
 	(*QueueLimits)(nil),         // 2: crawly.frontier.policy.v1.QueueLimits
-	(*Behaviour)(nil),           // 3: crawly.frontier.policy.v1.Behaviour
-	(*Backoff)(nil),             // 4: crawly.frontier.policy.v1.Backoff
-	(*RunPolicy)(nil),           // 5: crawly.frontier.policy.v1.RunPolicy
-	(*RunQueueOverride)(nil),    // 6: crawly.frontier.policy.v1.RunQueueOverride
-	(*durationpb.Duration)(nil), // 7: google.protobuf.Duration
+	(*AdaptiveLimits)(nil),      // 3: crawly.frontier.policy.v1.AdaptiveLimits
+	(*Behaviour)(nil),           // 4: crawly.frontier.policy.v1.Behaviour
+	(*Backoff)(nil),             // 5: crawly.frontier.policy.v1.Backoff
+	(*RunPolicy)(nil),           // 6: crawly.frontier.policy.v1.RunPolicy
+	(*RunQueueOverride)(nil),    // 7: crawly.frontier.policy.v1.RunQueueOverride
+	(*durationpb.Duration)(nil), // 8: google.protobuf.Duration
 }
 var file_crawly_frontier_policy_v1_policy_proto_depIdxs = []int32{
 	1,  // 0: crawly.frontier.policy.v1.Policy.match:type_name -> crawly.frontier.policy.v1.PolicySelector
 	2,  // 1: crawly.frontier.policy.v1.Policy.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
-	3,  // 2: crawly.frontier.policy.v1.Policy.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
-	7,  // 3: crawly.frontier.policy.v1.QueueLimits.min_delay:type_name -> google.protobuf.Duration
-	4,  // 4: crawly.frontier.policy.v1.Behaviour.backoff:type_name -> crawly.frontier.policy.v1.Backoff
-	7,  // 5: crawly.frontier.policy.v1.Behaviour.fetch_timeout:type_name -> google.protobuf.Duration
-	7,  // 6: crawly.frontier.policy.v1.Behaviour.lease_duration:type_name -> google.protobuf.Duration
-	7,  // 7: crawly.frontier.policy.v1.Behaviour.max_lease_duration:type_name -> google.protobuf.Duration
-	7,  // 8: crawly.frontier.policy.v1.Behaviour.task_ttl:type_name -> google.protobuf.Duration
-	7,  // 9: crawly.frontier.policy.v1.Behaviour.max_queue_block:type_name -> google.protobuf.Duration
-	7,  // 10: crawly.frontier.policy.v1.Backoff.initial:type_name -> google.protobuf.Duration
-	7,  // 11: crawly.frontier.policy.v1.Backoff.max:type_name -> google.protobuf.Duration
-	2,  // 12: crawly.frontier.policy.v1.RunPolicy.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
-	3,  // 13: crawly.frontier.policy.v1.RunPolicy.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
-	6,  // 14: crawly.frontier.policy.v1.RunPolicy.overrides:type_name -> crawly.frontier.policy.v1.RunQueueOverride
-	2,  // 15: crawly.frontier.policy.v1.RunQueueOverride.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
-	3,  // 16: crawly.frontier.policy.v1.RunQueueOverride.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
-	17, // [17:17] is the sub-list for method output_type
-	17, // [17:17] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	4,  // 2: crawly.frontier.policy.v1.Policy.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
+	8,  // 3: crawly.frontier.policy.v1.QueueLimits.min_delay:type_name -> google.protobuf.Duration
+	3,  // 4: crawly.frontier.policy.v1.QueueLimits.adaptive:type_name -> crawly.frontier.policy.v1.AdaptiveLimits
+	8,  // 5: crawly.frontier.policy.v1.AdaptiveLimits.max_interval:type_name -> google.protobuf.Duration
+	5,  // 6: crawly.frontier.policy.v1.Behaviour.backoff:type_name -> crawly.frontier.policy.v1.Backoff
+	8,  // 7: crawly.frontier.policy.v1.Behaviour.fetch_timeout:type_name -> google.protobuf.Duration
+	8,  // 8: crawly.frontier.policy.v1.Behaviour.lease_duration:type_name -> google.protobuf.Duration
+	8,  // 9: crawly.frontier.policy.v1.Behaviour.max_lease_duration:type_name -> google.protobuf.Duration
+	8,  // 10: crawly.frontier.policy.v1.Behaviour.task_ttl:type_name -> google.protobuf.Duration
+	8,  // 11: crawly.frontier.policy.v1.Behaviour.max_queue_block:type_name -> google.protobuf.Duration
+	8,  // 12: crawly.frontier.policy.v1.Backoff.initial:type_name -> google.protobuf.Duration
+	8,  // 13: crawly.frontier.policy.v1.Backoff.max:type_name -> google.protobuf.Duration
+	2,  // 14: crawly.frontier.policy.v1.RunPolicy.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
+	4,  // 15: crawly.frontier.policy.v1.RunPolicy.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
+	7,  // 16: crawly.frontier.policy.v1.RunPolicy.overrides:type_name -> crawly.frontier.policy.v1.RunQueueOverride
+	2,  // 17: crawly.frontier.policy.v1.RunQueueOverride.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
+	4,  // 18: crawly.frontier.policy.v1.RunQueueOverride.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
+	19, // [19:19] is the sub-list for method output_type
+	19, // [19:19] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_crawly_frontier_policy_v1_policy_proto_init() }
@@ -657,13 +782,14 @@ func file_crawly_frontier_policy_v1_policy_proto_init() {
 	file_crawly_frontier_policy_v1_policy_proto_msgTypes[4].OneofWrappers = []any{}
 	file_crawly_frontier_policy_v1_policy_proto_msgTypes[5].OneofWrappers = []any{}
 	file_crawly_frontier_policy_v1_policy_proto_msgTypes[6].OneofWrappers = []any{}
+	file_crawly_frontier_policy_v1_policy_proto_msgTypes[7].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_crawly_frontier_policy_v1_policy_proto_rawDesc), len(file_crawly_frontier_policy_v1_policy_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
