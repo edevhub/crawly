@@ -108,7 +108,8 @@ func (r runService) AddTasks(stream grpc.BidiStreamingServer[runv1.AddTasksReque
 		if err != nil {
 			return grpcErr(err)
 		}
-		res, err := r.s.store.AddTasks(ctx, store.AddRequest{Run: spec.ID, Tasks: r.s.newTasks(spec, req.GetTasks())})
+		res, err := r.s.store.AddTasks(ctx, store.AddRequest{Run: spec.ID, Tasks: r.s.newTasks(spec, req.GetTasks(), ""),
+			MaxLabels: r.s.cfg.MaxLabelsPerRun})
 		if err != nil {
 			return grpcErr(err)
 		}
@@ -251,7 +252,7 @@ func (r runService) WatchRuns(req *runv1.WatchRunsRequest, stream grpc.ServerStr
 }
 
 func (r runService) ListTasks(ctx context.Context, req *runv1.ListTasksRequest) (*runv1.ListTasksResponse, error) {
-	f := store.TaskFilter{Run: store.RunID(req.GetRunId()), Queue: store.QueueKey(req.GetQueueKey()), Code: req.GetCode()}
+	f := store.TaskFilter{Run: store.RunID(req.GetRunId()), Queue: store.QueueKey(req.GetQueueKey()), Code: req.GetCode(), Label: req.GetLabel()}
 	for _, st := range req.GetStates() {
 		f.States = append(f.States, store.TaskState(st))
 	}
@@ -421,10 +422,22 @@ func runProto(r store.Run) *runv1.Run {
 		Stats: &runv1.RunStats{Pending: st.Pending, Delayed: st.Delayed, InFlight: st.InFlight, Succeeded: st.Succeeded,
 			Failed: st.Failed, Expired: st.Expired, Cancelled: st.Cancelled, Attempts: st.Attempts, QueueBlocks: st.QueueBlocks,
 			Discovered: st.Discovered, Duplicates: st.Duplicates, OverBudget: st.OverBudget, ByCode: st.ByCode,
-			BlockedQueues: blockedQueuesProto(st.BlockedQueues)},
+			BlockedQueues: blockedQueuesProto(st.BlockedQueues), ByLabel: labelStatsProto(st.ByLabel), Invalid: st.Invalid},
 		CreateTime: ts(r.CreatedAt), SealTime: ts(r.SealedAt), FinishTime: ts(r.FinishedAt),
 		AbortReason: abortProto(r.Abort),
 	}
+}
+
+func labelStatsProto(m map[string]store.LabelStats) map[string]*runv1.LabelStats {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]*runv1.LabelStats, len(m))
+	for k, l := range m {
+		out[k] = &runv1.LabelStats{Succeeded: l.Succeeded, Failed: l.Failed, Expired: l.Expired, Cancelled: l.Cancelled,
+			FailedByCode: l.FailedByCode}
+	}
+	return out
 }
 
 func blockedQueuesProto(bq []store.BlockedQueue) []*runv1.BlockedQueue {
@@ -480,7 +493,9 @@ func taskFromSpec(id store.TaskID, run store.RunID, fp store.Fingerprint, depth 
 func taskStatusProto(t store.TaskStatus) *runv1.TaskStatus {
 	spec := &taskv1.TaskSpec{}
 	_ = proto.Unmarshal(t.Spec, spec)
-	out := &runv1.TaskStatus{Task: taskFromSpec(t.ID, t.Run, t.Fingerprint, t.Depth, t.Parent, spec),
+	task := taskFromSpec(t.ID, t.Run, t.Fingerprint, t.Depth, t.Parent, spec)
+	task.Label = t.Label // the stored column, which is what the statistics count
+	out := &runv1.TaskStatus{Task: task,
 		State: runv1.TaskStatus_State(safeconv.Int32(int(t.State))), NextEligibleTime: ts(t.NextEligibleAt)}
 	for i := range t.Attempts {
 		a := &t.Attempts[i]

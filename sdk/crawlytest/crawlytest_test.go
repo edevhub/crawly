@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -245,3 +247,74 @@ func TestCrawlAborted(t *testing.T) {
 		t.Fatalf("%d calls", calls.Load())
 	}
 }
+
+// TestLabels: a label follows the subtree of the task that has it, unless a task sets
+// another or clears it, and the run's statistics are kept per label.
+func TestLabels(t *testing.T) {
+	var logs strings.Builder
+	var logMu sync.Mutex
+	f := crawlytest.Start(t, local.WithLogger(slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return logs.Write(p)
+	}), &slog.HandlerOptions{Level: slog.LevelWarn}))))
+	w, err := f.Worker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const base = "https://a.example"
+	var seen sync.Map // URL -> label the handler saw
+	err = w.Register("node", worker.HandlerFunc(func(_ context.Context, tk *worker.Task) (*worker.Result, error) {
+		seen.Store(tk.URL, tk.Label)
+		switch tk.URL {
+		case base + "/n":
+			return &worker.Result{Tasks: []worker.NewTask{
+				{URL: base + "/n/1"},                   // inherits
+				{URL: base + "/n/2", NoLabel: true},    // cleared
+				{URL: base + "/n/3", Label: "shop"},    // replaced
+				{URL: base + "/n/4", Label: "no good"}, // invalid: not an allowed label
+			}}, nil
+		case base + "/n/1":
+			return &worker.Result{Tasks: []worker.NewTask{{URL: base + "/n/1/a"}}}, nil
+		case base + "/n/1/a":
+			return nil, worker.Fail("boom", errors.New("the page is broken"))
+		default:
+			return nil, nil
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	news := "news"
+	final, err := f.Crawl(t.Context(), w, []*task.Spec{{Request: &task.Request{Url: base + "/n"}, Handler: "node", Label: &news}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{base + "/n": "news", base + "/n/1": "news", base + "/n/1/a": "news", base + "/n/2": "", base + "/n/3": "shop"}
+	for url, label := range want {
+		if got, ok := seen.Load(url); !ok || got != label {
+			t.Errorf("%s: the handler saw label %v (%v), want %q", url, got, ok, label)
+		}
+	}
+	if _, ok := seen.Load(base + "/n/4"); ok {
+		t.Error("a task with an invalid label ran")
+	}
+	by := final.GetStats().GetByLabel()
+	if len(by) != 2 || by["news"].GetSucceeded() != 2 || by["news"].GetFailed() != 1 || by["news"].GetFailedByCode()["boom"] != 1 ||
+		by["shop"].GetSucceeded() != 1 || by["shop"].GetFailed() != 0 {
+		t.Fatalf("by label: %v", by)
+	}
+	if st := final.GetStats(); st.GetSucceeded() != 4 || st.GetFailed() != 1 || st.GetInvalid() != 1 {
+		t.Fatalf("stats: %v", st)
+	}
+	// The rejected task is not silent: the worker says which one and why.
+	logMu.Lock()
+	defer logMu.Unlock()
+	if out := logs.String(); !strings.Contains(out, "rejected as invalid") || !strings.Contains(out, `first_label="no good"`) {
+		t.Errorf("the worker did not report the rejected task: %q", out)
+	}
+}
+
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

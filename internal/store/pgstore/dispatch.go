@@ -138,7 +138,7 @@ const claimSQL = `WITH picked AS MATERIALIZED (
 	UPDATE tasks t SET state = 'in_flight', attempt = t.attempt + 1, lease_nonce = $6,
 		worker_id = $7, worker_version = $8, dispatched_at = $5, lease_expires_at = $9, lease_deadline = $10
 	FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id
-	RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.fingerprint, t.priority, t.spec, t.strain_attempts`
+	RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.fingerprint, t.priority, t.spec, t.strain_attempts, t.label`
 
 // candidates are the queues the session may dispatch from, the one with the earliest
 // ready lane first. Each handler is probed in the readiness index on its own, so a
@@ -476,8 +476,9 @@ func (s *Store) claim(ctx context.Context, tx pgx.Tx, now time.Time, key store.Q
 			parentBucket *int16
 			fp           []byte
 			strained     int32
+			label        string
 		)
-		if err := row.Scan(&c.id, &attempt, &depth, &parent, &parentBucket, &fp, &c.priority, &c.a.Spec, &strained); err != nil {
+		if err := row.Scan(&c.id, &attempt, &depth, &parent, &parentBucket, &fp, &c.priority, &c.a.Spec, &strained, &label); err != nil {
 			return c, err
 		}
 		task := taskKey{bucket: bucket, day: b.meta.day, id: c.id}
@@ -485,7 +486,7 @@ func (s *Store) claim(ctx context.Context, tx pgx.Tx, now time.Time, key store.Q
 		c.a.Lease = store.Lease{Ref: ref, ExpiresAt: expires, Duration: lease.Duration}
 		c.a.Info = store.LeaseInfo{Ref: ref, Task: task.ID(), Run: b.meta.spec.ID, RunPolicy: b.meta.spec.Policy,
 			Queue: key, Pool: poolName, Fingerprint: store.Fingerprint(fp), Depth: uint32(depth), //nolint:gosec // G115: depths are not negative
-			Parent: parentID(parent, parentBucket, b.meta.day), StrainAttempts: uint32(max(strained, 0))}
+			Parent: parentID(parent, parentBucket, b.meta.day), StrainAttempts: uint32(max(strained, 0)), Label: label}
 		return c, nil
 	})
 	if err != nil {

@@ -935,13 +935,15 @@ func (x *WatchRunsResponse) GetEvent() *RunEvent {
 }
 
 type ListTasksRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	QueueKey      string                 `protobuf:"bytes,2,opt,name=queue_key,json=queueKey,proto3" json:"queue_key,omitempty"`
-	States        []TaskStatus_State     `protobuf:"varint,3,rep,packed,name=states,proto3,enum=crawly.frontier.run.v1.TaskStatus_State" json:"states,omitempty"`
-	Code          string                 `protobuf:"bytes,4,opt,name=code,proto3" json:"code,omitempty"`
-	PageSize      int32                  `protobuf:"varint,5,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
-	PageToken     string                 `protobuf:"bytes,6,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	RunId     string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	QueueKey  string                 `protobuf:"bytes,2,opt,name=queue_key,json=queueKey,proto3" json:"queue_key,omitempty"`
+	States    []TaskStatus_State     `protobuf:"varint,3,rep,packed,name=states,proto3,enum=crawly.frontier.run.v1.TaskStatus_State" json:"states,omitempty"`
+	Code      string                 `protobuf:"bytes,4,opt,name=code,proto3" json:"code,omitempty"`
+	PageSize  int32                  `protobuf:"varint,5,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	PageToken string                 `protobuf:"bytes,6,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
+	// Only tasks with this label. Empty: all.
+	Label         string `protobuf:"bytes,7,opt,name=label,proto3" json:"label,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1014,6 +1016,13 @@ func (x *ListTasksRequest) GetPageSize() int32 {
 func (x *ListTasksRequest) GetPageToken() string {
 	if x != nil {
 		return x.PageToken
+	}
+	return ""
+}
+
+func (x *ListTasksRequest) GetLabel() string {
+	if x != nil {
+		return x.Label
 	}
 	return ""
 }
@@ -1239,7 +1248,7 @@ const file_crawly_frontier_run_v1_run_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"K\n" +
 	"\x11WatchRunsResponse\x126\n" +
-	"\x05event\x18\x01 \x01(\v2 .crawly.frontier.run.v1.RunEventR\x05event\"\xd8\x01\n" +
+	"\x05event\x18\x01 \x01(\v2 .crawly.frontier.run.v1.RunEventR\x05event\"\xee\x01\n" +
 	"\x10ListTasksRequest\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x1b\n" +
 	"\tqueue_key\x18\x02 \x01(\tR\bqueueKey\x12@\n" +
@@ -1247,7 +1256,8 @@ const file_crawly_frontier_run_v1_run_service_proto_rawDesc = "" +
 	"\x04code\x18\x04 \x01(\tR\x04code\x12\x1b\n" +
 	"\tpage_size\x18\x05 \x01(\x05R\bpageSize\x12\x1d\n" +
 	"\n" +
-	"page_token\x18\x06 \x01(\tR\tpageToken\"u\n" +
+	"page_token\x18\x06 \x01(\tR\tpageToken\x12\x14\n" +
+	"\x05label\x18\a \x01(\tR\x05label\"u\n" +
 	"\x11ListTasksResponse\x128\n" +
 	"\x05tasks\x18\x01 \x03(\v2\".crawly.frontier.run.v1.TaskStatusR\x05tasks\x12&\n" +
 	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"R\n" +

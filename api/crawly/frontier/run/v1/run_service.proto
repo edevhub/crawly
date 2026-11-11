@@ -134,6 +134,8 @@ message ListTasksRequest {
   string code = 4;
   int32 page_size = 5;
   string page_token = 6;
+  // Only tasks with this label. Empty: all.
+  string label = 7;
 }
 
 message ListTasksResponse {

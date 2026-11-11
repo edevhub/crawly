@@ -373,9 +373,9 @@ func (s *Store) drainBacklog(ctx context.Context, tx pgx.Tx, now time.Time, ref 
 	if own == nil || own.meta == nil || (own.state != store.RunCancelled && own.state != store.RunExpired && own.state != store.RunAborted) {
 		return nil
 	}
-	final := taskCancelled
+	final, column := taskCancelled, "cancelled"
 	if own.state == store.RunExpired {
-		final = taskExpired
+		final, column = taskExpired, "expired"
 	}
 	// Task rows are skipped when a Finish holds them: it holds the task and waits for
 	// this queue, so waiting for it here would be a deadlock. It ends the task itself.
@@ -383,17 +383,21 @@ func (s *Store) drainBacklog(ctx context.Context, tx pgx.Tx, now time.Time, ref 
 	const pick = `WITH picked AS MATERIALIZED (SELECT task_id FROM tasks
 		WHERE run_created_on = $1 AND run_no = $2 AND queue_key = $3 AND pool_id = $4 AND state = $5::task_state
 		LIMIT $8 FOR UPDATE SKIP LOCKED) `
-	tag, err := tx.Exec(ctx, pick+`UPDATE tasks t SET state = $6::task_state, finished_at = $7
-		FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id`,
+	rows, err := tx.Query(ctx, pick+`UPDATE tasks t SET state = $6::task_state, finished_at = $7
+		FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id RETURNING t.label`,
 		own.meta.createdOn, ref.run, ref.queue, ref.pool, taskPending, final, now, maintainTasks)
 	if err != nil {
 		return err
 	}
-	pending := tag.RowsAffected()
-	rows, err := tx.Query(ctx, pick+`UPDATE tasks t SET state = $6::task_state, finished_at = $7,
+	labels, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	pending := int64(len(labels))
+	rows, err = tx.Query(ctx, pick+`UPDATE tasks t SET state = $6::task_state, finished_at = $7,
 			lease_nonce = NULL, lease_expires_at = NULL, lease_deadline = NULL
 		FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id
-		RETURNING t.task_id, t.attempt, coalesce(t.worker_id, ''), coalesce(t.worker_version, ''), t.dispatched_at`,
+		RETURNING t.task_id, t.attempt, coalesce(t.worker_id, ''), coalesce(t.worker_version, ''), t.dispatched_at, t.label`,
 		own.meta.createdOn, ref.run, ref.queue, ref.pool, taskInFlight, final, now, maintainTasks)
 	if err != nil {
 		return err
@@ -401,18 +405,22 @@ func (s *Store) drainBacklog(ctx context.Context, tx pgx.Tx, now time.Time, ref 
 	revoked, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*leased, error) {
 		t := &leased{run: ref.run}
 		var attempt int32
-		err := row.Scan(&t.key.id, &attempt, &t.worker.ID, &t.worker.Version, &t.dispatched)
+		err := row.Scan(&t.key.id, &attempt, &t.worker.ID, &t.worker.Version, &t.dispatched, &t.label)
 		t.key.day, t.attempt = own.meta.day, uint32(attempt) //nolint:gosec // G115: attempts are positive
 		return t, err
 	})
 	if err != nil {
 		return err
 	}
-	if len(revoked) > 0 {
-		batch := &pgx.Batch{}
-		for _, t := range revoked {
-			recordAttempt(batch, t, now, resultRevoked, store.AttemptRecord{Code: codeRevoked, PolicySet: s.pol.Hash()})
-		}
+	for _, t := range revoked {
+		labels = append(labels, t.label)
+	}
+	batch := &pgx.Batch{}
+	for _, t := range revoked {
+		recordAttempt(batch, t, now, resultRevoked, store.AttemptRecord{Code: codeRevoked, PolicySet: s.pol.Hash()})
+	}
+	countLabels(batch, ref.queue, ref.run, column, tally(labels))
+	if batch.Len() > 0 {
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 			return err
 		}
@@ -475,18 +483,29 @@ func (s *Store) expireBacklog(ctx context.Context, tx pgx.Tx, now time.Time, ref
 	if own == nil || own.meta == nil {
 		return nil
 	}
-	tag, err := tx.Exec(ctx, `WITH picked AS MATERIALIZED (SELECT task_id FROM tasks
+	rows, err := tx.Query(ctx, `WITH picked AS MATERIALIZED (SELECT task_id FROM tasks
 			WHERE run_created_on = $1 AND run_no = $2 AND queue_key = $3 AND pool_id = $4 AND state = 'pending' AND expires_at <= $5
 			LIMIT $6 FOR UPDATE SKIP LOCKED)
 		UPDATE tasks t SET state = 'expired', finished_at = $5
-		FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id`,
+		FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id RETURNING t.label`,
 		own.meta.createdOn, ref.run, ref.queue, ref.pool, now, maintainTasks)
 	if err != nil {
 		return err
 	}
-	n := tag.RowsAffected()
+	labels, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	n := int64(len(labels))
 	if n == 0 {
 		return nil
+	}
+	batch := &pgx.Batch{}
+	countLabels(batch, ref.queue, ref.run, "expired", tally(labels))
+	if batch.Len() > 0 {
+		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+			return err
+		}
 	}
 	own.pending = max(own.pending-n, 0)
 	own.expired += n
@@ -574,6 +593,7 @@ func (s *Store) retain(ctx context.Context, now time.Time) error {
 			ORDER BY run_no LIMIT $2 FOR UPDATE SKIP LOCKED),
 		codes AS (DELETE FROM backlog_codes WHERE run_no IN (SELECT run_no FROM old)),
 		lns AS (DELETE FROM lanes WHERE run_no IN (SELECT run_no FROM old)),
+		label_counts AS (DELETE FROM backlog_labels WHERE run_no IN (SELECT run_no FROM old)),
 		logs AS (DELETE FROM backlogs WHERE run_no IN (SELECT run_no FROM old))
 		DELETE FROM runs WHERE run_no IN (SELECT run_no FROM old) RETURNING run_no`, now.Add(-s.keepRuns), maintainRuns)
 	if err != nil {

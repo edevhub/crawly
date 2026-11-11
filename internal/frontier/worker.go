@@ -384,7 +384,8 @@ func (s *Server) handleDiscover(ctx context.Context, sess *session, m *workerv1.
 	if err != nil {
 		return err
 	}
-	res, err := s.store.AddTasks(ctx, store.AddRequest{Run: info.Run, Parent: &ref, Tasks: s.newTasks(spec, m.GetTasks())})
+	res, err := s.store.AddTasks(ctx, store.AddRequest{Run: info.Run, Parent: &ref, Tasks: s.newTasks(spec, m.GetTasks(), info.Label),
+		MaxLabels: s.cfg.MaxLabelsPerRun})
 	switch {
 	case errors.Is(err, store.ErrLeaseStale):
 		return reply(workerv1.DiscoverAck_STATUS_STALE)
@@ -525,6 +526,7 @@ func (s *Server) assignment(a store.Assignment) *workerv1.Assignment {
 	beh := s.pol.Resolve(a.Info.RunPolicy, string(a.Info.Queue)).Behaviour
 	t := taskFromSpec(a.Info.Task, a.Info.Run, a.Info.Fingerprint, a.Info.Depth, a.Info.Parent, ts)
 	t.FetchTimeout = beh.GetFetchTimeout()
+	t.Label = a.Info.Label // the stored column, which is what the statistics count
 	return &workerv1.Assignment{
 		Lease: &workerv1.Lease{LeaseId: string(a.Lease.Ref.ID), Attempt: a.Lease.Ref.Attempt,
 			ExpireTime: timestamppb.New(a.Lease.ExpiresAt), Duration: durationpb.New(a.Lease.Duration)},

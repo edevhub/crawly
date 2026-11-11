@@ -93,6 +93,15 @@ message RunStats {
   // shows. Empty for a run that has ended. Best effort: when it cannot be read the run
   // is returned without it. Lifecycle events (not STATS events) do not carry it.
   repeated BlockedQueue blocked_queues = 14;
+  // Final task counts per task label (TaskSpec.label). Every label the run has accepted
+  // has an entry, with zero counts until a task ends; tasks without a label are not
+  // listed. Counts agree with the task states: a task is counted once, when it ends.
+  map<string, LabelStats> by_label = 15;
+  // Tasks that were submitted and rejected as INVALID (a bad pool, queue key, URL or label,
+  // a task that is too large, or a new label beyond the run's limit). Seeds learn this from
+  // the result of AddTasks; a task that a handler discovers is otherwise lost without a trace.
+  // Tasks of a batch that is refused because the run is closed are not counted.
+  uint64 invalid = 16;
 }
 
 // A blocked queue a run waits on.
@@ -103,6 +112,17 @@ message BlockedQueue {
   string reason = 3;
   // Pending and delayed tasks of this run on the queue.
   uint64 waiting = 4;
+}
+
+// Tasks of one label that have ended, by how they ended. The sum of all labels is at
+// most the run's own counters.
+message LabelStats {
+  uint64 succeeded = 1;
+  uint64 failed = 2;
+  uint64 expired = 3;    // dropped by TTL or run deadline
+  uint64 cancelled = 4;  // dropped because the run was cancelled
+  // The outcome codes of the tasks that failed, one per task: the code of its last attempt.
+  map<string, uint64> failed_by_code = 5;
 }
 
 // Safety net against crawler traps and runaway discovery. Link-following rules stay in the spider.

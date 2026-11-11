@@ -379,8 +379,9 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta, withBlocked boo
 	var sealed, finished pgtype.Timestamptz
 	var abortRule *int16
 	var abortCode, abortTask *string
-	err = q.QueryRow(ctx, `SELECT state::text, paused, sealed_at, finished_at, abort_rule, abort_code, abort_task
-		FROM runs WHERE run_no = $1`, m.no).Scan(&name, &r.Paused, &sealed, &finished, &abortRule, &abortCode, &abortTask)
+	var invalid int64
+	err = q.QueryRow(ctx, `SELECT state::text, paused, sealed_at, finished_at, abort_rule, abort_code, abort_task, invalid
+		FROM runs WHERE run_no = $1`, m.no).Scan(&name, &r.Paused, &sealed, &finished, &abortRule, &abortCode, &abortTask, &invalid)
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.forget(m)
 		return store.Run{}, store.ErrNotFound
@@ -389,6 +390,7 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta, withBlocked boo
 		return store.Run{}, wrap(err)
 	}
 	r.State, r.SealedAt, r.FinishedAt = s.parseRunState(name), timeOf(sealed), timeOf(finished)
+	r.Stats.Invalid = uint64(invalid) //nolint:gosec // G115: a count
 	if r.State == store.RunAborted && abortRule != nil {
 		r.Abort = &store.AbortReason{Rule: store.AbortRule(*abortRule)}
 		if abortCode != nil {
@@ -399,7 +401,15 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta, withBlocked boo
 		}
 	}
 
+	// The label counters are read before the run's counters. Both only grow, and a task is
+	// counted in both in one transaction, so what is read first is never ahead of what is
+	// read later, and no label total exceeds the run's own without a snapshot.
+	byLabel, err := labelStats(ctx, q, m.no)
+	if err != nil {
+		return store.Run{}, wrap(err)
+	}
 	st := &r.Stats
+	st.ByLabel = byLabel
 	var pending, delayed int64
 	err = q.QueryRow(ctx, `SELECT coalesce(sum(pending), 0)::bigint, coalesce(sum(in_flight), 0)::bigint, coalesce(sum(succeeded), 0)::bigint,
 			coalesce(sum(failed), 0)::bigint, coalesce(sum(expired), 0)::bigint, coalesce(sum(cancelled), 0)::bigint, coalesce(sum(attempts), 0)::bigint,
