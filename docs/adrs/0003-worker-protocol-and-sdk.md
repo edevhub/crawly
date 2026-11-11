@@ -110,7 +110,7 @@ Both are the spider's side of the contract; the Frontier cannot see either.
   `redirect`. Redirects on the same host are followed. A spider can override the default.
 - **Dedup keys.** The Frontier's default dedup key is a simple normalisation of the URL
   (ADR 0001, Dedup). A spider sets `TaskSpec.dedup_key` whenever its site needs special
-  rules: case-sensitive paths, tracking or session parameters, requests told apart by
+  rules: case-insensitive paths, tracking or session parameters, requests told apart by
   method or body.
 
 ### Spider strategies and registration

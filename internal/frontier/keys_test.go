@@ -8,15 +8,22 @@ import (
 
 func TestDedupKey(t *testing.T) {
 	for in, want := range map[string]string{
-		"HTTP://Example.COM/Path?b=2&a=1#frag": "http://example.com/path?a=1&b=2",
-		"https://example.com:443/":             "https://example.com/",
-		"https://example.com:8443/x?z=1&Z=0":   "https://example.com:8443/x?z=0&z=1",
-		"http://example.com":                   "http://example.com",
+		// Scheme and host are case-insensitive; path and query are not.
+		"HTTP://Example.COM/Path?b=2&a=1#frag":    "http://example.com/Path?a=1&b=2",
+		"https://example.com/watch?v=dQw4w9WgXcQ": "https://example.com/watch?v=dQw4w9WgXcQ",
+		"https://example.com:443/":                "https://example.com/",
+		"https://example.com:8443/x?z=1&Z=0":      "https://example.com:8443/x?Z=0&z=1",
+		"http://example.com":                      "http://example.com/",
 	} {
 		got, err := DedupKey(in)
 		if err != nil || got != want {
 			t.Errorf("DedupKey(%q) = %q, %v; want %q", in, got, err, want)
 		}
+	}
+	a, _ := DedupKey("https://example.com/p/aB3x")
+	b, _ := DedupKey("https://example.com/p/Ab3X")
+	if a == b {
+		t.Error("paths that differ in case must not be one task")
 	}
 	if _, err := DedupKey("/relative"); err == nil {
 		t.Error("a relative URL must be rejected")
