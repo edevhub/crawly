@@ -3,6 +3,7 @@ package frontier
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"slices"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -39,9 +40,32 @@ func (ss sessionService) ListSessions(_ context.Context, req *sessionv1.ListSess
 		}
 		p.mu.Unlock()
 	}
-	slices.SortFunc(out.Sessions, func(a, b *sessionv1.Session) int {
-		return cmp.Or(cmp.Compare(a.GetPool(), b.GetPool()), a.GetConnectedTime().AsTime().Compare(b.GetConnectedTime().AsTime()),
-			cmp.Compare(a.GetSessionId(), b.GetSessionId()))
-	})
+	slices.SortFunc(out.Sessions, func(a, b *sessionv1.Session) int { return cmp.Compare(sortKey(a), sortKey(b)) })
+	// The token is the sort key of the last session of the previous page.
+	if after := req.GetPageToken(); after != "" {
+		i, _ := slices.BinarySearchFunc(out.Sessions, after, func(s *sessionv1.Session, key string) int {
+			if k := sortKey(s); k <= key {
+				return -1
+			}
+			return 1
+		})
+		out.Sessions = out.Sessions[i:]
+	}
+	size := int(req.GetPageSize())
+	if size <= 0 || size > maxSessionsPage {
+		size = maxSessionsPage
+	}
+	if len(out.Sessions) > size {
+		out.NextPageToken = sortKey(out.Sessions[size-1])
+		out.Sessions = out.Sessions[:size]
+	}
 	return out, nil
+}
+
+// maxSessionsPage is the most sessions one ListSessions call returns.
+const maxSessionsPage = 1000
+
+// sortKey orders sessions by pool, then connection time, then id.
+func sortKey(s *sessionv1.Session) string {
+	return fmt.Sprintf("%s\x00%020d\x00%s", s.GetPool(), s.GetConnectedTime().AsTime().UnixNano(), s.GetSessionId())
 }

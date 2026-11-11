@@ -13,6 +13,7 @@ import (
 // recorder is a worker.Metrics that keeps what it is told.
 type recorder struct {
 	mu      sync.Mutex
+	pools   []string
 	opened  int
 	closed  int
 	started []string
@@ -20,6 +21,11 @@ type recorder struct {
 	lost    []string
 }
 
+func (r *recorder) PoolStarted(pool string) {
+	r.mu.Lock()
+	r.pools = append(r.pools, pool)
+	r.mu.Unlock()
+}
 func (r *recorder) SessionOpened(string) { r.mu.Lock(); r.opened++; r.mu.Unlock() }
 func (r *recorder) SessionClosed(string) { r.mu.Lock(); r.closed++; r.mu.Unlock() }
 func (r *recorder) TaskStarted(pool, handler string) {
@@ -77,6 +83,9 @@ func TestMetricsHooks(t *testing.T) {
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
+	if len(rec.pools) != 1 || rec.pools[0] != "default" {
+		t.Errorf("pools started: %v", rec.pools)
+	}
 	if rec.opened != 1 || rec.closed != 1 {
 		t.Errorf("sessions opened %d, closed %d", rec.opened, rec.closed)
 	}

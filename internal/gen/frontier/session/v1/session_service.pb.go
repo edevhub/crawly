@@ -27,7 +27,10 @@ const (
 type ListSessionsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Only the sessions of this pool; empty: all.
-	Pool          string `protobuf:"bytes,1,opt,name=pool,proto3" json:"pool,omitempty"`
+	Pool string `protobuf:"bytes,1,opt,name=pool,proto3" json:"pool,omitempty"`
+	// At most this many sessions; 0 or more than 1000: 1000.
+	PageSize      int32  `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	PageToken     string `protobuf:"bytes,3,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -69,12 +72,29 @@ func (x *ListSessionsRequest) GetPool() string {
 	return ""
 }
 
+func (x *ListSessionsRequest) GetPageSize() int32 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+func (x *ListSessionsRequest) GetPageToken() string {
+	if x != nil {
+		return x.PageToken
+	}
+	return ""
+}
+
 type ListSessionsResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Sorted by pool, then connection time.
 	Sessions []*Session `protobuf:"bytes,1,rep,name=sessions,proto3" json:"sessions,omitempty"`
 	// The replica that answered.
-	ReplicaId     string `protobuf:"bytes,2,opt,name=replica_id,json=replicaId,proto3" json:"replica_id,omitempty"`
+	ReplicaId string `protobuf:"bytes,2,opt,name=replica_id,json=replicaId,proto3" json:"replica_id,omitempty"`
+	// Empty on the last page. A page is read from the live sessions: one that opens or
+	// closes between two calls may be missed or listed once.
+	NextPageToken string `protobuf:"bytes,3,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -123,17 +143,28 @@ func (x *ListSessionsResponse) GetReplicaId() string {
 	return ""
 }
 
+func (x *ListSessionsResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
+}
+
 var File_crawly_frontier_session_v1_session_service_proto protoreflect.FileDescriptor
 
 const file_crawly_frontier_session_v1_session_service_proto_rawDesc = "" +
 	"\n" +
-	"0crawly/frontier/session/v1/session_service.proto\x12\x1acrawly.frontier.session.v1\x1a(crawly/frontier/session/v1/session.proto\")\n" +
+	"0crawly/frontier/session/v1/session_service.proto\x12\x1acrawly.frontier.session.v1\x1a(crawly/frontier/session/v1/session.proto\"e\n" +
 	"\x13ListSessionsRequest\x12\x12\n" +
-	"\x04pool\x18\x01 \x01(\tR\x04pool\"v\n" +
+	"\x04pool\x18\x01 \x01(\tR\x04pool\x12\x1b\n" +
+	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x03 \x01(\tR\tpageToken\"\x9e\x01\n" +
 	"\x14ListSessionsResponse\x12?\n" +
 	"\bsessions\x18\x01 \x03(\v2#.crawly.frontier.session.v1.SessionR\bsessions\x12\x1d\n" +
 	"\n" +
-	"replica_id\x18\x02 \x01(\tR\treplicaId2\x83\x01\n" +
+	"replica_id\x18\x02 \x01(\tR\treplicaId\x12&\n" +
+	"\x0fnext_page_token\x18\x03 \x01(\tR\rnextPageToken2\x83\x01\n" +
 	"\x0eSessionService\x12q\n" +
 	"\fListSessions\x12/.crawly.frontier.session.v1.ListSessionsRequest\x1a0.crawly.frontier.session.v1.ListSessionsResponseBFZDgithub.com/edevhub/crawly/internal/gen/frontier/session/v1;sessionv1b\x06proto3"
 

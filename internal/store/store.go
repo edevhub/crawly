@@ -105,9 +105,11 @@ type Inspect interface {
 	ListQueues(ctx context.Context, f QueueFilter, page Page) ([]Queue, string, error)
 	// BlockQueue sets (or with a zero time, clears) an operator block for all runs.
 	BlockQueue(ctx context.Context, key QueueKey, until time.Time, reason string) (Queue, error)
-	// PoolStats sums the work of every pool across all runs, for monitoring. It reads
-	// the readiness index and the backlogs that have work, never the tasks, so it is
-	// cheap enough to call on every scrape. At most dueLimit queues are listed per pool.
+	// PoolStats sums the work of every pool across all runs, for monitoring. A store
+	// that keeps backlogs reads them and the readiness index, not the tasks (pgstore);
+	// one that keeps tasks in memory may walk them (memstore). Its cost grows with the
+	// backlogs that have work, so the caller reads it on an interval, not per request.
+	// At most dueLimit queues are listed per pool.
 	PoolStats(ctx context.Context, dueLimit int) ([]PoolStats, error)
 }
 
@@ -327,7 +329,8 @@ type Assignment struct {
 	Spec  []byte
 	// Waited is how long the task was eligible before this dispatch, by the store
 	// clock: from its creation, its not-before time or its retry time, whichever is
-	// last. It is what politeness, blocks and busy workers cost the task.
+	// last. It is what politeness, blocks and busy workers cost the task. It also
+	// includes the time a run was paused.
 	Waited time.Duration
 }
 

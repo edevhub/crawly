@@ -602,8 +602,9 @@ have empty `tasks_leases` indexes, so the scan touches only active partitions.
 
 ### Pool statistics
 
-`PoolStats` serves the metrics and runs on every scrape, so it reads backlogs and never
-tasks. The totals per pool are one grouped read over the backlogs that have work
+`PoolStats` serves the metrics and is read by each replica on an interval, so it reads
+backlogs and never tasks. Its cost grows with the backlogs that have work, times the
+number of replicas, and it runs under a timeout. The totals per pool are one grouped read over the backlogs that have work
 (`backlogs_active`), joined to their runs, because the readiness of a backlog of a paused
 or ended run is only lowered by the next dispatch round and must not count. The queues
 whose work is ready come from the readiness index, one bounded read per pool:

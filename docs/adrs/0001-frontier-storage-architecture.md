@@ -615,14 +615,18 @@ part of scheduling.
   them: a metric is per replica, and a total is the sum over replicas. What a replica holds
   in memory (sessions, credits, unfinished assignments) is per replica as well. What the
   store holds (tasks per pool and state, the age of the longest ready work) is global: every
-  replica reads it through `PoolStats` at scrape time and reports the same figure. A
-  figure that cannot be read is left out, not reported as zero.
+  replica reads it through `PoolStats` in the background, on an interval, and reports the
+  same figure. A scrape never waits for the store. When a read fails the last good figures
+  stay, and the replica exports whether the last read succeeded and when it last did, so
+  that stale figures are visible and an alert on them does not resolve by itself.
 - **Bounded labels.** Queue keys are unbounded, so no metric carries one. A queue is
   labelled by the most specific global policy that matches it, or by `builtin` when none
   does, so the number of values is the number of policies plus one. A queue that needs a
-  series of its own gets a policy of its own. Values that workers choose (pool, worker id,
-  outcome code) are capped per process, and the values past the cap are counted as one
-  `other`. Run, task and URL are never labels.
+  series of its own gets a policy of its own. Values that workers choose (pool, outcome
+  code) are capped per process, and the values past the cap are counted as one `other`;
+  the codes the Frontier itself gives are reserved and never folded. A worker id labels
+  lease expiries only, and only while it is recent: an id not seen for a while is forgotten
+  with its series. Run, task and URL are never labels.
 - **What the store contributes.** A dispatched assignment carries how long its task was
   eligible before the dispatch, by the store clock, and a lease names the worker it was
   dispatched to, so the reaper can say whose lease expired. `PoolStats` reports readiness

@@ -19,6 +19,9 @@ service SessionService {
 message ListSessionsRequest {
   // Only the sessions of this pool; empty: all.
   string pool = 1;
+  // At most this many sessions; 0 or more than 1000: 1000.
+  int32 page_size = 2;
+  string page_token = 3;
 }
 
 message ListSessionsResponse {
@@ -26,4 +29,7 @@ message ListSessionsResponse {
   repeated Session sessions = 1;
   // The replica that answered.
   string replica_id = 2;
+  // Empty on the last page. A page is read from the live sessions: one that opens or
+  // closes between two calls may be missed or listed once.
+  string next_page_token = 3;
 }

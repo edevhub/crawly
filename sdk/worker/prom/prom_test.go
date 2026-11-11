@@ -27,6 +27,25 @@ func TestNewRegistersOnTheGivenRegistryOnly(t *testing.T) {
 	}
 }
 
+func TestPoolStartedShowsZeroSessions(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := prom.New(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.PoolStarted("default")
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == "crawly_worker_sessions" && len(mf.GetMetric()) == 1 && mf.GetMetric()[0].GetGauge().GetValue() == 0 {
+			return
+		}
+	}
+	t.Error("a worker that never connected must report sessions at 0 for its pool")
+}
+
 func TestCodesAreBounded(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m, err := prom.New(reg)

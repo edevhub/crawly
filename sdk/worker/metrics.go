@@ -4,13 +4,17 @@ import "time"
 
 // Metrics receives what a worker observes about itself, for the caller to count. The
 // worker calls it from its own goroutines, so an implementation must be safe for
-// concurrent use and must not block.
+// concurrent use and should return quickly. It is never called while the worker holds
+// a lock of its own, but a slow implementation still delays the goroutine that calls it.
 //
 // The interface keeps the SDK free of any metrics library. The sub-package prom
 // implements it with Prometheus. Pool and Handler values come from the worker's own
 // registrations and are few; Code is whatever the handlers report, so an
 // implementation that stores it as a label should bound its distinct values.
 type Metrics interface {
+	// PoolStarted is called once for each pool the worker serves, when Run starts, before
+	// any session: an implementation can show the pool at zero sessions from then on.
+	PoolStarted(pool string)
 	// SessionOpened and SessionClosed bracket one session with the Frontier, from its
 	// Welcome to the end of the stream. A worker reconnects with a new session.
 	SessionOpened(pool string)
@@ -54,6 +58,7 @@ func WithMetrics(m Metrics) Option {
 
 type noMetrics struct{}
 
+func (noMetrics) PoolStarted(string)      {}
 func (noMetrics) SessionOpened(string)    {}
 func (noMetrics) SessionClosed(string)    {}
 func (noMetrics) TaskStarted(_, _ string) {}

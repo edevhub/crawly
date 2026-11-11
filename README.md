@@ -345,7 +345,7 @@ lists the workers that are connected: for each session its id, worker id, build 
 connection time, unused credits, unfinished assignments and the replica that holds it. A
 session lives in the memory of the replica that serves its stream, so the call answers for
 the replica it reaches, and names it (`replica_id`). With several replicas, ask each one,
-e.g. through a headless service, or read `crawly_frontier_sessions` for the count per pool.
+e.g. through a headless service, or read `crawly_frontier_sessions` for the count per pool. The list is paged (`page_size`, at most 1000 per page).
 
 A run can set limits for itself, for every site or for the sites a glob matches:
 
@@ -462,9 +462,17 @@ Queue keys are hosts, so there is no bound on them, and no metric carries one. I
   them, or into `builtin`. The number of values is the number of policies plus one. To
   watch a site on its own, give it a policy. To find one site that is misbehaving among
   many, use the `ListQueues` call (`only_blocked`).
-- **`pool`, `worker` and `code`** are chosen by workers. Each is capped per process:
-  100 pools, 200 worker ids, 100 codes. A value past the cap is counted as `other`.
-  Worker ids label lease expiries only.
+- **`pool` and `code`** are chosen by workers. Each is capped per process, first come first
+  kept: 100 pools and 100 codes. A value past the cap is counted as `other`. The codes the
+  Frontier itself uses (`no_handler`, `shutdown`, `undelivered`, `lease_expired`,
+  `revoked`) are reserved and never folded, and the `code` of `released_tasks_total` takes
+  only the values `no_handler`, `shutdown` and `undelivered`. The caps are per replica and
+  depend on the order values arrive in, so after a cap is reached two replicas can fold
+  different values into `other`.
+- **`worker`** labels lease expiries only, and only for recent workers: at most 200 ids, and
+  an id with no expiry for an hour is forgotten, with its series, so a fleet that rolls does
+  not use the cap up. Past 200 recent ids, expiries are counted as `other`. The id is also
+  in the `lease expired` log line.
 - Nothing is labelled by run, task or URL.
 
 ### Scope with several replicas
@@ -472,9 +480,15 @@ Queue keys are hosts, so there is no bound on them, and no metric carries one. I
 Counters, histograms, `sessions`, `credits` and `assignments` are **per replica**: it counts
 what it did and holds. Sum them over replicas. The gauges that read the store
 (`pool_tasks`, `oldest_due_task_age_seconds`) are **global**: every replica reports the
-same figure, so use `max`, not `sum`. They are read at scrape time, at most once every five
-seconds, from the readiness index and the backlogs that have work, never from the tasks.
-When the store cannot be read they are left out.
+same figure, so use `max`, not `sum`.
+
+The store's figures are refreshed in the background, every 15 seconds, with a 5 second
+timeout, from the backlogs that have work and the readiness index (PostgreSQL does not read
+tasks). A scrape never waits for the store. Each replica does its own refresh, so the
+load on the store grows with the replicas, not with the scrapers. When a refresh fails the
+last good figures stay, and `pool_stats_up` is 0 and `pool_stats_last_success_timestamp_seconds`
+stops moving: alert on those, not on the absence of the gauges. Before the first successful
+refresh the gauges are absent.
 
 ### Frontier metrics
 
@@ -483,23 +497,64 @@ All names start with `crawly_frontier_`.
 | Name | Type | Labels | Scope | Serves the alert |
 |---|---|---|---|---|
 | `oldest_due_task_age_seconds` | gauge | `pool`, `policy` | global | Due work that nobody works. Age of the longest waiting ready work; absent when none is ready |
-| `sessions` | gauge | `pool` | replica | The same alert: `oldest_due_task_age_seconds > 300 and on(pool) sum(sessions) == 0`. 0 for a pool the replica knows and has no session in |
+| `sessions` | gauge | `pool` | replica | The same alert (see below). 0 for a pool the replica knows and has no session in |
+| `pool_stats_up`, `pool_stats_last_success_timestamp_seconds` | gauge | none | replica | The store's gauges are stale: the last refresh failed, or has not succeeded for a while |
 | `pool_tasks` | gauge | `pool`, `state` (`pending`, `delayed`, `in_flight`) | global | Backlog size. `pending` is ready work, `delayed` waits for a time, a slot or a resume |
 | `credits`, `assignments` | gauge | `pool` | replica | Free slots workers granted; assignments held and not completed |
 | `lease_expiries_total` | counter | `worker`, `pool` | replica | A worker whose lease was reaped |
 | `queue_blocks_total` | counter | `policy` | replica | A site blocked the crawler |
-| `dispatch_wait_seconds` | histogram | `policy` | replica | Time spent keeping the pace: how long a task was eligible before it was dispatched |
+| `dispatch_wait_seconds` | histogram | `policy` | replica | Time spent keeping the pace: how long a task was eligible before it was dispatched. It includes the time its run was paused |
 | `fetch_duration_seconds` | histogram | `policy` | replica | A slow site, from the fetch time workers report |
 | `released_tasks_total` | counter | `pool`, `code` (`no_handler`, `shutdown`, `undelivered`) | replica | Tasks going round between workers |
 | `dispatched_tasks_total` | counter | `pool`, `policy` | replica | Dispatches |
-| `task_outcomes_total` | counter | `pool`, `kind`, `code`, `result` | replica | Outcomes by the kind and code the worker gave, and what the Frontier decided (`succeeded`, `retry`, `failed`, `released`) |
+| `task_outcomes_total` | counter | `kind`, `code`, `result` | replica | Outcomes by the kind and code the worker gave, and what the Frontier decided (`succeeded`, `retry`, `failed`, `released`) |
 | `attempts_total` | counter | `pool` | replica | Attempts that ended; a release is not one |
 | `tasks_added_total` | counter | `source` (`seed`, `discovered`), `status` | replica | Added, `duplicate`, `over_budget`, `run_closed`, `invalid` |
 | `sessions_opened_total` | counter | `pool` | replica | Reconnects: a rate far above the number of workers |
 | `store_call_duration_seconds` | histogram | `method` | replica | A slow store |
-| `store_errors_total` | counter | `method`, `kind` (`unavailable`, `other`) | replica | A failing store. Answers such as not found or a stale lease are not failures |
-| `grpc_handled_total` | counter | `method`, `code` | replica | Calls finished. A `Work` call ends when its session does |
+| `store_errors_total` | counter | `method`, `kind` (`unavailable`, `timeout`, `other`) | replica | A failing store. Answers such as not found or a stale lease are not failures. A `timeout` includes a caller's own deadline |
+| `grpc_server_handled_total` | counter | `grpc_service`, `grpc_method`, `grpc_code` | replica | Calls finished, named as in the usual gRPC dashboards. A `Work` call ends when its session does |
+| `grpc_server_handling_seconds` | histogram | `grpc_service`, `grpc_method` | replica | Latency of unary calls. Streams are not timed |
 | `replica_info` | gauge | `replica`, `policy_set` | replica | Always 1; ties a series to the replica `ListSessions` names |
+
+Counters that can have a zero value start at zero (`store_errors_total`, the release codes
+and `attempts_total` of each pool), so that the first event is a rise. A `lease_expiries_total`
+series starts with the first expiry of a worker.
+
+### Example alerts
+
+Names are as exported. Each expression was written for the metric's real labels.
+
+```promql
+# Due work that nobody works: ready for five minutes, in a pool with no session on any replica.
+max by (pool) (crawly_frontier_oldest_due_task_age_seconds) > 300
+  and on (pool)
+sum by (pool) (crawly_frontier_sessions) == 0
+
+# Ready for five minutes although workers are connected: they are too few or stuck.
+max by (pool, policy) (crawly_frontier_oldest_due_task_age_seconds) > 300
+
+# The figures above are stale: the store could not be read for two minutes.
+time() - max(crawly_frontier_pool_stats_last_success_timestamp_seconds) > 120
+
+# A worker whose leases were reaped.
+sum by (worker) (increase(crawly_frontier_lease_expiries_total[10m])) > 0
+
+# A site, or a group of sites, blocked the crawler.
+sum by (policy) (increase(crawly_frontier_queue_blocks_total[10m])) > 0
+
+# Time spent keeping the pace: the slowest 5% of tasks waited more than a minute, by policy.
+histogram_quantile(0.95, sum by (le, policy) (rate(crawly_frontier_dispatch_wait_seconds_bucket[10m]))) > 60
+
+# A slow site: the median fetch took more than five seconds, by policy.
+histogram_quantile(0.5, sum by (le, policy) (rate(crawly_frontier_fetch_duration_seconds_bucket[10m]))) > 5
+
+# Tasks going round between workers: handed back for a missing handler.
+sum by (pool) (increase(crawly_frontier_released_tasks_total{code="no_handler"}[10m])) > 0
+
+# The store is failing.
+sum by (method, kind) (increase(crawly_frontier_store_errors_total[5m])) > 0
+```
 
 `oldest_due_task_age_seconds` measures how long a queue has been ready: not paused, not
 blocked, not held back by politeness or by its concurrency limit. A queue held back by
@@ -514,7 +569,7 @@ All names start with `crawly_worker_`; the registry of the process says which wo
 
 | Name | Type | Labels | Meaning |
 |---|---|---|---|
-| `sessions` | gauge | `pool` | Sessions open with the Frontier: 0 while it reconnects |
+| `sessions` | gauge | `pool` | Sessions open with the Frontier: 0 from the start of `Run` and while it reconnects, so a worker that never connects shows 0 |
 | `sessions_opened_total` | counter | `pool` | More than one per pool means the worker reconnected |
 | `tasks_running` | gauge | `pool`, `handler` | Handlers running now |
 | `tasks_finished_total` | counter | `pool`, `handler`, `kind`, `code` | How tasks ended: `success`, `retry`, `failed`, `released`, or `lost` when the lease was lost and nothing was reported. `handler` is `unregistered` for a task whose handler the worker lacks |

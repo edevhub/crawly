@@ -105,7 +105,7 @@ func (f *Frontier) Restart() {
 	}
 	reg := prometheus.NewRegistry()
 	srv, err := frontier.New(frontier.Config{Store: f.store, Policies: f.pol, Metrics: reg, NoHandlerGrace: grace, NoHandlerDelay: 50 * time.Millisecond,
-		ReaperInterval: 50 * time.Millisecond, MaintainInterval: 50 * time.Millisecond, PollInterval: 100 * time.Millisecond})
+		ReaperInterval: 50 * time.Millisecond, PoolStatsInterval: 50 * time.Millisecond, MaintainInterval: 50 * time.Millisecond, PollInterval: 100 * time.Millisecond})
 	if err != nil {
 		f.tb.Fatal(err)
 	}

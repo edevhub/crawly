@@ -115,6 +115,7 @@ func (s *Server) pool(ctx context.Context, name store.PoolName) *pool {
 	if !ok {
 		p = &pool{name: name, sessions: map[*session]struct{}{}, wake: make(chan struct{}, 1)}
 		s.pools[name] = p
+		s.m.initPool(name)
 		go s.dispatchLoop(ctx, p)
 	}
 	return p

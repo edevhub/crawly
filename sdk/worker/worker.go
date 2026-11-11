@@ -235,6 +235,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	client := workerv1.NewWorkerServiceClient(conn)
 	var wg sync.WaitGroup
 	for pool := range pools {
+		w.metrics.PoolStarted(pool)
 		r := &runner{w: w, pool: pool, client: client, running: map[string]*active{}, idle: make(chan struct{}, 1)}
 		wg.Go(func() { r.run(ctx) })
 	}
@@ -701,13 +702,14 @@ func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 		if rep != nil {
 			done.Kind, done.Code = outcomeKind(rep.complete.GetOutcome().GetKind()), rep.complete.GetOutcome().GetCode()
 		}
-		r.w.metrics.TaskFinished(done)
 		// A lost lease is not reported: only its slot is returned.
 		if rep != nil {
 			r.sendReportLocked(rep)
 		}
 		r.grantLocked()
 		r.sendMu.Unlock()
+		// Outside the locks: the implementation is the caller's.
+		r.w.metrics.TaskFinished(done)
 		r.checkIdle()
 	})
 }

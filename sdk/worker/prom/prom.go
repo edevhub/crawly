@@ -92,6 +92,12 @@ func (m *Metrics) code(c string) string {
 	return c
 }
 
+// PoolStarted implements worker.Metrics.
+func (m *Metrics) PoolStarted(pool string) {
+	m.sessions.WithLabelValues(pool)
+	m.opened.WithLabelValues(pool)
+}
+
 // SessionOpened implements worker.Metrics.
 func (m *Metrics) SessionOpened(pool string) {
 	m.sessions.WithLabelValues(pool).Inc()

@@ -55,6 +55,9 @@ type Config struct {
 	// round takes a politeness slot of its queue, so the delay bounds what a pool
 	// without the handler costs the queue's other tasks. Zero: five seconds.
 	NoHandlerDelay time.Duration
+	// PoolStatsInterval is how often the replica reads the store's state for the
+	// metrics. Zero: fifteen seconds.
+	PoolStatsInterval time.Duration
 	// Metrics is where the replica registers its Prometheus metrics. The Frontier
 	// serves nothing itself: the caller exposes the registry. Nil: the metrics are
 	// kept in a registry nobody reads. A registry takes one replica.
@@ -68,6 +71,7 @@ type Server struct {
 	log   *slog.Logger
 	cfg   Config
 	m     *metrics
+	state *stateCollector
 
 	mu        sync.Mutex
 	pools     map[store.PoolName]*pool
@@ -98,6 +102,9 @@ func New(cfg Config) (*Server, error) {
 			*d = time.Second
 		}
 	}
+	if cfg.PoolStatsInterval <= 0 {
+		cfg.PoolStatsInterval = defaultStatsInterval
+	}
 	if cfg.NoHandlerGrace <= 0 {
 		cfg.NoHandlerGrace = time.Hour
 	}
@@ -113,7 +120,8 @@ func New(cfg Config) (*Server, error) {
 	}
 	s := &Server{store: timedStore{Store: cfg.Store, m: m}, pol: cfg.Policies, log: cfg.Logger, cfg: cfg, m: m,
 		pools: map[store.PoolName]*pool{}, draining: make(chan struct{}), health: health.NewServer()}
-	if err := cfg.Metrics.Register(newStateCollector(s)); err != nil {
+	s.state = newStateCollector(s)
+	if err := cfg.Metrics.Register(s.state); err != nil {
 		return nil, fmt.Errorf("frontier: registering metrics: %w", err)
 	}
 	s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING) // until Run
@@ -165,6 +173,7 @@ func (s *Server) Run(ctx context.Context) error {
 	for _, loop := range []func(context.Context){
 		func(ctx context.Context) { s.notifications(ctx, notes) },
 		s.reaper, s.maintain, s.revoker,
+		func(ctx context.Context) { s.state.loop(ctx, s.cfg.PoolStatsInterval) },
 	} {
 		wg.Go(func() { loop(ctx) })
 	}

@@ -18,6 +18,15 @@ type timedStore struct {
 var answers = []error{store.ErrNotFound, store.ErrConflict, store.ErrRunClosed, store.ErrLeaseStale, store.ErrLeaseUnknown,
 	context.Canceled}
 
+// storeMethods are the methods observe sees, and storeErrorKinds the kinds of failure,
+// for the series that start at zero.
+var (
+	storeMethods = []string{"CreateRun", "SealRun", "PauseRun", "ResumeRun", "CancelRun", "GetRun", "ListRuns", "RunEvents",
+		"LastEventCursor", "AddTasks", "Dispatch", "Lease", "ExtendLease", "Finish", "ExpiredLeases", "GetTask", "ListTasks",
+		"GetQueue", "ListQueues", "BlockQueue", "PoolStats", "Start", "Maintain", "Now"}
+	storeErrorKinds = []string{"unavailable", "timeout", "other"}
+)
+
 func (t timedStore) observe(method string, start time.Time, err error) {
 	t.m.storeTime.WithLabelValues(method).Observe(time.Since(start).Seconds())
 	if err == nil {
@@ -28,11 +37,19 @@ func (t timedStore) observe(method string, start time.Time, err error) {
 			return
 		}
 	}
-	kind := "other"
-	if errors.Is(err, store.ErrUnavailable) {
-		kind = "unavailable"
+	t.m.storeErrors.WithLabelValues(method, errorKind(err)).Inc()
+}
+
+// errorKind classifies a failure: the store says it is unavailable, a deadline passed
+// (the store's or the caller's own: the store cannot tell them apart), or anything else.
+func errorKind(err error) string {
+	switch {
+	case errors.Is(err, store.ErrUnavailable):
+		return "unavailable"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
 	}
-	t.m.storeErrors.WithLabelValues(method, kind).Inc()
+	return "other"
 }
 
 // timed runs one call. Generic over the result so that each method below is one line.

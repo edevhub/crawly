@@ -9,7 +9,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/sdk"
@@ -152,16 +154,27 @@ func testMetrics(t *testing.T, start startFunc) { //nolint:thelper // a test bod
 	g.want(t, atLeast(1), "crawly_frontier_sessions_opened_total", "pool", "default")
 	g.want(t, atLeast(1), "crawly_frontier_store_call_duration_seconds", "method", "Dispatch")
 	g.want(t, atLeast(1), "crawly_frontier_store_call_duration_seconds", "method", "Finish")
-	g.want(t, equals(1), "crawly_frontier_grpc_handled_total", "method", "/crawly.frontier.run.v1.RunService/CreateRun", "code", "OK")
+	g.want(t, equals(1), "crawly_frontier_grpc_server_handled_total", "grpc_service", "crawly.frontier.run.v1.RunService", "grpc_method", "CreateRun", "grpc_code", "OK")
+	g.want(t, equals(1), "crawly_frontier_grpc_server_handling_seconds", "grpc_method", "CreateRun")
 	g.want(t, equals(1), "crawly_frontier_sessions", "pool", "default")
-	g.want(t, equals(0), "crawly_frontier_pool_tasks", "pool", "default", "state", "in_flight")
-	g.want(t, equals(0), "crawly_frontier_pool_tasks", "pool", "default", "state", "pending")
+	// The store's state is refreshed in the background: wait for a refresh after the run.
+	eventually(t, "the store's gauges to show the finished run", func() bool {
+		g := gather(t, f.Metrics)
+		pending, ok1 := g.sum("crawly_frontier_pool_tasks", "pool", "default", "state", "pending")
+		flight, ok2 := g.sum("crawly_frontier_pool_tasks", "pool", "default", "state", "in_flight")
+		return ok1 && ok2 && pending == 0 && flight == 0
+	})
+	gather(t, f.Metrics).want(t, equals(1), "crawly_frontier_pool_stats_up")
 	g.want(t, equals(1), "crawly_frontier_replica_info")
-	if _, ok := g.sum("crawly_frontier_store_errors_total"); ok {
-		t.Error("no store call failed, and none may be counted as a failure")
+	if n, _ := g.sum("crawly_frontier_store_errors_total"); n != 0 {
+		t.Errorf("no store call failed, and %v were counted as failures", n)
 	}
 
-	// The worker's side.
+	// The worker's side. A handler is reported finished just after its report is sent.
+	eventually(t, "the worker to report its handlers finished", func() bool {
+		n, _ := gather(t, workerReg).sum("crawly_worker_tasks_running")
+		return n == 0
+	})
 	wg := gather(t, workerReg)
 	wg.want(t, equals(1), "crawly_worker_sessions", "pool", "default")
 	wg.want(t, atLeast(1), "crawly_worker_sessions_opened_total", "pool", "default")
@@ -192,16 +205,28 @@ func testMetricsSilentWorker(t *testing.T, start startFunc) { //nolint:thelper /
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	stream, err := workerv1.NewWorkerServiceClient(conn).Work(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, m := range []*workerv1.WorkRequest{
-		{Msg: &workerv1.WorkRequest_Hello{Hello: &workerv1.Hello{WorkerId: "ghost", BuildVersion: "b1", Pool: "default"}}},
-		{Msg: &workerv1.WorkRequest_Credit{Credit: &workerv1.Credit{Slots: 3}}},
-	} {
-		if err := stream.Send(m); err != nil {
+	// The replica may not have started its loops yet: it answers Unavailable until it has.
+	var stream grpc.BidiStreamingClient[workerv1.WorkRequest, workerv1.WorkResponse]
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		var err error
+		stream, err = workerv1.NewWorkerServiceClient(conn).Work(ctx)
+		if err != nil {
 			t.Fatal(err)
+		}
+		for _, m := range []*workerv1.WorkRequest{
+			{Msg: &workerv1.WorkRequest_Hello{Hello: &workerv1.Hello{WorkerId: "ghost", BuildVersion: "b1", Pool: "default"}}},
+			{Msg: &workerv1.WorkRequest_Credit{Credit: &workerv1.Credit{Slots: 3}}},
+		} {
+			if err := stream.Send(m); err != nil {
+				break // the stream ended: Recv says why
+			}
+		}
+		m, err := stream.Recv()
+		if err == nil && m.GetWelcome() != nil {
+			break
+		}
+		if status.Code(err) != codes.Unavailable || time.Now().After(deadline) {
+			t.Fatalf("opening a session: %v %v", m, err)
 		}
 	}
 	for {
@@ -256,6 +281,10 @@ func testMetricsDueWork(t *testing.T, start startFunc) { //nolint:thelper // a t
 		&task.Spec{Request: &task.Request{Url: "https://a.example/1"}, Handler: "page"},
 		&task.Spec{Request: &task.Request{Url: "https://b.example/1"}, Handler: "page", Pool: "browser"})
 	time.Sleep(300 * time.Millisecond)
+	eventually(t, "the store's gauges to show the work", func() bool {
+		n, _ := gather(t, f.Metrics).sum("crawly_frontier_pool_tasks", "pool", "browser", "state", "pending")
+		return n == 1
+	})
 
 	g := gather(t, f.Metrics)
 	g.want(t, func(v float64) bool { return v >= 0.3 && v < 30 }, "crawly_frontier_oldest_due_task_age_seconds", "pool", "default", "policy", "fast")
@@ -264,6 +293,7 @@ func testMetricsDueWork(t *testing.T, start startFunc) { //nolint:thelper // a t
 	g.want(t, equals(1), "crawly_frontier_pool_tasks", "pool", "browser", "state", "pending")
 	g.want(t, equals(0), "crawly_frontier_sessions", "pool", "default")
 	g.want(t, equals(0), "crawly_frontier_sessions", "pool", "browser")
+	g.want(t, equals(1), "crawly_frontier_pool_stats_up")
 }
 
 // clientOf returns the SDK client that runClient made for the address.

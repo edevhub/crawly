@@ -29,7 +29,11 @@ func serveMetrics(addr string, reg *prometheus.Registry, log *slog.Logger) (stop
 		return nil, err
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn)}))
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
+		ErrorLog:      slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		ErrorHandling: promhttp.ContinueOnError, // one faulty collector must not drop every series
+		Registry:      reg,                      // exports promhttp_metric_handler_errors_total
+	}))
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	done := make(chan struct{})
 	go func() {
