@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -38,6 +39,12 @@ func WithBuildVersion(v string) Option { return func(w *Worker) { w.version = v 
 
 // WithMaxConcurrentTasks sets how many tasks run at once per pool. Default 8.
 func WithMaxConcurrentTasks(n int) Option { return func(w *Worker) { w.maxTasks = n } }
+
+// WithMaxTasksPerSecond limits how fast the worker takes work: it starts at most n
+// tasks per second, evenly spaced, across all its pools. It protects the worker and
+// what it depends on; politeness towards the crawled sites stays in the Frontier.
+// Zero, the default, sets no limit.
+func WithMaxTasksPerSecond(n float64) Option { return func(w *Worker) { w.perSecond = n } }
 
 // WithDialOptions adds gRPC dial options. Transport security is the caller's choice
 // and has no default: pass grpc.WithTransportCredentials here, or use WithInsecure.
@@ -78,13 +85,15 @@ type registration struct {
 
 // Worker runs registered handlers against a Frontier.
 type Worker struct {
-	target   string
-	id       string
-	version  string
-	maxTasks int
-	grace    time.Duration
-	dial     []grpc.DialOption
-	log      *slog.Logger
+	target    string
+	id        string
+	version   string
+	maxTasks  int
+	perSecond float64
+	pace      *pacer // nil: no limit on how fast work is taken
+	grace     time.Duration
+	dial      []grpc.DialOption
+	log       *slog.Logger
 
 	mu       sync.Mutex
 	handlers map[string]*registration // by handler name
@@ -107,10 +116,40 @@ func New(target string, opts ...Option) (*Worker, error) {
 	if w.maxTasks < 1 {
 		return nil, errors.New("worker: MaxConcurrentTasks must be at least 1")
 	}
+	if w.perSecond < 0 || math.IsNaN(w.perSecond) || math.IsInf(w.perSecond, 0) {
+		return nil, errors.New("worker: MaxTasksPerSecond must be a positive number, or zero for no limit")
+	}
+	if w.perSecond > 0 {
+		w.pace = &pacer{every: time.Duration(float64(time.Second) / w.perSecond)}
+	}
 	if len(w.dial) == 0 {
 		return nil, errors.New("worker: transport security is required: use WithDialOptions with credentials, or WithInsecure for plaintext")
 	}
 	return w, nil
+}
+
+// pacer spaces out the credits a worker grants: one every interval. A credit is one
+// task the Frontier may send, so this bounds how fast the worker starts tasks. All
+// pools of a worker share one pacer.
+type pacer struct {
+	every time.Duration
+
+	mu   sync.Mutex
+	next time.Time // when the next credit may be granted
+}
+
+// take reports how many of the want credits may be granted at now (none or one),
+// and how long to wait before asking again when that is fewer than wanted.
+func (p *pacer) take(want int, now time.Time) (granted int, wait time.Duration) {
+	if p == nil {
+		return want, 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if want > 0 && !now.Before(p.next) {
+		granted, p.next = 1, now.Add(p.every)
+	}
+	return granted, p.next.Sub(now)
 }
 
 // Register adds a handler under the name tasks are routed by (the task's handler
@@ -188,10 +227,12 @@ type runner struct {
 
 	sendMu sync.Mutex // serialises sends and the switch of stream
 	stream grpc.BidiStreamingClient[workerv1.WorkRequest, workerv1.WorkResponse]
-	gen    int // session generation, to resend only what the current stream has not seen
+	gen    int         // session generation, to resend only what the current stream has not seen
+	paced  *time.Timer // set while a credit waits for the pacer; guarded by sendMu
 
 	mu       sync.Mutex
 	running  map[string]*active // by lease id
+	credits  int                // granted on the current stream and not used by an assignment yet
 	unacked  []*report          // in the order the handlers finished
 	draining bool
 	idle     chan struct{} // signalled when nothing runs and nothing is unacknowledged
@@ -317,15 +358,12 @@ func (r *runner) session(ctx context.Context) error {
 	r.gen++
 	r.mu.Lock()
 	pending := append([]*report(nil), r.unacked...)
-	free := r.w.maxTasks - len(r.running)
-	draining := r.draining
+	r.credits = 0 // credits do not carry over to a new session
 	r.mu.Unlock()
 	for _, rep := range pending {
 		r.sendReportLocked(rep)
 	}
-	if free > 0 && !draining {
-		_ = stream.Send(&workerv1.WorkRequest{Msg: &workerv1.WorkRequest_Credit{Credit: &workerv1.Credit{Slots: safeconv.Uint32(free)}}})
-	}
+	r.grantLocked()
 	r.sendMu.Unlock()
 	defer func() {
 		r.sendMu.Lock()
@@ -362,6 +400,38 @@ func (r *runner) session(ctx context.Context) error {
 		case *workerv1.WorkResponse_Drain:
 			return errors.New("the frontier asked to reconnect")
 		}
+	}
+}
+
+// grantLocked grants the Frontier a credit for every free slot that has none yet, as
+// fast as the pacer allows, and comes back for the rest. The caller holds sendMu, so
+// the count of free slots and the grant are one step: a session that reconnects in
+// between cannot grant a slot a second time.
+func (r *runner) grantLocked() {
+	if r.stream == nil {
+		return // the next session grants
+	}
+	r.mu.Lock()
+	owed := r.w.maxTasks - len(r.running) - r.credits
+	draining := r.draining
+	r.mu.Unlock()
+	if owed <= 0 || draining {
+		return // no credit follows a Goodbye
+	}
+	n, wait := r.w.pace.take(owed, time.Now())
+	if n > 0 {
+		_ = r.stream.Send(&workerv1.WorkRequest{Msg: &workerv1.WorkRequest_Credit{Credit: &workerv1.Credit{Slots: safeconv.Uint32(n)}}})
+		r.mu.Lock()
+		r.credits += n
+		r.mu.Unlock()
+	}
+	if n < owed && r.paced == nil {
+		r.paced = time.AfterFunc(wait, func() {
+			r.sendMu.Lock()
+			r.paced = nil
+			r.grantLocked()
+			r.sendMu.Unlock()
+		})
 	}
 }
 
@@ -446,6 +516,7 @@ func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 		deadline: time.Now().Add(lease.GetDuration().AsDuration()), leaseFor: lease.GetDuration().AsDuration()}
 	r.mu.Lock()
 	r.running[act.leaseID] = act
+	r.credits = max(r.credits-1, 0) // the assignment used one
 	r.mu.Unlock()
 
 	r.handlers.Go(func() {
@@ -471,15 +542,12 @@ func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 			rep = buildReport(act, task, res, err, r.poolFor)
 			r.unacked = append(r.unacked, rep)
 		}
-		draining := r.draining
 		r.mu.Unlock()
 		// A lost lease is not reported: only its slot is returned.
 		if rep != nil {
 			r.sendReportLocked(rep)
 		}
-		if r.stream != nil && !draining {
-			_ = r.stream.Send(&workerv1.WorkRequest{Msg: &workerv1.WorkRequest_Credit{Credit: &workerv1.Credit{Slots: 1}}})
-		}
+		r.grantLocked()
 		r.sendMu.Unlock()
 		r.checkIdle()
 	})

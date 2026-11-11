@@ -163,11 +163,17 @@ Named after Temporal's worker options so their behaviour is familiar:
 | Option | Meaning | Temporal |
 |---|---|---|
 | `MaxConcurrentTasks` | Fixed number of credits | `MaxConcurrentActivityExecutionSize` |
-| `MaxTasksPerSecond` | Throttles credit grants on the worker | `MaxWorkerActivitiesPerSecond` |
+| `MaxTasksPerSecond` | Throttles credit grants on the worker: one credit per interval, over all its pools | `MaxWorkerActivitiesPerSecond` |
 | `ResourceBasedTuner{TargetCPU, TargetMemory, MinSlots, MaxSlots}` | Grants credits from measured CPU and memory, between a floor and a ceiling | Resource-based slot supplier |
 | `CompositeTuner` (later) | Different tuners per handler | `WorkerTuner` composite |
 
 These limit the worker, not the target sites: politeness stays in the Frontier.
+
+A credit is one task the Frontier may send, so the rate limit needs nothing from the
+Frontier: the worker grants a credit for a free slot only when the interval since its last
+grant has passed, and one at a time, so unused time is not saved up into a burst. Credits
+do not carry over to a new session; after a reconnect the free slots are granted again at
+the same pace.
 
 ### Drain and shutdown
 
