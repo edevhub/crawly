@@ -47,7 +47,9 @@ type Config struct {
 	MaintainInterval time.Duration
 	PollInterval     time.Duration
 	// NoHandlerGrace is how long a task waits while no session can run its handler,
-	// before it fails with code "no_handler". Zero: one hour.
+	// before it fails with code "no_handler". Zero: one hour. At least four maintain
+	// intervals: the sessions' handlers are reported on those ticks, and a task must
+	// not fail because a report was late.
 	NoHandlerGrace time.Duration
 	// NoHandlerDelay is how long a task that a session without declared handlers handed
 	// back for want of its handler waits before it is given out again. Each such round
@@ -72,10 +74,11 @@ type Server struct {
 	loops     context.Context // set by Run: the lifetime of the dispatch loops
 	draining  chan struct{}   // closed by Drain
 	health    *health.Server
-	unserved  sync.Map                  // store.TaskID -> time.Time: since when no worker that got the task had its handler
-	forgotten time.Time                 // guarded by mu: when forgetUnserved last looked at unserved
-	swept     time.Time                 // guarded by mu: when the sweep for tasks without a handler last ran
-	waiting   map[store.HandlerRef]bool // guarded by mu: handlers whose waiting tasks were logged
+	unserved  sync.Map  // store.TaskID -> time.Time: since when no worker that got the task had its handler
+	forgotten time.Time // guarded by mu: when forgetUnserved last looked at unserved
+	swept     time.Time // guarded by mu: when the sweep for tasks without a handler last ran
+	reported  string    // guarded by mu: the handlers of the sessions as last reported to the store
+	reportAt  time.Time // guarded by mu: when they were
 }
 
 // New builds a replica. Call Register to expose it and Run to start its loops.
@@ -97,12 +100,12 @@ func New(cfg Config) (*Server, error) {
 	if cfg.NoHandlerGrace <= 0 {
 		cfg.NoHandlerGrace = time.Hour
 	}
+	cfg.NoHandlerGrace = max(cfg.NoHandlerGrace, 4*cfg.MaintainInterval)
 	if cfg.NoHandlerDelay <= 0 {
 		cfg.NoHandlerDelay = 5 * time.Second
 	}
 	s := &Server{store: cfg.Store, pol: cfg.Policies, log: cfg.Logger, cfg: cfg,
-		pools: map[store.PoolName]*pool{}, draining: make(chan struct{}), health: health.NewServer(),
-		waiting: map[store.HandlerRef]bool{}}
+		pools: map[store.PoolName]*pool{}, draining: make(chan struct{}), health: health.NewServer()}
 	s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING) // until Run
 	return s, nil
 }
@@ -379,12 +382,15 @@ const CodeNoHandler = store.CodeNoHandler
 // CodeShutdown is the code of a task a worker handed back because it shut down.
 const CodeShutdown = "shutdown"
 
-// reportHandlers tells the store which handlers have a session on this replica.
+// reportHandlers tells the store which handlers have a session on this replica: when
+// they change, and otherwise as a heartbeat, a tenth of the grace period (at most a
+// minute) apart. A session that names no handlers is the handler "": it can run any.
 func (s *Server) reportHandlers(ctx context.Context) error {
 	s.mu.Lock()
 	pools := slices.Collect(maps.Values(s.pools))
 	s.mu.Unlock()
 	var sets []store.PoolHandlers
+	var sig strings.Builder
 	for _, p := range pools {
 		p.mu.Lock()
 		seen := map[string]bool{}
@@ -395,18 +401,36 @@ func (s *Server) reportHandlers(ctx context.Context) error {
 			for _, h := range ss.handlers {
 				seen[h] = true
 			}
+			if len(ss.handlers) == 0 {
+				seen[""] = true
+			}
 		}
 		p.mu.Unlock()
 		if len(seen) > 0 {
-			sets = append(sets, store.PoolHandlers{Pool: p.name, Handlers: slices.Sorted(maps.Keys(seen))})
+			hs := slices.Sorted(maps.Keys(seen))
+			sets = append(sets, store.PoolHandlers{Pool: p.name, Handlers: hs})
+			fmt.Fprintf(&sig, "%s\x00%q\x00", p.name, hs)
 		}
 	}
-	return s.store.ServeHandlers(ctx, sets)
+	s.mu.Lock()
+	same := sig.String() == s.reported && time.Since(s.reportAt) < min(s.cfg.NoHandlerGrace/10, time.Minute)
+	s.mu.Unlock()
+	if same || len(sets) == 0 {
+		return nil
+	}
+	if err := s.store.ServeHandlers(ctx, sets); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.reported, s.reportAt = sig.String(), time.Now()
+	s.mu.Unlock()
+	return nil
 }
 
 // sweepUnserved reports the handlers this replica serves, and from time to time asks
 // the store to fail the tasks that waited the grace period for a session that has
-// their handler. It logs each handler whose tasks wait once, and each failure.
+// their handler. It logs each failure, and, when the store says it is this replica's
+// turn, the handlers whose tasks wait.
 func (s *Server) sweepUnserved(ctx context.Context) {
 	if err := s.reportHandlers(ctx); err != nil {
 		s.log.Warn("reporting handlers", "err", err)
@@ -431,17 +455,17 @@ func (s *Server) sweepUnserved(ctx context.Context) {
 		s.log.Warn("no session had the handler for the grace period: the tasks failed",
 			"pool", f.Pool, "handler", f.Handler, "tasks", f.Tasks, "grace", s.cfg.NoHandlerGrace)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := make(map[store.HandlerRef]bool, len(res.Waiting))
-	for _, w := range res.Waiting {
-		now[w] = true
-		if !s.waiting[w] {
-			s.log.Warn("tasks wait for a handler that no session has",
-				"pool", w.Pool, "handler", w.Handler, "grace", s.cfg.NoHandlerGrace)
-		}
+	if !res.Report {
+		return
 	}
-	s.waiting = now
+	for _, w := range res.Waiting {
+		s.log.Warn("tasks wait for a handler that no session has",
+			"pool", w.Pool, "handler", w.Handler, "queues_and_runs", w.Lanes, "grace", s.cfg.NoHandlerGrace)
+	}
+	if res.Held {
+		s.log.Info("tasks that wait for a handler are not failed yet: a replica started less than the grace period ago",
+			"grace", s.cfg.NoHandlerGrace)
+	}
 }
 
 // forgetUnserved drops the tasks that were handed back long ago and not since: they
@@ -574,7 +598,7 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 	out := make([]store.NewTask, len(specs))
 	for i, ts := range specs {
 		pool, queue, fp, err := identify(spec.KeyRule, ts)
-		if err != nil || proto.Size(ts) > wire.MaxTaskBytes || !wire.ValidHandler(ts.GetHandler()) {
+		if err != nil || proto.Size(ts) > wire.MaxTaskBytes {
 			out[i].Invalid = true
 			continue
 		}
@@ -590,7 +614,7 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 			out[i].Invalid = true
 			continue
 		}
-		out[i] = store.NewTask{Fingerprint: fp, Queue: store.QueueKey(queue), Pool: pool, Handler: ts.GetHandler(), Priority: ts.GetPriority(), Spec: raw,
+		out[i] = store.NewTask{Fingerprint: fp, Queue: store.QueueKey(queue), Pool: pool, Handler: storedHandler(ts.GetHandler()), Priority: ts.GetPriority(), Spec: raw,
 			TTL: s.pol.Resolve(spec.Policy, queue).Behaviour.GetTaskTtl().AsDuration()}
 		if ts.GetNotBeforeTime() != nil {
 			out[i].NotBefore = ts.GetNotBeforeTime().AsTime()
@@ -649,4 +673,14 @@ func (s *signal) Broadcast() {
 		s.ch = nil
 	}
 	s.mu.Unlock()
+}
+
+// storedHandler is the handler a task is stored with. A name that no worker could
+// have registered is stored as unknown, "": the task is accepted, as before, and
+// every session may try it.
+func storedHandler(h string) string {
+	if wire.ValidHandler(h) {
+		return h
+	}
+	return ""
 }

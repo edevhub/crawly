@@ -18,6 +18,7 @@ import (
 
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/testfrontier"
+	"github.com/edevhub/crawly/internal/wire"
 	"github.com/edevhub/crawly/sdk"
 	"github.com/edevhub/crawly/sdk/run"
 	"github.com/edevhub/crawly/sdk/task"
@@ -70,6 +71,21 @@ func TestRegisterValidates(t *testing.T) {
 	}
 	if err := w.Register("render", noop, worker.InPool("browser_2")); err != nil {
 		t.Errorf("a valid pool was rejected: %v", err)
+	}
+}
+
+func TestRegisterLimitsHandlersPerPool(t *testing.T) {
+	w := newWorker(t, "localhost:1")
+	for i := range wire.MaxSessionHandlers {
+		if err := w.Register("h"+strconv.Itoa(i), noop); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Register("one_too_many", noop); err == nil {
+		t.Error("a session names at most as many handlers as the Frontier accepts")
+	}
+	if err := w.Register("elsewhere", noop, worker.InPool("browser")); err != nil {
+		t.Errorf("the limit is per pool: %v", err)
 	}
 }
 

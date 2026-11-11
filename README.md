@@ -51,6 +51,12 @@ change the schema on its own and refuses to start on a database that is behind i
 The migrations are recorded in the table `crawly_migrations`; to use another name, pass
 `-postgres-migrations-table` (or `CRAWLY_POSTGRES_MIGRATIONS_TABLE`) to both commands.
 
+A migration only adds to the schema, so the replicas of the previous version keep running on
+a migrated database, and you can migrate first and then roll the replicas. Indexes on the
+task tables are built without blocking writes, so on a large database `migrate` can take a
+while; running it again finishes an interrupted build. To go back, stop the new replicas and
+start the old ones; the added tables stay until a later migration removes what they replace.
+
 `-postgres` takes the same URL. When that URL goes through a transaction pooler such as
 PgBouncer, give the Frontier a direct one for `LISTEN` with `-postgres-listen` (or
 `CRAWLY_POSTGRES_LISTEN`).
@@ -417,8 +423,11 @@ given them at once: no task goes round, none is dispatched twice, and none is lo
 whose handler no worker has waits in its queue without using a politeness slot. It fails
 with code `no_handler` when no Frontier replica has had a session with the handler for
 `-no-handler-grace` (one hour by default; counted in the store, so a restart does not reset
-it, but nothing fails until that time has passed since the newest replica started). The
-Frontier logs each handler whose tasks wait, once, at `WARN`, and each failure. A worker
+it, but nothing fails until that time has passed since the newest replica started). A
+worker of an older SDK counts as able to run any handler of its pool, so while one is
+connected no task of its pool fails this way. The Frontier logs each failure at `WARN`, and,
+once in a while, each handler whose tasks wait, with the number of queues and runs that
+have them; failed tasks are found by code `no_handler`. A worker
 that stops lets its handlers finish for `WithShutdownGrace`, then cancels them and hands
 their tasks back, so a deploy never uses up a task's attempts. Workers of an older SDK name
 no handlers: they are offered every task of their pool and hand back the ones they cannot

@@ -3,6 +3,7 @@ package pgstore
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -46,74 +47,214 @@ type sweepLane struct {
 	handler string
 }
 
-// SweepUnserved examines the lanes whose handler has had no session for grace, drops
-// the ones that have no tasks, fails the tasks that waited as long, and reports what
-// still waits. A task waits from its creation, and nothing fails before grace has
-// passed since the newest replica started: a restart of every replica must not fail
-// tasks whose workers have not reconnected yet.
+// sweepCursor is where a round of the sweep stopped: the handler it was on, and the
+// last of that handler's lanes it looked at, in the order of the index lanes_ready.
+type sweepCursor struct {
+	pool    int16
+	handler string
+	ready   time.Time
+	queue   string
+	run     int64
+}
+
+// unservedPair is a handler of a pool that has lanes and no session.
+type unservedPair struct {
+	pool    int16
+	name    store.PoolName
+	handler string
+}
+
+// SweepUnserved is one bounded round over the lanes whose handler no replica has
+// reported for grace: it fails the tasks of those lanes that waited as long and
+// reports what waits. It finds the handlers first, from the few (pool, handler) pairs
+// that have lanes, and walks the lanes of the ones that are unserved from where the
+// last round stopped, so that a round costs the same however many lanes exist and
+// every lane is reached. The store keeps the position and the time of the last round:
+// one replica at a time does the work, at most every quarter of grace (and a minute).
+// A task waits from its creation, and nothing fails before grace has passed since the
+// newest replica started: a restart of every replica must not fail tasks whose
+// workers have not reconnected yet.
 func (s *Store) SweepUnserved(ctx context.Context, grace time.Duration) (store.Unserved, error) {
 	var out store.Unserved
 	now, err := s.Now(ctx)
 	if err != nil {
 		return out, err
 	}
+	every := min(grace/4, time.Minute)
+	var cur sweepCursor
+	var ready pgtype.Timestamptz
+	err = s.db.QueryRow(ctx, `UPDATE unserved_sweep SET swept_at = $1 WHERE swept_at <= $2
+		RETURNING cur_pool, cur_handler, cur_ready, cur_queue, cur_run`, now, now.Add(-every)).
+		Scan(&cur.pool, &cur.handler, &ready, &cur.queue, &cur.run)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return out, nil // another replica swept lately
+	}
+	if err != nil {
+		return out, wrap(err)
+	}
+	cur.ready = timeOf(ready)
+
 	var newest pgtype.Timestamptz
 	if err := s.db.QueryRow(ctx, "SELECT max(started_at) FROM replicas").Scan(&newest); err != nil {
 		return out, wrap(err)
 	}
 	mayFail := !timeOf(newest).After(now.Add(-grace))
-	// Lanes of paused runs have no readiness and are left alone.
-	rows, err := s.db.Query(ctx, `SELECT l.queue_key, l.run_no, l.pool_id, p.name, l.handler
-		FROM lanes l JOIN pools p USING (pool_id)
-		WHERE l.handler <> '' AND l.ready_at IS NOT NULL
-			AND NOT EXISTS (SELECT 1 FROM pool_handlers h WHERE h.pool = p.name AND h.handler = l.handler AND h.seen_at > $1)
-		ORDER BY l.queue_key, l.run_no, l.pool_id, l.handler LIMIT $2`, now.Add(-grace), maintainBacklogs)
+	pairs, err := s.unservedPairs(ctx, now.Add(-grace))
 	if err != nil {
-		return out, wrap(err)
+		return out, err
 	}
-	lanes, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (sweepLane, error) {
-		var l sweepLane
-		var name string
-		err := row.Scan(&l.queue, &l.run, &l.pool, &name, &l.handler)
-		l.name = store.PoolName(name)
-		return l, err
-	})
+	failed, next, err := s.sweepRound(ctx, pairs, cur, grace, mayFail)
 	if err != nil {
-		return out, wrap(err)
+		return out, err
 	}
-	waiting := map[store.HandlerRef]bool{}
-	failed := map[store.HandlerRef]int{}
-	for _, l := range lanes {
-		ref := store.HandlerRef{Pool: l.name, Handler: l.handler}
-		var n int
-		var left bool
-		err := s.tx(ctx, func(tx pgx.Tx, at time.Time) error {
-			var err error
-			n, left, err = s.sweepLane(ctx, tx, at, l, grace, mayFail)
-			return err
-		})
+	// What still waits, counted after the round.
+	for _, p := range pairs {
+		n, err := s.countLanes(ctx, p)
 		if err != nil {
 			return out, err
 		}
 		if n > 0 {
-			failed[ref] += n
-		}
-		if left {
-			waiting[ref] = true
+			out.Waiting = append(out.Waiting, store.WaitingHandler{HandlerRef: store.HandlerRef{Pool: p.name, Handler: p.handler}, Lanes: n})
 		}
 	}
-	for ref := range waiting {
-		out.Waiting = append(out.Waiting, ref)
+	if _, err := s.db.Exec(ctx, `UPDATE unserved_sweep SET cur_pool = $1, cur_handler = $2, cur_ready = $3, cur_queue = $4, cur_run = $5
+		WHERE id = 1`, next.pool, next.handler, next.ready, next.queue, next.run); err != nil {
+		return out, wrap(err)
 	}
 	for ref, n := range failed {
 		out.Failed = append(out.Failed, store.FailedTasks{HandlerRef: ref, Tasks: n})
 	}
-	cmpRef := func(a, b store.HandlerRef) int {
-		return cmp.Or(cmp.Compare(a.Pool, b.Pool), cmp.Compare(a.Handler, b.Handler))
-	}
-	slices.SortFunc(out.Waiting, cmpRef)
 	slices.SortFunc(out.Failed, func(a, b store.FailedTasks) int { return cmpRef(a.HandlerRef, b.HandlerRef) })
+
+	out.Held = !mayFail && len(out.Waiting) > 0
+	// One caller in a while is asked to log what waits.
+	err = s.db.QueryRow(ctx, `UPDATE unserved_sweep SET reported_at = $1 WHERE reported_at <= $2 RETURNING true`,
+		now, now.Add(-min(grace, 10*time.Minute))).Scan(&out.Report)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return out, wrap(err)
+	}
 	return out, nil
+}
+
+func cmpRef(a, b store.HandlerRef) int {
+	return cmp.Or(cmp.Compare(a.Pool, b.Pool), cmp.Compare(a.Handler, b.Handler))
+}
+
+// unservedPairsSQL skips through lanes_ready from one (pool, handler) to the next, and
+// keeps the pairs that have no session since $1. A session that names no handlers is
+// recorded as the handler ”: it serves all of its pool.
+const unservedPairsSQL = `WITH RECURSIVE pairs AS (
+		(SELECT pool_id, handler FROM lanes WHERE ready_at IS NOT NULL ORDER BY pool_id, handler LIMIT 1)
+		UNION ALL
+		SELECT n.pool_id, n.handler FROM pairs p CROSS JOIN LATERAL (
+			SELECT pool_id, handler FROM lanes WHERE ready_at IS NOT NULL AND (pool_id, handler) > (p.pool_id, p.handler)
+			ORDER BY pool_id, handler LIMIT 1) n)
+	SELECT p.pool_id, pl.name, p.handler FROM pairs p JOIN pools pl USING (pool_id)
+	WHERE p.handler <> '' AND NOT EXISTS (SELECT 1 FROM pool_handlers h
+		WHERE h.pool = pl.name AND h.handler IN (p.handler, '') AND h.seen_at > $1)
+	ORDER BY p.pool_id, p.handler`
+
+// sweepLanesSQL reads a page of one handler's lanes from the cursor ($3, $4, $5) on, in
+// the order of lanes_ready.
+const sweepLanesSQL = `SELECT queue_key, run_no, ready_at FROM lanes
+	WHERE pool_id = $1 AND handler = $2 AND ready_at IS NOT NULL AND (ready_at, queue_key, run_no) > ($3, $4, $5)
+	ORDER BY ready_at, queue_key, run_no LIMIT $6`
+
+// unservedPairs lists the handlers that have lanes and no session since the cut-off,
+// by skipping from one (pool, handler) to the next in lanes_ready. A session that
+// names no handlers is recorded as the handler ”: it serves all of its pool.
+func (s *Store) unservedPairs(ctx context.Context, since time.Time) ([]unservedPair, error) {
+	rows, err := s.db.Query(ctx, unservedPairsSQL, since)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (unservedPair, error) {
+		var p unservedPair
+		var name string
+		err := row.Scan(&p.pool, &name, &p.handler)
+		p.name = store.PoolName(name)
+		return p, err
+	})
+}
+
+// laneCountBound is where the count of waiting lanes stops.
+const laneCountBound = 10000
+
+// countLanes counts the lanes of a pair that wait, up to laneCountBound.
+func (s *Store) countLanes(ctx context.Context, p unservedPair) (int, error) {
+	var n int
+	err := s.db.QueryRow(ctx, `SELECT count(*) FROM (SELECT 1 FROM lanes WHERE pool_id = $1 AND handler = $2
+		AND ready_at IS NOT NULL LIMIT $3) c`, p.pool, p.handler, laneCountBound).Scan(&n)
+	return n, wrap(err)
+}
+
+// sweepRound visits up to maintainBacklogs lanes of the unserved pairs, from the
+// cursor on, and returns what it failed and where to resume. The cursor is zero when
+// the round reached the end: the next one starts again.
+func (s *Store) sweepRound(ctx context.Context, pairs []unservedPair, cur sweepCursor, grace time.Duration, mayFail bool) (map[store.HandlerRef]int, sweepCursor, error) {
+	failed := map[store.HandlerRef]int{}
+	budget := maintainBacklogs
+	for _, p := range pairs {
+		if p.pool < cur.pool || (p.pool == cur.pool && p.handler < cur.handler) {
+			continue // before the cursor
+		}
+		from := sweepCursor{}
+		if p.pool == cur.pool && p.handler == cur.handler {
+			from = cur
+		}
+		for {
+			rows, err := s.db.Query(ctx, sweepLanesSQL, p.pool, p.handler, from.ready, from.queue, from.run, min(budget, 50))
+			if err != nil {
+				return failed, cur, wrap(err)
+			}
+			batch, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (visit, error) {
+				v := visit{lane: sweepLane{pool: p.pool, name: p.name, handler: p.handler}}
+				var ready pgtype.Timestamptz
+				err := row.Scan(&v.lane.queue, &v.lane.run, &ready)
+				v.ready = timeOf(ready)
+				return v, err
+			})
+			if err != nil {
+				return failed, cur, wrap(err)
+			}
+			if len(batch) == 0 {
+				break // this handler is done
+			}
+			for _, v := range batch {
+				l := v.lane
+				for budget > 0 {
+					budget--
+					var n int
+					var left bool
+					err := s.tx(ctx, func(tx pgx.Tx, at time.Time) error {
+						var err error
+						n, left, err = s.sweepLane(ctx, tx, at, l, grace, mayFail)
+						return err
+					})
+					if err != nil {
+						return failed, cur, err
+					}
+					if n > 0 {
+						failed[store.HandlerRef{Pool: l.name, Handler: l.handler}] += n
+					}
+					if n < maintainTasks || !left {
+						break // the lane is done, or has only tasks that are too young
+					}
+				}
+				from = sweepCursor{pool: p.pool, handler: p.handler, ready: v.ready, queue: l.queue, run: l.run}
+				if budget <= 0 {
+					return failed, from, nil
+				}
+			}
+		}
+	}
+	return failed, sweepCursor{}, nil
+}
+
+// visit is a lane the sweep looks at, with the readiness that orders it.
+type visit struct {
+	lane  sweepLane
+	ready time.Time
 }
 
 // failedTask is a task the sweep failed.

@@ -19,7 +19,7 @@ func TestNoHandlerGrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	const grace = 50 * time.Millisecond
-	s, err := New(Config{Store: memstore.New(pol), Policies: pol, NoHandlerGrace: grace, NoHandlerDelay: time.Second})
+	s, err := New(Config{Store: memstore.New(pol), Policies: pol, NoHandlerGrace: grace, MaintainInterval: grace / 4, NoHandlerDelay: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

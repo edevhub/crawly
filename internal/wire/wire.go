@@ -21,7 +21,7 @@ const (
 	// MaxHandlerBytes is the longest handler name. The Frontier indexes tasks by it.
 	MaxHandlerBytes = 256
 	// MaxSessionHandlers is how many handlers one session can name.
-	MaxSessionHandlers = 1024
+	MaxSessionHandlers = 64
 )
 
 // Batches splits tasks into consecutive batches of at most maxTasks tasks and

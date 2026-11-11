@@ -44,6 +44,7 @@ type Store struct {
 	// when this store started (SweepUnserved).
 	handlers map[store.HandlerRef]time.Time
 	started  time.Time
+	reported time.Time // when SweepUnserved last asked its caller to log
 }
 
 // Option configures a Store.
@@ -486,6 +487,27 @@ func (h handlerSet) runs(t *task) bool {
 	return ok
 }
 
+// servedWindow is how recently a handler must have been reported to count as served
+// when another pool's first refusal is decided.
+const servedWindow = 5 * time.Minute
+
+// servedSet is what the pool's sessions can run, as they reported it lately: a session
+// that names no handlers can run anything (nil); with none, only tasks of unknown
+// handler can be run.
+func (s *Store) servedSet(pool store.PoolName, now time.Time) handlerSet {
+	set := handlerSet{}
+	for ref, seen := range s.handlers {
+		if ref.Pool != pool || now.Sub(seen) > servedWindow {
+			continue
+		}
+		if ref.Handler == "" {
+			return nil
+		}
+		set[ref.Handler] = struct{}{}
+	}
+	return set
+}
+
 // eligible counts the tasks that the set can run and that can be claimed now, and
 // reports the earliest time a delayed one becomes claimable.
 func (b *backlog) eligible(now time.Time, h handlerSet) (n int, next time.Time) {
@@ -559,10 +581,11 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, h handlerSet,
 			if !b.r.dispatchable() {
 				continue
 			}
-			// Another pool's tasks are judged by their pool's sessions, not this one's.
+			// Another pool's tasks are judged by their pool's sessions, not this one's:
+			// the ones that have had a session lately.
 			bh := h
 			if b.pool != req.Pool {
-				bh = nil
+				bh = s.servedSet(b.pool, now)
 			}
 			elig, next := b.eligible(now, bh)
 			if elig == 0 {
@@ -995,13 +1018,22 @@ func (s *Store) ServeHandlers(_ context.Context, sets []store.PoolHandlers) erro
 }
 
 // SweepUnserved fails the pending tasks that waited longer than grace for a session
-// that can run their handler.
+// that can run their handler, and reports the handlers whose tasks wait.
 func (s *Store) SweepUnserved(_ context.Context, grace time.Duration) (store.Unserved, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
 	var out store.Unserved
-	waiting := map[store.HandlerRef]bool{}
+	mayFail := now.Sub(s.started) >= grace
+	served := func(pool store.PoolName, handler string) bool {
+		for _, h := range []string{handler, ""} { // "": a session that can run any
+			if seen, ok := s.handlers[store.HandlerRef{Pool: pool, Handler: h}]; ok && now.Sub(seen) <= grace {
+				return true
+			}
+		}
+		return false
+	}
+	waiting := map[store.HandlerRef]map[*backlog]bool{}
 	failed := map[store.HandlerRef]int{}
 	for _, r := range s.order {
 		if !r.dispatchable() {
@@ -1010,11 +1042,14 @@ func (s *Store) SweepUnserved(_ context.Context, grace time.Duration) (store.Uns
 		for _, b := range r.backlogs {
 			for _, t := range slices.Clone(b.pending) {
 				ref := store.HandlerRef{Pool: b.pool, Handler: t.handler}
-				if seen, ok := s.handlers[ref]; t.handler == "" || (ok && now.Sub(seen) <= grace) {
+				if t.handler == "" || served(b.pool, t.handler) {
 					continue // served, or no handler named: any session may try it
 				}
-				if now.Sub(t.created) < grace || now.Sub(s.started) < grace {
-					waiting[ref] = true
+				if now.Sub(t.created) < grace || !mayFail {
+					if waiting[ref] == nil {
+						waiting[ref] = map[*backlog]bool{}
+					}
+					waiting[ref][b] = true
 					continue
 				}
 				if i := slices.Index(b.pending, t); i >= 0 {
@@ -1033,14 +1068,18 @@ func (s *Store) SweepUnserved(_ context.Context, grace time.Duration) (store.Uns
 			}
 		}
 	}
-	for ref := range waiting {
-		out.Waiting = append(out.Waiting, ref)
+	for ref, bs := range waiting {
+		out.Waiting = append(out.Waiting, store.WaitingHandler{HandlerRef: ref, Lanes: len(bs)})
 	}
 	for ref, n := range failed {
 		out.Failed = append(out.Failed, store.FailedTasks{HandlerRef: ref, Tasks: n})
 	}
-	slices.SortFunc(out.Waiting, cmpRef)
+	slices.SortFunc(out.Waiting, func(a, b store.WaitingHandler) int { return cmpRef(a.HandlerRef, b.HandlerRef) })
 	slices.SortFunc(out.Failed, func(a, b store.FailedTasks) int { return cmpRef(a.HandlerRef, b.HandlerRef) })
+	out.Held = !mayFail && len(out.Waiting) > 0
+	if now.Sub(s.reported) >= min(grace, 10*time.Minute) {
+		s.reported, out.Report = now, true
+	}
 	return out, nil
 }
 

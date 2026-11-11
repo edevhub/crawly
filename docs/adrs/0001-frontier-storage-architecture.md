@@ -274,8 +274,9 @@ type Background interface {
 	// last (a new set or a rollback) resets readiness, so no backlog stays parked by a
 	// limit that no longer applies.
 	Start(ctx context.Context, r Replica) error
-	// ServeHandlers records that this replica has sessions that can run these handlers.
-	// It is called regularly while they are connected.
+	// ServeHandlers records that this replica has sessions that can run these handlers
+	// ("" stands for a session that names none and can run any). It is called when the
+	// sessions change and, while they stay, as a heartbeat.
 	ServeHandlers(ctx context.Context, sets []PoolHandlers) error
 	// SweepUnserved fails the pending tasks whose handler no replica has reported for
 	// grace (code "no_handler", no attempt dispatched) and reports the handlers whose
@@ -512,7 +513,13 @@ allowances there.
 
 Tasks are claimed only from the session's pool, and only those of its handlers. A queue's
 politeness state and fairness clock are shared across pools. Work no session can run costs
-no politeness slot and no share: it is never dispatched, so it advances neither.
+no politeness slot and no share: it is never dispatched, so it advances neither. In its own
+pool it is not offered to anyone. In another pool, a backlog gets first refusal on a shared
+queue only if a session of that pool, as the pool's replicas last reported, can run some of
+its work, so work nobody can run neither holds the queue nor wakes the pool. One residue: a
+session is reported some seconds after it connects, and a replica of a build that does not
+report leaves its pool without reports, and in both cases that pool's work of named
+handlers has no first refusal for a while.
 
 **Fairness comes before priority.** Temporal does the opposite: strict priority tiers are
 dispatched before fairness applies. For a crawler that would let a high-priority run take a

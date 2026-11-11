@@ -30,8 +30,11 @@ This ADR borrows it.
   (plain HTTP) or `browser` (headless). It is Temporal's task queue.
 - A task names its pool in `TaskSpec.pool` (empty: `default`) and its handler in
   `TaskSpec.handler`. There is no label or capability matching. Pool names match
-  `[a-z0-9_]{1,32}`; anything else is `INVALID`. A handler name is at most 256 bytes and
-  holds no NUL byte; anything else is `INVALID`.
+  `[a-z0-9_]{1,32}`; anything else is `INVALID`. A worker registers handler names of at most
+  256 bytes without a NUL byte, and a session names at most 64 of them; `Hello` with more, or
+  with a name that is not valid, is refused. A task that names a handler no worker could
+  register is not refused: it is stored as of unknown handler, which every session may try,
+  as it was before handlers took part in dispatch.
 - A **session** serves exactly one pool. `Hello` carries `pool`, `worker_id`,
   `build_version` and `handlers`. A worker process that serves several pools opens one
   session per pool.
@@ -60,12 +63,19 @@ This ADR borrows it.
   - It does not wait for ever without a sign. When no replica has reported a session with
     the handler for a configured time (`-no-handler-grace`, one hour by default), the task
     fails with code `no_handler`. Each replica reports the handlers of its sessions to the
-    store on every maintenance tick, and the store keeps when each was last reported; a task fails when
-    its handler was last reported longer ago than the grace period and the task itself is
-    at least as old. The state is in the store, so a restart of a replica does not restart
+    store when they change and as a heartbeat well inside the grace period, and the store keeps
+    when each was last reported; a task fails when its handler was last reported longer ago
+    than the grace period and the task itself is at least as old. A session that names no
+    handlers is reported as able to run any, so while one is connected, and for the grace
+    period after, no handler of its pool counts as unserved: its tasks are its own to run or
+    hand back. The state is in the store, so a restart of a replica does not restart
     the count, and the count is the same on every replica. The failure is recorded as an
-    attempt with code `no_handler` that was never dispatched. A Frontier logs each handler
-    whose tasks wait, once, and each failure.
+    attempt with code `no_handler` that was never dispatched. The sweep that does this is
+    bounded: it takes a limited number of queues in a round, goes on from where the last
+    round stopped, and one replica at a time does it. A Frontier logs each failure, and, once
+    in a while and not once per replica, each handler whose tasks wait, with how many queues
+    and runs have such tasks; that line and the failed tasks, found by code `no_handler`, are
+    what an operator sees.
   - The limits of that guarantee. The store knows that some replica reported the handler
     lately, not that the session is alive, has free credits or can reach the task: a handler
     served by one worker that is stuck keeps its tasks from failing. Nothing fails before the

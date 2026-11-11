@@ -113,14 +113,20 @@ type Background interface {
 	// Start registers the replica and its policy set.
 	Start(ctx context.Context, r Replica) error
 	// ServeHandlers records that this replica has sessions that can run these handlers.
-	// It is called regularly while they are connected; SweepUnserved reads it.
+	// It is called when the sessions change and, while they stay, more often than the
+	// grace period of SweepUnserved. SweepUnserved reads it, and so does Dispatch: work
+	// in another pool that none of the pool's sessions can run is not given first
+	// refusal on a queue.
 	ServeHandlers(ctx context.Context, sets []PoolHandlers) error
 	// SweepUnserved looks for pending tasks whose handler no session can run. It fails
 	// the ones that waited longer than grace (code CodeNoHandler, no attempt recorded)
 	// and reports the handlers whose tasks wait. A handler is served from the moment a
 	// replica reports it until grace after the last report; a task waits from its
 	// creation, and no grace ends before one has passed since the newest replica
-	// started. Safe to call concurrently.
+	// started. A call is one bounded round: the store keeps where the last round
+	// stopped, and a call that comes sooner than a quarter of grace (at most a
+	// minute) after another, from any replica, does nothing. Safe to call
+	// concurrently.
 	SweepUnserved(ctx context.Context, grace time.Duration) (Unserved, error)
 	// Notifications delivers coalesced wake-ups until ctx is done. A missed
 	// notification only delays work until the next NextReadyAt or poll.
@@ -166,7 +172,9 @@ type Replica struct {
 // period.
 const CodeNoHandler = "no_handler"
 
-// PoolHandlers is the set of handlers the sessions of one pool can run.
+// PoolHandlers is the set of handlers the sessions of one pool can run. The handler
+// "" stands for a session that names no handlers and so can run any: while one is
+// reported, no handler of the pool counts as unserved.
 type PoolHandlers struct {
 	Pool     PoolName
 	Handlers []string
@@ -184,10 +192,22 @@ type FailedTasks struct {
 	Tasks int
 }
 
+// WaitingHandler is a handler whose tasks wait because no session can run it.
+type WaitingHandler struct {
+	HandlerRef
+	Lanes int // the queues and runs with such tasks; counted up to a bound
+}
+
 // Unserved is what SweepUnserved found.
 type Unserved struct {
-	Waiting []HandlerRef  // handlers with pending tasks that no live session can run
-	Failed  []FailedTasks // tasks failed by this call
+	Waiting []WaitingHandler // handlers with pending tasks that no live session can run
+	Failed  []FailedTasks    // tasks failed by this call
+	// Held is set when tasks wait and nothing may fail yet, because a replica
+	// started less than the grace period ago.
+	Held bool
+	// Report is set on at most one call in a while, cluster-wide: the caller logs
+	// what waits then, so that the replicas do not each log the same lines.
+	Report bool
 }
 
 // Notification is a coalesced wake-up for the dispatch loop or run watchers.

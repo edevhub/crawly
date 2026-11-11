@@ -114,23 +114,49 @@ func (h *handlerSet) runs(l *lane) bool {
 	return h == nil || slices.Contains(h.names, l.handler)
 }
 
+// candidatesByHandlerSQL: one probe of lanes_ready per handler, each bounded, then the
+// earliest queues of what they found.
+const candidatesByHandlerSQL = `SELECT queue_key FROM (
+		SELECT l.queue_key, l.ready_at FROM unnest($5::text[]) AS h(handler)
+		CROSS JOIN LATERAL (SELECT queue_key, ready_at FROM lanes
+			WHERE pool_id = $1 AND handler = h.handler AND ready_at <= $2 ORDER BY ready_at LIMIT $6) l
+		ORDER BY l.ready_at LIMIT $3) c
+	GROUP BY queue_key ORDER BY min(ready_at) LIMIT $4`
+
+// claimSQL leases the best $11 due tasks of a backlog's handlers: one range of
+// tasks_claim_h per handler, merged by priority. The picked rows are materialised
+// first: as a plain sub-select the planner may run the LIMIT again for every outer row
+// and claim more than n.
+const claimSQL = `WITH picked AS MATERIALIZED (
+		SELECT p.task_id FROM unnest($12::text[]) AS h(handler)
+		CROSS JOIN LATERAL (
+			SELECT task_id, priority FROM tasks
+			WHERE run_created_on = $1 AND run_no = $2 AND queue_key = $3 AND pool_id = $4 AND handler = h.handler
+				AND state = 'pending' AND not_before <= $5 AND (expires_at IS NULL OR expires_at > $5)
+			ORDER BY priority DESC, task_id LIMIT $11 FOR UPDATE SKIP LOCKED) p
+		ORDER BY p.priority DESC, p.task_id LIMIT $11)
+	UPDATE tasks t SET state = 'in_flight', attempt = t.attempt + 1, lease_nonce = $6,
+		worker_id = $7, worker_version = $8, dispatched_at = $5, lease_expires_at = $9, lease_deadline = $10
+	FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id
+	RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.fingerprint, t.priority, t.spec`
+
 // candidates are the queues the session may dispatch from, the one with the earliest
 // ready lane first. Each handler is probed in the readiness index on its own, so a
 // session never reads past lanes it cannot run.
 func (s *Store) candidates(ctx context.Context, pool int16, h *handlerSet, now time.Time) ([]string, error) {
 	var rows pgx.Rows
 	var err error
+	// Each handler's probe reads at most its share of the bound.
+	each := candidateBacklogs
+	if h != nil {
+		each = max(candidateBacklogs/len(h.names), 8)
+	}
 	if h == nil {
 		rows, err = s.db.Query(ctx, `SELECT queue_key FROM (
 				SELECT queue_key, ready_at FROM lanes WHERE pool_id = $1 AND ready_at <= $2 ORDER BY ready_at LIMIT $3) c
 			GROUP BY queue_key ORDER BY min(ready_at) LIMIT $4`, pool, now, candidateBacklogs, candidateQueues)
 	} else {
-		rows, err = s.db.Query(ctx, `SELECT queue_key FROM (
-				SELECT l.queue_key, l.ready_at FROM unnest($5::text[]) AS h(handler)
-				CROSS JOIN LATERAL (SELECT queue_key, ready_at FROM lanes
-					WHERE pool_id = $1 AND handler = h.handler AND ready_at <= $2 ORDER BY ready_at LIMIT $3) l
-				ORDER BY l.ready_at LIMIT $3) c
-			GROUP BY queue_key ORDER BY min(ready_at) LIMIT $4`, pool, now, candidateBacklogs, candidateQueues, h.names)
+		rows, err = s.db.Query(ctx, candidatesByHandlerSQL, pool, now, candidateBacklogs, candidateQueues, h.names, each)
 	}
 	if err != nil {
 		return nil, wrap(err)
@@ -175,7 +201,12 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 	}
 
 	// The lanes this session can run. Another pool's lanes are judged by its own
-	// sessions, so the first refusal below does not depend on this session's handlers.
+	// sessions, so the first refusal below does not depend on this session's handlers;
+	// but a lane that none of them can run is not worth waiting for.
+	served, err := s.servedHandlers(ctx, tx, now, pool, bs)
+	if err != nil {
+		return nil, err
+	}
 	for _, b := range bs {
 		for _, l := range b.lanes {
 			l.mine = b.pool == pool && run.runs(l)
@@ -185,7 +216,7 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 		if b.pool == pool {
 			return func(l *lane) bool { return l.mine }
 		}
-		return func(*lane) bool { return true }
+		return func(l *lane) bool { return l.handler == "" || served[b.pool][l.handler] || served[b.pool][""] }
 	}
 
 	var out []store.Assignment
@@ -302,6 +333,36 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 	return out, s.wake(ctx, tx, notify)
 }
 
+// servedWindow is how recently a replica must have reported a handler for it to count
+// as served when another pool's first refusal is decided. The reports come far more
+// often than this.
+const servedWindow = 5 * time.Minute
+
+// servedHandlers returns, for each pool that has a live backlog with pending tasks in
+// the queue besides the dispatching pool's, the handlers that have had a session
+// lately. The handler "" is a session that can run any. Nil when there is no such pool.
+func (s *Store) servedHandlers(ctx context.Context, tx pgx.Tx, now time.Time, pool int16, bs []*brow) (map[int16]map[string]bool, error) {
+	if !slices.ContainsFunc(bs, func(b *brow) bool { return b.pool != pool && b.live && b.pending > 0 }) {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `SELECT p.pool_id, h.handler FROM pool_handlers h JOIN pools p ON p.name = h.pool
+		WHERE h.seen_at > $1`, now.Add(-servedWindow))
+	if err != nil {
+		return nil, err
+	}
+	out := map[int16]map[string]bool{}
+	var id int16
+	var handler string
+	_, err = pgx.ForEachRow(rows, []any{&id, &handler}, func() error {
+		if out[id] == nil {
+			out[id] = map[string]bool{}
+		}
+		out[id][handler] = true
+		return nil
+	})
+	return out, err
+}
+
 // earliestReady is the earliest readiness among the backlog's lanes that wait at now:
 // forever when they all wait for an event.
 func (b *brow) earliestReady(now time.Time) time.Time {
@@ -391,20 +452,7 @@ func (s *Store) claim(ctx context.Context, tx pgx.Tx, now time.Time, key store.Q
 	if err != nil {
 		return nil, err
 	}
-	// The picked rows are materialised first: as a plain sub-select the planner may
-	// run the LIMIT again for every outer row and claim more than n.
-	rows, err := tx.Query(ctx, `WITH picked AS MATERIALIZED (
-			SELECT p.task_id FROM unnest($12::text[]) AS h(handler)
-			CROSS JOIN LATERAL (
-				SELECT task_id, priority FROM tasks
-				WHERE run_created_on = $1 AND run_no = $2 AND queue_key = $3 AND pool_id = $4 AND handler = h.handler
-					AND state = 'pending' AND not_before <= $5 AND (expires_at IS NULL OR expires_at > $5)
-				ORDER BY priority DESC, task_id LIMIT $11 FOR UPDATE SKIP LOCKED) p
-			ORDER BY p.priority DESC, p.task_id LIMIT $11)
-		UPDATE tasks t SET state = 'in_flight', attempt = t.attempt + 1, lease_nonce = $6,
-			worker_id = $7, worker_version = $8, dispatched_at = $5, lease_expires_at = $9, lease_deadline = $10
-		FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id
-		RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.fingerprint, t.priority, t.spec`,
+	rows, err := tx.Query(ctx, claimSQL,
 		b.meta.createdOn, b.run, string(key), b.pool, now, nonce, req.Worker.ID, req.Worker.Version, expires, deadline, n, handlers)
 	if err != nil {
 		return nil, err

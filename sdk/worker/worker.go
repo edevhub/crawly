@@ -182,6 +182,15 @@ func (w *Worker) Register(name string, h Handler, opts ...RegisterOption) error 
 	if _, dup := w.handlers[name]; dup {
 		return fmt.Errorf("worker: handler %q is already registered", name)
 	}
+	n := 0
+	for _, o := range w.handlers {
+		if o.pool == r.pool {
+			n++
+		}
+	}
+	if n >= wire.MaxSessionHandlers {
+		return fmt.Errorf("worker: a pool can have at most %d handlers", wire.MaxSessionHandlers)
+	}
 	w.handlers[name] = r
 	return nil
 }

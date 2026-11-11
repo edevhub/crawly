@@ -190,15 +190,14 @@ const sweepBatch = 500
 // while the run was paused nothing kept the others up to date, so one may still wait
 // for a slot that was freed or for a block that was lifted.
 func (s *Store) resumeSweep(ctx context.Context, no int64) error {
-	var queue string // the sweep's position: the last lane it reset
+	var queue string // the sweep's position: the last backlog it reset
 	var pool int16
-	var handler string
 	for {
 		done := false
-		nextQueue, nextPool, nextHandler := queue, pool, handler
+		nextQueue, nextPool := queue, pool
 		err := s.tx(ctx, func(tx pgx.Tx, now time.Time) error {
 			done = false
-			nextQueue, nextPool, nextHandler = queue, pool, handler
+			nextQueue, nextPool = queue, pool
 			var name string
 			var paused, resuming bool
 			err := tx.QueryRow(ctx, "SELECT state::text, paused, resuming FROM runs WHERE run_no = $1", no).Scan(&name, &paused, &resuming)
@@ -209,23 +208,25 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 			if err != nil {
 				return err
 			}
+			// The backlogs are locked first, in key order, as every other writer of
+			// lanes does: a trigger writes the backlog's readiness after its lanes.
 			rows, err := tx.Query(ctx, `WITH c AS (
-					SELECT queue_key, pool_id, handler FROM lanes
-					WHERE run_no = $1 AND (queue_key, pool_id, handler) > ($4, $5, $6)
-					ORDER BY queue_key, pool_id, handler LIMIT $3 FOR UPDATE)
-				UPDATE lanes l SET ready_at = $2 FROM c
-				WHERE l.queue_key = c.queue_key AND l.run_no = $1 AND l.pool_id = c.pool_id AND l.handler = c.handler
-				RETURNING l.queue_key, l.pool_id, l.handler`, no, now, sweepBatch, queue, pool, handler)
+					SELECT queue_key, pool_id FROM backlogs
+					WHERE run_no = $1 AND (queue_key, pool_id) > ($4, $5)
+					ORDER BY queue_key, pool_id LIMIT $3 FOR NO KEY UPDATE),
+				u AS (UPDATE lanes l SET ready_at = $2 FROM c
+					WHERE l.run_no = $1 AND l.queue_key = c.queue_key AND l.pool_id = c.pool_id)
+				SELECT queue_key, pool_id FROM c`, no, now, sweepBatch, queue, pool)
 			if err != nil {
 				return err
 			}
 			pools := map[int16]bool{}
-			var k, h string
+			var k string
 			var p int16
-			if _, err := pgx.ForEachRow(rows, []any{&k, &p, &h}, func() error {
+			if _, err := pgx.ForEachRow(rows, []any{&k, &p}, func() error {
 				pools[p] = true
-				if k > nextQueue || (k == nextQueue && (p > nextPool || (p == nextPool && h > nextHandler))) {
-					nextQueue, nextPool, nextHandler = k, p, h
+				if k > nextQueue || (k == nextQueue && p > nextPool) {
+					nextQueue, nextPool = k, p
 				}
 				return nil
 			}); err != nil {
@@ -245,7 +246,7 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 		if err != nil || done {
 			return err
 		}
-		queue, pool, handler = nextQueue, nextPool, nextHandler // only now: a transaction that is tried again starts where it did
+		queue, pool = nextQueue, nextPool // only now: a transaction that is tried again starts where it did
 	}
 }
 
