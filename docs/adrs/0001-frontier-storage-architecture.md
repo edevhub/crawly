@@ -622,13 +622,20 @@ expired or cancelled, and for the failed ones the code of their last attempt.
 - Labels are bounded in length and in character set, and a run takes a limited number of
   distinct labels, a Frontier setting. A task that breaks either rule is `INVALID`. The
   alternative, counting the excess under one overflow entry, would give that entry two
-  meanings and hide a mistake in the client that produces labels; the rejection is visible
-  to the worker or scheduler that submitted the task, at the moment it does. Tasks whose
-  label the run already has are always accepted.
+  meanings and hide a mistake in the client that produces labels. The rejection is made
+  visible three ways: the result of `AddTasks` and the acknowledgement of a discovered
+  batch carry the status of each task, the SDK worker logs the rejected tasks of a batch,
+  and `RunStats.invalid` counts every task a run rejected as invalid, whatever the reason.
+  Tasks whose label the run already has are always accepted.
 - Counters follow the locality rule: they are kept per queue, next to the backlogs, and
   summed on read. The limit on distinct labels is the one run-wide fact: a batch that brings
-  a label the run does not have takes a run-scoped lock to count it, so the limit is exact. A
-  batch whose labels are all known does not take it.
+  a label the run does not have, while the run has room, takes a run-scoped lock to count it,
+  so the limit is exact. A batch whose labels are all known, or a run that is full, does not
+  take it.
+- The label counters are read before the run's own counters, so a label total never exceeds
+  the run's counter on any read, although a read is not a snapshot.
+- Statistics by label are exact for runs created after every replica runs a build that knows
+  labels; a replica that predates them finishes tasks without counting them.
 - `ListTasks` can filter by label.
 
 ### Locality rule

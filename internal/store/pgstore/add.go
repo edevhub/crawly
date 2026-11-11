@@ -141,7 +141,7 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 			return nil, 0, err
 		}
 	}
-	labels, err := s.knownLabels(ctx, tx, m, req.Tasks)
+	labels, err := s.knownLabels(ctx, tx, m, req.Tasks, req.MaxLabels)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -181,7 +181,10 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 			out[i].Status = store.AddInvalid
 		default:
 			if nt.Label != "" {
-				labels[nt.Label] = true // taken for the rest of the batch; recorded below if the task is inserted
+				// Taken for the rest of the batch, recorded below if the task is inserted. A task
+				// that then loses the insert race to a duplicate still counts against the
+				// limit within this batch: that errs on the side of rejecting.
+				labels[nt.Label] = true
 			}
 			first[nt.Fingerprint] = i
 			rows = append(rows, newRow{index: i, id: s.ids.next(), key: key})
@@ -289,7 +292,23 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 	} else if !open {
 		return nil, 0, errRunClosed
 	}
+	// The run row is written after its advisory lock (order item 6 before 7), and only
+	// when something was rejected.
+	if n := countInvalid(out); n > 0 {
+		if _, err := tx.Exec(ctx, "UPDATE runs SET invalid = invalid + $2 WHERE run_no = $1", m.no, n); err != nil {
+			return nil, 0, err
+		}
+	}
 	return out, added, s.wake(ctx, tx, woken)
+}
+
+func countInvalid(res []store.AddResult) (n int64) {
+	for i := range res {
+		if res[i].Status == store.AddInvalid {
+			n++
+		}
+	}
+	return n
 }
 
 // accepts reports whether the run takes new tasks: seeds while it is open,

@@ -239,9 +239,13 @@ CREATE INDEX backlog_labels_run ON backlog_labels (run_no);
 The label counters are per queue, like `backlog_codes`, so a `Finish` updates a row of the
 queue it already holds and no counter is shared by all queues of a run. `run_labels` is
 written only when a label is new to a run. `AddTasks` reads it; when the batch brings a label
-the run does not have, it first takes advisory lock `(5, run_no)`, reads the registry again,
-and rejects the tasks whose label would exceed the limit as `INVALID`. Batches with known
-labels never take the lock. A task that loses the insert race to a duplicate does not
+the run does not have and the run is not full, it first takes advisory lock `(5, run_no)`,
+reads the registry again, and rejects the tasks whose label would exceed the limit as
+`INVALID`. Batches with known labels, and batches to a full run (labels are never removed,
+so a full run stays full), never take the lock. `runs.invalid` counts the tasks rejected
+as invalid; it is written after the run's shared advisory lock, only when a batch had
+rejections. The migration sets `lock_timeout` for its `ALTER TABLE`, which needs a lock on
+`tasks` and all its partitions; if it times out, run it again. A task that loses the insert race to a duplicate does not
 register its label.
 
 Backlog rows are kept after their run ends, for stats, so a queue accumulates one row per

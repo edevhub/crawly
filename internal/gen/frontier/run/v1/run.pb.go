@@ -415,7 +415,12 @@ type RunStats struct {
 	// Final task counts per task label (TaskSpec.label). Every label the run has accepted
 	// has an entry, with zero counts until a task ends; tasks without a label are not
 	// listed. Counts agree with the task states: a task is counted once, when it ends.
-	ByLabel       map[string]*LabelStats `protobuf:"bytes,15,rep,name=by_label,json=byLabel,proto3" json:"by_label,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	ByLabel map[string]*LabelStats `protobuf:"bytes,15,rep,name=by_label,json=byLabel,proto3" json:"by_label,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Tasks that were submitted and rejected as INVALID (a bad pool, queue key, URL or label,
+	// a task that is too large, or a new label beyond the run's limit). Seeds learn this from
+	// the result of AddTasks; a task that a handler discovers is otherwise lost without a trace.
+	// Tasks of a batch that is refused because the run is closed are not counted.
+	Invalid       uint64 `protobuf:"varint,16,opt,name=invalid,proto3" json:"invalid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -546,6 +551,13 @@ func (x *RunStats) GetByLabel() map[string]*LabelStats {
 		return x.ByLabel
 	}
 	return nil
+}
+
+func (x *RunStats) GetInvalid() uint64 {
+	if x != nil {
+		return x.Invalid
+	}
+	return 0
 }
 
 // Tasks of one label that have ended, by how they ended. The sum of all labels is at
@@ -993,7 +1005,7 @@ const file_crawly_frontier_run_v1_run_proto_rawDesc = "" +
 	"\x0fSTATE_COMPLETED\x10\x03\x12\x13\n" +
 	"\x0fSTATE_CANCELLED\x10\x04\x12\x11\n" +
 	"\rSTATE_EXPIRED\x10\x05J\x04\b\x02\x10\x03J\x04\b\b\x10\tJ\x04\b\n" +
-	"\x10\vJ\x04\b\v\x10\f\"\x95\x05\n" +
+	"\x10\vJ\x04\b\v\x10\f\"\xaf\x05\n" +
 	"\bRunStats\x12\x18\n" +
 	"\apending\x18\x01 \x01(\x04R\apending\x12\x18\n" +
 	"\adelayed\x18\x02 \x01(\x04R\adelayed\x12\x1b\n" +
@@ -1014,7 +1026,8 @@ const file_crawly_frontier_run_v1_run_proto_rawDesc = "" +
 	"overBudget\x12E\n" +
 	"\aby_code\x18\f \x03(\v2,.crawly.frontier.run.v1.RunStats.ByCodeEntryR\x06byCode\x12\x1c\n" +
 	"\tcancelled\x18\r \x01(\x04R\tcancelled\x12H\n" +
-	"\bby_label\x18\x0f \x03(\v2-.crawly.frontier.run.v1.RunStats.ByLabelEntryR\abyLabel\x1a9\n" +
+	"\bby_label\x18\x0f \x03(\v2-.crawly.frontier.run.v1.RunStats.ByLabelEntryR\abyLabel\x12\x18\n" +
+	"\ainvalid\x18\x10 \x01(\x04R\ainvalid\x1a9\n" +
 	"\vByCodeEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\x1a^\n" +

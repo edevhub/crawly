@@ -3,6 +3,11 @@
 -- counters, kept per queue like the other counters of a backlog and summed on read.
 
 -- +goose Up
+-- The ALTER needs a lock on tasks and every partition. If a long query holds one, give up
+-- instead of queueing the whole Frontier behind it: run the migration again later.
+SET LOCAL lock_timeout = '5s';
+
+ALTER TABLE runs ADD COLUMN invalid bigint NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN label text NOT NULL DEFAULT '';
 
 CREATE TABLE run_labels (
@@ -28,3 +33,4 @@ CREATE INDEX backlog_labels_run ON backlog_labels (run_no);
 DROP TABLE IF EXISTS backlog_labels;
 DROP TABLE IF EXISTS run_labels;
 ALTER TABLE tasks DROP COLUMN IF EXISTS label;
+ALTER TABLE runs DROP COLUMN IF EXISTS invalid;

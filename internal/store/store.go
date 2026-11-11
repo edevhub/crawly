@@ -225,6 +225,7 @@ type RunStats struct {
 	Succeeded, Failed, Expired, Cancelled uint64
 	Attempts, QueueBlocks                 uint64
 	Discovered, Duplicates, OverBudget    uint64
+	Invalid                               uint64 // tasks rejected as invalid, in an open run
 	ByCode                                map[string]uint64
 	ByLabel                               map[string]LabelStats // by task label; labelled tasks only
 }

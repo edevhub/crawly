@@ -63,6 +63,11 @@ message RunStats {
   // has an entry, with zero counts until a task ends; tasks without a label are not
   // listed. Counts agree with the task states: a task is counted once, when it ends.
   map<string, LabelStats> by_label = 15;
+  // Tasks that were submitted and rejected as INVALID (a bad pool, queue key, URL or label,
+  // a task that is too large, or a new label beyond the run's limit). Seeds learn this from
+  // the result of AddTasks; a task that a handler discovers is otherwise lost without a trace.
+  // Tasks of a batch that is refused because the run is closed are not counted.
+  uint64 invalid = 16;
 }
 
 // Tasks of one label that have ended, by how they ended. The sum of all labels is at

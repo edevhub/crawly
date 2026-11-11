@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -217,7 +218,13 @@ func TestCrawlCut(t *testing.T) {
 // TestLabels: a label follows the subtree of the task that has it, unless a task sets
 // another or clears it, and the run's statistics are kept per label.
 func TestLabels(t *testing.T) {
-	f := crawlytest.Start(t)
+	var logs strings.Builder
+	var logMu sync.Mutex
+	f := crawlytest.Start(t, local.WithLogger(slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return logs.Write(p)
+	}), &slog.HandlerOptions{Level: slog.LevelWarn}))))
 	w, err := f.Worker()
 	if err != nil {
 		t.Fatal(err)
@@ -264,7 +271,17 @@ func TestLabels(t *testing.T) {
 		by["shop"].GetSucceeded() != 1 || by["shop"].GetFailed() != 0 {
 		t.Fatalf("by label: %v", by)
 	}
-	if st := final.GetStats(); st.GetSucceeded() != 4 || st.GetFailed() != 1 {
+	if st := final.GetStats(); st.GetSucceeded() != 4 || st.GetFailed() != 1 || st.GetInvalid() != 1 {
 		t.Fatalf("stats: %v", st)
 	}
+	// The rejected task is not silent: the worker says which one and why.
+	logMu.Lock()
+	defer logMu.Unlock()
+	if out := logs.String(); !strings.Contains(out, "rejected as invalid") || !strings.Contains(out, `first_label="no good"`) {
+		t.Errorf("the worker did not report the rejected task: %q", out)
+	}
 }
+
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

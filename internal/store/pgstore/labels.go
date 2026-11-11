@@ -17,10 +17,11 @@ import (
 
 // knownLabels returns the labels of the run that the batch can use: those it has
 // already, and the room for the new ones. It is nil for a batch without labels.
-// When the batch brings a label the run does not have, the run's label lock is taken
+// When the batch brings a label the run does not have and the run has room for it,
+// the run's label lock is taken
 // and held to the end of the transaction, so that batches that bring new labels
 // count against the cap one after the other.
-func (s *Store) knownLabels(ctx context.Context, tx pgx.Tx, m *runMeta, tasks []store.NewTask) (map[string]bool, error) {
+func (s *Store) knownLabels(ctx context.Context, tx pgx.Tx, m *runMeta, tasks []store.NewTask, limit int) (map[string]bool, error) {
 	var wanted []string
 	for i := range tasks {
 		if l := tasks[i].Label; l != "" && !tasks[i].Invalid {
@@ -35,6 +36,11 @@ func (s *Store) knownLabels(ctx context.Context, tx pgx.Tx, m *runMeta, tasks []
 		return nil, err
 	}
 	if !slices.ContainsFunc(wanted, func(l string) bool { return !known[l] }) {
+		return known, nil
+	}
+	if limit > 0 && len(known) >= limit {
+		// The run is full and labels are never removed: every new label is rejected,
+		// whatever another batch does, so there is nothing to count and no lock to take.
 		return known, nil
 	}
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int, $2::int)", lockLabels, lockKey(m.no)); err != nil {

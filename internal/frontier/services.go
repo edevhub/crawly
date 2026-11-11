@@ -379,7 +379,7 @@ func runProto(r store.Run) *runv1.Run {
 		KeyRule: &runv1.KeyRule{Kind: rule},
 		Stats: &runv1.RunStats{Pending: st.Pending, Delayed: st.Delayed, InFlight: st.InFlight, Succeeded: st.Succeeded,
 			Failed: st.Failed, Expired: st.Expired, Cancelled: st.Cancelled, Attempts: st.Attempts, QueueBlocks: st.QueueBlocks,
-			Discovered: st.Discovered, Duplicates: st.Duplicates, OverBudget: st.OverBudget, ByCode: st.ByCode, ByLabel: labelStatsProto(st.ByLabel)},
+			Discovered: st.Discovered, Duplicates: st.Duplicates, OverBudget: st.OverBudget, ByCode: st.ByCode, ByLabel: labelStatsProto(st.ByLabel), Invalid: st.Invalid},
 		CreateTime: ts(r.CreatedAt), SealTime: ts(r.SealedAt), FinishTime: ts(r.FinishedAt),
 	}
 }
@@ -419,13 +419,15 @@ func addResults(res []store.AddResult) []*taskv1.AddResult {
 func taskFromSpec(id store.TaskID, run store.RunID, fp store.Fingerprint, depth uint32, parent store.TaskID, spec *taskv1.TaskSpec) *taskv1.Task {
 	return &taskv1.Task{TaskId: string(id), RunId: string(run), QueueKey: spec.GetQueueKey(), Fingerprint: hex.EncodeToString(fp[:]),
 		Request: spec.GetRequest(), Handler: spec.GetHandler(), Depth: depth, ParentTaskId: string(parent),
-		Context: spec.GetContext(), Pool: spec.GetPool(), Label: spec.GetLabel()}
+		Context: spec.GetContext(), Pool: spec.GetPool()}
 }
 
 func taskStatusProto(t store.TaskStatus) *runv1.TaskStatus {
 	spec := &taskv1.TaskSpec{}
 	_ = proto.Unmarshal(t.Spec, spec)
-	out := &runv1.TaskStatus{Task: taskFromSpec(t.ID, t.Run, t.Fingerprint, t.Depth, t.Parent, spec),
+	task := taskFromSpec(t.ID, t.Run, t.Fingerprint, t.Depth, t.Parent, spec)
+	task.Label = t.Label // the stored column, which is what the statistics count
+	out := &runv1.TaskStatus{Task: task,
 		State: runv1.TaskStatus_State(safeconv.Int32(int(t.State))), NextEligibleTime: ts(t.NextEligibleAt)}
 	for i := range t.Attempts {
 		a := &t.Attempts[i]

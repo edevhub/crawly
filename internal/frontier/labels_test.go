@@ -65,3 +65,27 @@ func TestTaskLabels(t *testing.T) {
 		t.Error("the label changed the fingerprint")
 	}
 }
+
+// The label a worker sees and the one the statistics count are the same: the stored
+// column. A spec that carries a label the store does not know (written by a Frontier
+// that predates labels) must not show one to the handler.
+func TestAssignmentLabelFollowsStore(t *testing.T) {
+	pol, err := policy.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Config{Store: memstore.New(pol), Policies: pol})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := proto.Marshal(&taskv1.TaskSpec{Request: &taskv1.Request{Url: "https://a.example/"}, Label: new("news")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"", "shop"} {
+		a := s.assignment(store.Assignment{Spec: raw, Info: store.LeaseInfo{Label: label}})
+		if got := a.GetTask().GetLabel(); got != label {
+			t.Errorf("column %q: the worker saw %q", label, got)
+		}
+	}
+}

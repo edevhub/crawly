@@ -33,20 +33,23 @@ func migrations() fs.FS {
 	return dir
 }
 
-// SchemaVersion is the version of the newest migration in this build.
-func SchemaVersion() int64 {
+// schemaVersions are the versions of the migrations in this build.
+func schemaVersions() []int64 {
 	names, err := fs.Glob(migrations(), "*.sql")
 	if err != nil {
 		panic(err) // the pattern is constant
 	}
-	var latest int64
+	var out []int64
 	for _, name := range names {
-		if v, err := goose.NumericComponent(name); err == nil && v > latest {
-			latest = v
+		if v, err := goose.NumericComponent(name); err == nil {
+			out = append(out, v)
 		}
 	}
-	return latest
+	return out
 }
+
+// SchemaVersion is the version of the newest migration in this build.
+func SchemaVersion() int64 { return slices.Max(schemaVersions()) }
 
 // Migration is one migration and whether the database has it.
 type Migration struct {
@@ -145,6 +148,26 @@ func tableIdent(table string) (string, error) {
 // ErrNotMigrated reports a database whose schema is older than this build needs.
 var ErrNotMigrated = errors.New("pgstore: the database schema is not up to date; run the migrations first")
 
+// missingVersion is the oldest migration of this build that the database lacks, or 0.
+// The newest one being applied does not mean the older ones are: migrations applied out
+// of order leave gaps.
+func (s *Store) missingVersion(ctx context.Context, table string) int64 {
+	rows, err := s.db.Query(ctx, "SELECT version_id FROM "+table+" WHERE is_applied")
+	if err != nil {
+		return 0
+	}
+	applied, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return 0
+	}
+	for _, v := range schemaVersions() {
+		if v > 0 && !slices.Contains(applied, v) {
+			return v
+		}
+	}
+	return 0
+}
+
 const codeUndefinedTable = "42P01"
 
 // checkSchema makes sure the database has every migration of this build. The store
@@ -166,6 +189,9 @@ func (s *Store) checkSchema(ctx context.Context) error {
 	case have > need:
 		// A newer build migrated the database already, as in a rolling update.
 		s.log.Warn("pgstore: the database schema is newer than this build", "database", have, "build", need)
+	}
+	if v := s.missingVersion(ctx, table); v != 0 {
+		return fmt.Errorf("%w (migration %d of this build is not applied, although a newer one is)", ErrNotMigrated, v)
 	}
 	return nil
 }

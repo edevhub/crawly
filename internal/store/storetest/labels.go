@@ -260,6 +260,76 @@ func runLabels(t *testing.T, f Factory) {
 		}
 	})
 
+	t.Run("RejectedTasksAreCounted", func(t *testing.T) {
+		e := newEnv(t, f, store.Limits{})
+		r := e.run("r")
+		bad := e.labelled("q", "")
+		bad.Invalid = true
+		got := e.addLabelled(r, 1, nil, e.labelled("q", "a"), bad, e.labelled("q", "b"), e.labelled("q", "c"), e.labelled("q", "a"))
+		if got[1] != store.AddInvalid || got[2] != store.AddInvalid || got[3] != store.AddInvalid || got[4] != store.AddAdded {
+			t.Fatalf("statuses %v", got)
+		}
+		if n := e.state(r).Stats.Invalid; n != 3 {
+			t.Fatalf("invalid = %d, want 3", n)
+		}
+		// A batch to a closed run is refused as a whole and counts nothing.
+		e.seal(r)
+		e.addLabelled(r, 1, nil, bad, e.labelled("q", "z"))
+		if n := e.state(r).Stats.Invalid; n != 3 {
+			t.Fatalf("invalid after a refused batch = %d", n)
+		}
+	})
+
+	// The labels of a run never add up to more than the run's own counters, on any read:
+	// a scheduler subtracts one from the other.
+	t.Run("LabelTotalsNeverExceedRunCounters", func(t *testing.T) {
+		e := newEnv(t, f, store.Limits{})
+		r := e.run("r")
+		const n = 300
+		tasks := make([]store.NewTask, n)
+		for i := range tasks {
+			tasks[i] = e.labelled(fmt.Sprintf("q%d", i%7), "l")
+		}
+		e.addLabelled(r, 0, nil, tasks...)
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				run, err := e.s.GetRun(ctx, r)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				l := run.Stats.ByLabel["l"]
+				if l.Succeeded > run.Stats.Succeeded || l.Failed > run.Stats.Failed {
+					t.Errorf("labels ahead of the run: %+v, succeeded %d, failed %d", l, run.Stats.Succeeded, run.Stats.Failed)
+					return
+				}
+			}
+		})
+		for done := 0; done < n; {
+			as := e.dispatch("default", 20)
+			for i := range as {
+				if done%5 == 0 {
+					e.fail(as[i], "x")
+				} else {
+					e.finish(as[i], store.ResultSucceeded)
+				}
+				done++
+			}
+		}
+		close(stop)
+		wg.Wait()
+		if l := e.byLabel(r)["l"]; l.Succeeded+l.Failed != n {
+			t.Fatalf("final: %+v", l)
+		}
+	})
+
 	t.Run("LabelOnTasks", func(t *testing.T) {
 		e := newEnv(t, f, store.Limits{})
 		r := e.run("r")

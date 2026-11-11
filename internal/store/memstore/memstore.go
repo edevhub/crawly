@@ -419,6 +419,9 @@ func (s *Store) AddTasks(_ context.Context, req store.AddRequest) ([]store.AddRe
 		switch {
 		case nt.Invalid:
 			out[i].Status = store.AddInvalid
+			if open {
+				r.stats.Invalid++
+			}
 		case !open:
 			out[i].Status = store.AddRunClosed
 		case r.spec.Limits.MaxDepth > 0 && depth > r.spec.Limits.MaxDepth,
@@ -430,6 +433,7 @@ func (s *Store) AddTasks(_ context.Context, req store.AddRequest) ([]store.AddRe
 			r.stats.Duplicates++
 		case nt.Label != "" && r.labels[nt.Label] == nil && req.MaxLabels > 0 && len(r.labels) >= req.MaxLabels:
 			out[i].Status = store.AddInvalid
+			r.stats.Invalid++
 		default:
 			pool := nt.Pool
 			if pool == "" {

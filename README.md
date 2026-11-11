@@ -194,6 +194,8 @@ per category against a tolerance, without putting the section into the outcome c
   has are not affected.
 - The label is not part of the dedup key: a repeat of a task with another label is a
   duplicate and keeps the first one's label.
+- `Stats.Invalid` counts the tasks the run rejected as invalid, for any reason. The worker
+  logs the rejected tasks of a discovered batch with the first one's URL and label.
 - Every label that was added appears in `ByLabel`, with zero counts until a task ends.
   Tasks without a label are not listed. `ListTasks` takes a `label` to list one section.
 
