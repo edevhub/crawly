@@ -421,8 +421,8 @@ func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.F
 	res := s.pol.Resolve(info.RunPolicy, string(info.Queue))
 	beh := res.Behaviour
 	// A sign of strain slows the queue (the store does it, with the outcome). The task
-	// is then judged by a larger attempt limit: the failures it meets while the queue
-	// is slowed down say little about it.
+	// has a budget of its own for such failures: they say little about it while the
+	// queue is slowed down, and max_attempts is judged against the other attempts.
 	strain := o.GetStrain() && o.GetKind() != taskv1.Outcome_KIND_RELEASED && res.Queue.GetAdaptive().GetEnabled()
 	// One outcome blocks the queue for as long as the queue's policy allows. A block
 	// stops every run on the queue, so a site's Retry-After, or a spider's mistake, must
@@ -435,6 +435,7 @@ func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.F
 	switch o.GetKind() {
 	case taskv1.Outcome_KIND_SUCCESS:
 		f.Result = store.ResultSucceeded
+		f.Answered = !strain && f.Block == 0
 	case taskv1.Outcome_KIND_RELEASED:
 		// The task was not run: nothing of the outcome but the hand-back applies.
 		f.Block = 0
@@ -457,13 +458,23 @@ func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.F
 			f.Result, f.Record.Kind = store.ResultFailed, int32(taskv1.Outcome_KIND_FAILED)
 		}
 	case taskv1.Outcome_KIND_RETRY:
-		limit := beh.GetMaxAttempts()
-		if strain && limit > 0 {
-			limit = max(limit, beh.GetMaxStrainAttempts())
-		}
-		if limit > 0 && info.Ref.Attempt >= limit {
-			f.Result = store.ResultFailed
-			break
+		limit, attempt := beh.GetMaxAttempts(), info.Ref.Attempt
+		if strain {
+			// Two budgets: the strain attempts (this one included) against
+			// max_strain_attempts, the others against max_attempts. What max_attempts
+			// alone would not allow is granted by the strain budget, and the store ends
+			// it when the queue has been at its ceiling for too long.
+			if limit > 0 && info.StrainAttempts+1 >= max(limit, beh.GetMaxStrainAttempts()) {
+				f.Result = store.ResultFailed
+				break
+			}
+			f.Extended = limit > 0 && attempt >= limit
+		} else {
+			f.Answered = f.Block == 0 && fetch.GetHttpStatus() > 0
+			if limit > 0 && attempt-min(info.StrainAttempts, attempt) >= limit {
+				f.Result = store.ResultFailed
+				break
+			}
 		}
 		f.Result = store.ResultRetry
 		if o.GetRetryAfter() != nil {
@@ -473,6 +484,7 @@ func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.F
 		}
 	default:
 		f.Result = store.ResultFailed
+		f.Answered = f.Block == 0 && fetch.GetHttpStatus() > 0
 	}
 	return f
 }

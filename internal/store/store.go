@@ -354,6 +354,9 @@ type LeaseInfo struct {
 	Fingerprint Fingerprint
 	Depth       uint32
 	Parent      TaskID
+	// StrainAttempts is how many earlier attempts of the task ended in a retry with
+	// strain. Attempt minus StrainAttempts is what max_attempts is judged against.
+	StrainAttempts uint32
 }
 
 // FinishSource says who ends an attempt, which decides how the lease is checked.
@@ -390,10 +393,18 @@ type Finish struct {
 	Block   time.Duration // > 0: block the task's queue for all runs
 	// Strain says the attempt failed for a reason that is a sign of strain on the
 	// site. The store moves the queue's adaptive state with it, in the same
-	// transaction. A successful attempt without it is a step back towards the policy's
-	// rate; the other results change nothing.
+	// transaction, and counts the attempt as a strain attempt of the task when it is
+	// retried.
 	Strain bool
-	Record AttemptRecord
+	// Answered says the site answered, and not with a sign of strain: a success, a
+	// 404, any outcome that carries an HTTP answer. It is a step back towards the
+	// policy's rate. Neither flag set changes nothing.
+	Answered bool
+	// Extended says a Retry is granted only by the task's strain budget, past what
+	// max_attempts allows. The store turns it into a failure while the queue is in an
+	// outage (sched.Adaptive.Outage).
+	Extended bool
+	Record   AttemptRecord
 }
 
 // AttemptRecord is what is kept about one finished attempt.

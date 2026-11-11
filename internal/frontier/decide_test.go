@@ -59,9 +59,10 @@ func TestQueueBlockCeiling(t *testing.T) {
 	}
 }
 
-// TestStrainRetries: a failure that is a sign of strain is judged against
-// max_strain_attempts, not max_attempts, while adaptive pacing is on; with it off the
-// signal means nothing, and a task that was handed back is never a sign of strain.
+// TestStrainRetries: a task has two budgets. Failures that are signs of strain count
+// against max_strain_attempts, the others against max_attempts, whatever came before;
+// with adaptive pacing off the signal means nothing, and a task that was handed back is
+// never a sign of strain.
 func TestStrainRetries(t *testing.T) {
 	pol, err := policy.Parse([]byte(`{"policies": [
 		{"name": "default", "behaviour": {"maxAttempts": 3, "maxStrainAttempts": 6}},
@@ -77,24 +78,62 @@ func TestStrainRetries(t *testing.T) {
 	strained := &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_503", Strain: true}
 	plain := &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "parse"}
 	cases := []struct {
-		name    string
-		queue   store.QueueKey
-		o       *taskv1.Outcome
-		attempt uint32
-		result  store.TaskResult
-		strain  bool
+		name     string
+		queue    store.QueueKey
+		o        *taskv1.Outcome
+		attempt  uint32
+		strained uint32 // earlier attempts that ended with strain
+		result   store.TaskResult
+		strain   bool
+		extended bool
 	}{
-		{"strain: past max_attempts", "a.example", strained, 5, store.ResultRetry, true},
-		{"strain: the ceiling ends it", "a.example", strained, 6, store.ResultFailed, true},
-		{"no strain: max_attempts", "a.example", plain, 3, store.ResultFailed, false},
-		{"adaptive off: the signal is ignored", "fixed.example", strained, 3, store.ResultFailed, false},
-		{"the ceiling is never below max_attempts", "short.example", strained, 2, store.ResultRetry, true},
-		{"handed back", "a.example", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RELEASED, Code: "shutdown", Strain: true}, 1, store.ResultReleased, false},
+		{"strain, first attempt", "a.example", strained, 1, 0, store.ResultRetry, true, false},
+		{"strain: past max_attempts is the extended budget", "a.example", strained, 5, 4, store.ResultRetry, true, true},
+		{"strain: the budget ends it", "a.example", strained, 6, 5, store.ResultFailed, true, false},
+		{"no strain: max_attempts", "a.example", plain, 3, 0, store.ResultFailed, false, false},
+		{"a 500 after four strain attempts is the first of its own", "a.example", plain, 5, 4, store.ResultRetry, false, false},
+		{"and the third of its own ends the task", "a.example", plain, 7, 4, store.ResultFailed, false, false},
+		{"adaptive off: the signal is ignored", "fixed.example", strained, 3, 0, store.ResultFailed, false, false},
+		{"the budget is never below max_attempts", "short.example", strained, 2, 0, store.ResultRetry, true, false},
+		{"handed back", "a.example", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RELEASED, Code: "shutdown", Strain: true}, 1, 0, store.ResultReleased, false, false},
 	}
 	for _, c := range cases {
-		f := s.decide(store.LeaseInfo{Queue: c.queue, Ref: store.LeaseRef{Attempt: c.attempt}}, c.o, nil)
-		if f.Result != c.result || f.Strain != c.strain {
-			t.Errorf("%s: result %v strain %v, want %v %v", c.name, f.Result, f.Strain, c.result, c.strain)
+		f := s.decide(store.LeaseInfo{Queue: c.queue, Ref: store.LeaseRef{Attempt: c.attempt}, StrainAttempts: c.strained}, c.o, nil)
+		if f.Result != c.result || f.Strain != c.strain || f.Extended != c.extended {
+			t.Errorf("%s: result %v strain %v extended %v, want %v %v %v", c.name, f.Result, f.Strain, f.Extended, c.result, c.strain, c.extended)
+		}
+	}
+}
+
+// TestAnsweredOutcomes: an outcome with an answer from the site and no sign of strain
+// is a step back to the policy's rate; one without an answer, or that blocks the queue,
+// is not.
+func TestAnsweredOutcomes(t *testing.T) {
+	pol, err := policy.Parse([]byte(`{"policies": [{"name": "default"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Config{Store: memstore.New(pol), Policies: pol})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := func(code uint32) *taskv1.FetchInfo { return &taskv1.FetchInfo{HttpStatus: code} }
+	cases := []struct {
+		name  string
+		o     *taskv1.Outcome
+		fetch *taskv1.FetchInfo
+		want  bool
+	}{
+		{"success", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_SUCCESS}, status(200), true},
+		{"a 404", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_FAILED, Code: "http_404"}, status(404), true},
+		{"a 500 that is no strain", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_500"}, status(500), true},
+		{"a retry without an answer", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "panic"}, nil, false},
+		{"strain", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_503", Strain: true}, status(503), false},
+		{"a block", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_429", BlockQueueFor: durationpb.New(time.Minute)}, status(429), false},
+	}
+	for _, c := range cases {
+		if got := s.decide(store.LeaseInfo{Queue: "a.example", Ref: store.LeaseRef{Attempt: 1}}, c.o, c.fetch).Answered; got != c.want {
+			t.Errorf("%s: answered = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

@@ -40,6 +40,7 @@ var (
 			MaxInterval:    durationpb.New(time.Minute),
 			DecreaseFactor: new(0.5),
 			RecoveryStep:   new(0.1),
+			MaxOutage:      durationpb.New(10 * time.Minute),
 		},
 	}
 	defaultBehaviour = &policyv1.Behaviour{
@@ -278,7 +279,7 @@ func ToLimits(l *policyv1.QueueLimits) store.Limits {
 // scheduling form.
 func ToAdaptive(a *policyv1.AdaptiveLimits) sched.Adaptive {
 	return sched.Adaptive{Enabled: a.GetEnabled(), MaxInterval: a.GetMaxInterval().AsDuration(),
-		Decrease: a.GetDecreaseFactor(), Recovery: a.GetRecoveryStep()}
+		Decrease: a.GetDecreaseFactor(), Recovery: a.GetRecoveryStep(), MaxOutage: a.GetMaxOutage().AsDuration()}
 }
 
 // Match reports whether a glob matches a queue key. "*" matches any run of characters;
@@ -363,6 +364,9 @@ func validateAdaptive(a *policyv1.AdaptiveLimits) error {
 	if a.GetMaxInterval() != nil && a.GetMaxInterval().AsDuration() <= 0 {
 		return errors.New("adaptive.max_interval must be positive")
 	}
+	if a.GetMaxOutage() != nil && a.GetMaxOutage().AsDuration() <= 0 {
+		return errors.New("adaptive.max_outage must be positive")
+	}
 	if a.DecreaseFactor != nil && (a.GetDecreaseFactor() <= 0 || a.GetDecreaseFactor() >= 1) {
 		return errors.New("adaptive.decrease_factor must be between 0 and 1, exclusive")
 	}
@@ -397,6 +401,9 @@ func mergeLimits(dst, src *policyv1.QueueLimits, name string, prov map[string]st
 		}
 		if a.MaxInterval != nil {
 			dst.Adaptive.MaxInterval, prov["limits.adaptive.max_interval"] = a.MaxInterval, name
+		}
+		if a.MaxOutage != nil {
+			dst.Adaptive.MaxOutage, prov["limits.adaptive.max_outage"] = a.MaxOutage, name
 		}
 		if a.DecreaseFactor != nil {
 			dst.Adaptive.DecreaseFactor, prov["limits.adaptive.decrease_factor"] = new(a.GetDecreaseFactor()), name

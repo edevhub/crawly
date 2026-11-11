@@ -71,8 +71,8 @@ func TestClassify(t *testing.T) {
 			t.Errorf("%s: got kind %d code %q", c.name, e.Kind, e.Code)
 		}
 	}
-	if e := classify(context.DeadlineExceeded); !e.Strain {
-		t.Error("a timeout is a sign of strain")
+	if e := classify(context.DeadlineExceeded); e.Strain {
+		t.Error("a handler that ran out of time says nothing about a site")
 	}
 }
 

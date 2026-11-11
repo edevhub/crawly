@@ -2,14 +2,18 @@ package worker
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -181,7 +185,8 @@ func TestHTTPStrainSignal(t *testing.T) {
 	}
 }
 
-// TestHTTPStrainOnTransportFailures: a timeout and a refused connection are signs of strain.
+// TestHTTPStrainOnTransportFailures: a timeout and a refused connection are signs of
+// strain on the site.
 func TestHTTPStrainOnTransportFailures(t *testing.T) {
 	slow := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
 	defer slow.Close()
@@ -196,6 +201,57 @@ func TestHTTPStrainOnTransportFailures(t *testing.T) {
 	_, err = HTTP(&echo{}).Handle(context.Background(), get(dead.URL))
 	if e := failure(t, err, KindRetry, "fetch_error"); !e.Strain {
 		t.Error("a refused connection must signal strain")
+	}
+}
+
+// TestHTTPNoStrainOnLocalFailures: what goes wrong on the worker's side must not slow a
+// queue down for every run and every other worker.
+func TestHTTPNoStrainOnLocalFailures(t *testing.T) {
+	// A name that does not resolve.
+	_, err := HTTP(&echo{}).Handle(context.Background(), get("http://no-such-host.invalid/"))
+	if e := failure(t, err, KindRetry, "fetch_error"); e.Strain {
+		t.Errorf("a name that does not resolve is no sign of strain: %v", err)
+	}
+	// A certificate that does not verify.
+	tls := httptest.NewTLSServer(http.NotFoundHandler())
+	defer tls.Close()
+	_, err = HTTP(&echo{}).Handle(context.Background(), get(tls.URL))
+	if e := failure(t, err, KindRetry, "fetch_error"); e.Strain {
+		t.Errorf("a certificate that does not verify is no sign of strain: %v", err)
+	}
+	// A request cancelled from this side (a shutdown, a revoked lease).
+	hang := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	defer hang.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	_, err = HTTP(&echo{}).Handle(ctx, get(hang.URL))
+	if e := failure(t, err, KindRetry, "fetch_error"); e.Strain {
+		t.Errorf("a cancelled request is no sign of strain: %v", err)
+	}
+}
+
+func TestSiteTrouble(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"timeout", context.DeadlineExceeded, true},
+		{"refused", &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}, true},
+		{"reset", &net.OpError{Op: "read", Err: os.NewSyscallError("read", syscall.ECONNRESET)}, true},
+		{"closed without an answer", fmt.Errorf("Get: %w", io.EOF), true},
+		{"dns", &net.DNSError{Err: "no such host", Name: "x.invalid"}, false},
+		{"dns timeout", &net.DNSError{Err: "i/o timeout", IsTimeout: true}, false},
+		{"proxy", &net.OpError{Op: "proxyconnect", Err: syscall.ECONNREFUSED}, false},
+		{"certificate", x509.UnknownAuthorityError{}, false},
+		{"out of descriptors", &net.OpError{Op: "dial", Err: os.NewSyscallError("socket", syscall.EMFILE)}, false},
+		{"cancelled", context.Canceled, false},
+		{"something else", errors.New("odd"), false},
+	}
+	for _, c := range cases {
+		if got := siteTrouble(c.err); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 

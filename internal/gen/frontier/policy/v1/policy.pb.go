@@ -254,14 +254,16 @@ func (x *QueueLimits) GetAdaptive() *AdaptiveLimits {
 
 // Adaptive pacing of a queue (AIMD on its rate). A task outcome that carries
 // Outcome.strain cuts the queue's rate by decrease_factor, down to max_interval; each
-// later success raises it again by recovery_step of the policy's rate, up to the
-// policy's rate. At most one step is taken per epoch: an outcome counts only if its
-// attempt was dispatched after the last step, so a burst of requests that fail together
-// is one step. While the queue is slower than its limits, one request is in flight at a
-// time, and the interval applies to run limits that replace the queue's as well: a run
-// can be slower than the queue but not faster than the site allows. The state is the
-// queue's, shared by all runs and replicas. It is inert on a queue without a rate limit.
-// Unset fields inherit; with nothing configured it is on.
+// later answer from the site without strain raises it again by recovery_step of the
+// policy's rate, up to the policy's rate. At most one step is taken per epoch: an
+// outcome counts only if its attempt was dispatched after the last step, so a burst of
+// requests that fail together is one step. While the queue is slower than its limits,
+// its concurrency and burst come down in the same proportion as its rate (at least 1).
+// The interval and the concurrency apply to run limits that replace the queue's as well,
+// and the run is admitted against the queue's state too: a run can be slower than the
+// queue but not faster than the site allows. The state is the queue's, shared by all
+// runs and replicas. It is inert on a queue without a rate limit. Unset fields inherit;
+// with nothing configured it is on.
 type AdaptiveLimits struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// false switches it off for the queue. Default true.
@@ -273,7 +275,12 @@ type AdaptiveLimits struct {
 	DecreaseFactor *float64 `protobuf:"fixed64,3,opt,name=decrease_factor,json=decreaseFactor,proto3,oneof" json:"decrease_factor,omitempty"`
 	// Share of the policy's rate that is added back on a recovery step, in (0, 1].
 	// Default 0.1.
-	RecoveryStep  *float64 `protobuf:"fixed64,4,opt,name=recovery_step,json=recoveryStep,proto3,oneof" json:"recovery_step,omitempty"`
+	RecoveryStep *float64 `protobuf:"fixed64,4,opt,name=recovery_step,json=recoveryStep,proto3,oneof" json:"recovery_step,omitempty"`
+	// How long the queue may sit at its ceiling before the site counts as down: from then
+	// on a task that fails with strain is judged against max_attempts again, not
+	// max_strain_attempts. It is also how long a slowdown that nothing touches lasts before
+	// it is forgotten. Default 10m.
+	MaxOutage     *durationpb.Duration `protobuf:"bytes,5,opt,name=max_outage,json=maxOutage,proto3" json:"max_outage,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -336,6 +343,13 @@ func (x *AdaptiveLimits) GetRecoveryStep() float64 {
 	return 0
 }
 
+func (x *AdaptiveLimits) GetMaxOutage() *durationpb.Duration {
+	if x != nil {
+		return x.MaxOutage
+	}
+	return nil
+}
+
 type Behaviour struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MaxAttempts   *uint32                `protobuf:"varint,1,opt,name=max_attempts,json=maxAttempts,proto3,oneof" json:"max_attempts,omitempty"`
@@ -351,10 +365,11 @@ type Behaviour struct {
 	// the global policies only, and a run that sets it is rejected. Must be positive.
 	// Default 24h.
 	MaxQueueBlock *durationpb.Duration `protobuf:"bytes,8,opt,name=max_queue_block,json=maxQueueBlock,proto3" json:"max_queue_block,omitempty"`
-	// Attempts a task gets when its failures are signs of strain on the site
-	// (Outcome.strain), instead of max_attempts: the queue is slowed down meanwhile, so
-	// these failures say little about the task. Never less than max_attempts. Has no
-	// effect on a queue whose adaptive limits are off. Default 10.
+	// Attempts a task gets for failures that are signs of strain on the site
+	// (Outcome.strain), on top of max_attempts for the others: the queue is slowed down
+	// meanwhile, so these failures say little about the task. Never less than
+	// max_attempts. Has no effect on a queue whose adaptive limits are off, and ends once
+	// the queue has been at its ceiling for adaptive.max_outage. Default 10.
 	MaxStrainAttempts *uint32 `protobuf:"varint,9,opt,name=max_strain_attempts,json=maxStrainAttempts,proto3,oneof" json:"max_strain_attempts,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
@@ -678,12 +693,14 @@ const file_crawly_frontier_policy_v1_policy_proto_rawDesc = "" +
 	"\badaptive\x18\x05 \x01(\v2).crawly.frontier.policy.v1.AdaptiveLimitsR\badaptiveB\x12\n" +
 	"\x10_max_concurrencyB\x12\n" +
 	"\x10_rate_per_secondB\b\n" +
-	"\x06_burst\"\xf7\x01\n" +
+	"\x06_burst\"\xb1\x02\n" +
 	"\x0eAdaptiveLimits\x12\x1d\n" +
 	"\aenabled\x18\x01 \x01(\bH\x00R\aenabled\x88\x01\x01\x12<\n" +
 	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\x12,\n" +
 	"\x0fdecrease_factor\x18\x03 \x01(\x01H\x01R\x0edecreaseFactor\x88\x01\x01\x12(\n" +
-	"\rrecovery_step\x18\x04 \x01(\x01H\x02R\frecoveryStep\x88\x01\x01B\n" +
+	"\rrecovery_step\x18\x04 \x01(\x01H\x02R\frecoveryStep\x88\x01\x01\x128\n" +
+	"\n" +
+	"max_outage\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\tmaxOutageB\n" +
 	"\n" +
 	"\b_enabledB\x12\n" +
 	"\x10_decrease_factorB\x10\n" +
@@ -752,24 +769,25 @@ var file_crawly_frontier_policy_v1_policy_proto_depIdxs = []int32{
 	8,  // 3: crawly.frontier.policy.v1.QueueLimits.min_delay:type_name -> google.protobuf.Duration
 	3,  // 4: crawly.frontier.policy.v1.QueueLimits.adaptive:type_name -> crawly.frontier.policy.v1.AdaptiveLimits
 	8,  // 5: crawly.frontier.policy.v1.AdaptiveLimits.max_interval:type_name -> google.protobuf.Duration
-	5,  // 6: crawly.frontier.policy.v1.Behaviour.backoff:type_name -> crawly.frontier.policy.v1.Backoff
-	8,  // 7: crawly.frontier.policy.v1.Behaviour.fetch_timeout:type_name -> google.protobuf.Duration
-	8,  // 8: crawly.frontier.policy.v1.Behaviour.lease_duration:type_name -> google.protobuf.Duration
-	8,  // 9: crawly.frontier.policy.v1.Behaviour.max_lease_duration:type_name -> google.protobuf.Duration
-	8,  // 10: crawly.frontier.policy.v1.Behaviour.task_ttl:type_name -> google.protobuf.Duration
-	8,  // 11: crawly.frontier.policy.v1.Behaviour.max_queue_block:type_name -> google.protobuf.Duration
-	8,  // 12: crawly.frontier.policy.v1.Backoff.initial:type_name -> google.protobuf.Duration
-	8,  // 13: crawly.frontier.policy.v1.Backoff.max:type_name -> google.protobuf.Duration
-	2,  // 14: crawly.frontier.policy.v1.RunPolicy.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
-	4,  // 15: crawly.frontier.policy.v1.RunPolicy.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
-	7,  // 16: crawly.frontier.policy.v1.RunPolicy.overrides:type_name -> crawly.frontier.policy.v1.RunQueueOverride
-	2,  // 17: crawly.frontier.policy.v1.RunQueueOverride.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
-	4,  // 18: crawly.frontier.policy.v1.RunQueueOverride.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
-	19, // [19:19] is the sub-list for method output_type
-	19, // [19:19] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	8,  // 6: crawly.frontier.policy.v1.AdaptiveLimits.max_outage:type_name -> google.protobuf.Duration
+	5,  // 7: crawly.frontier.policy.v1.Behaviour.backoff:type_name -> crawly.frontier.policy.v1.Backoff
+	8,  // 8: crawly.frontier.policy.v1.Behaviour.fetch_timeout:type_name -> google.protobuf.Duration
+	8,  // 9: crawly.frontier.policy.v1.Behaviour.lease_duration:type_name -> google.protobuf.Duration
+	8,  // 10: crawly.frontier.policy.v1.Behaviour.max_lease_duration:type_name -> google.protobuf.Duration
+	8,  // 11: crawly.frontier.policy.v1.Behaviour.task_ttl:type_name -> google.protobuf.Duration
+	8,  // 12: crawly.frontier.policy.v1.Behaviour.max_queue_block:type_name -> google.protobuf.Duration
+	8,  // 13: crawly.frontier.policy.v1.Backoff.initial:type_name -> google.protobuf.Duration
+	8,  // 14: crawly.frontier.policy.v1.Backoff.max:type_name -> google.protobuf.Duration
+	2,  // 15: crawly.frontier.policy.v1.RunPolicy.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
+	4,  // 16: crawly.frontier.policy.v1.RunPolicy.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
+	7,  // 17: crawly.frontier.policy.v1.RunPolicy.overrides:type_name -> crawly.frontier.policy.v1.RunQueueOverride
+	2,  // 18: crawly.frontier.policy.v1.RunQueueOverride.limits:type_name -> crawly.frontier.policy.v1.QueueLimits
+	4,  // 19: crawly.frontier.policy.v1.RunQueueOverride.behaviour:type_name -> crawly.frontier.policy.v1.Behaviour
+	20, // [20:20] is the sub-list for method output_type
+	20, // [20:20] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_crawly_frontier_policy_v1_policy_proto_init() }

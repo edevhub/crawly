@@ -370,6 +370,8 @@ type Finish struct {
 	RetryIn time.Duration // Retry only: not before now+RetryIn
 	Block   time.Duration // > 0: block the task's queue for all runs, extending any block
 	Strain  bool          // the failure is a sign of strain on the site (adaptive pacing)
+	Answered bool         // the site answered, with no sign of strain: a step back to the policy's rate
+	Extended bool         // the retry is granted only by the strain budget; ended by an outage
 	Record  AttemptRecord // outcome code and message, fetch info, worker, policy set hash
 }
 ```
@@ -446,68 +448,95 @@ other runs for nine hours after it stopped.
 
 ### Adaptive pacing
 
-A rate that policy fixes does not follow the site. A site that answers 503, resets
-connections or times out is asked at the full rate, and a task that meets such failures
-uses up its attempts on its own clock. The queue therefore adapts its rate, by AIMD, to
-what the spiders report.
+A rate that policy fixes does not follow the site. A site that answers 503 or times out
+is asked at the full rate, and a task that meets such failures uses up its attempts on its
+own clock. The queue therefore adapts its rate, by AIMD, to what the spiders report.
 
-**Signal.** An outcome carries `strain` when its failure is a sign of strain on the
-site: a 502, 503 or 504, a 429 without `Retry-After`, a timeout, a failed connection. The
-spider classifies, as for everything else; the HTTP adapter of the SDK sets it for those
-statuses and errors, and a spider that fetches by itself sets it with `worker.Strain()`. A
-429 with `Retry-After` blocks the queue instead: the site said how long to wait. `strain`
-means nothing on a `RELEASED` outcome and on a lease that expired.
+**Signal.** An outcome carries `strain` when its failure says the *site* is in trouble: a
+502, 503 or 504, a 429 without `Retry-After`, a request that timed out, a connection the
+site refused or reset or closed without an answer. The spider classifies, as for
+everything else. The HTTP adapter of the SDK sets it for those cases only. It does not
+for failures on the worker's side: a name that does not resolve, a proxy, a certificate
+that does not verify, no file descriptors left, a request cancelled by a shutdown, a
+handler that ran out of time. Such a failure would slow every queue a worker touches for
+every run, and a worker that fails fast takes more tasks than the others. A spider that
+fetches by itself sets it with `worker.Strain()`; it is a privilege that affects every
+run on the queue. `strain` means nothing on a `RELEASED` outcome and on a lease that
+expired. A 429 with `Retry-After` blocks the queue instead: the site said how long to
+wait.
 
 **State.** The queue keeps `interval`, the interval it is slowed to (zero: it runs at its
-policy's rate), and `epoch`, the time of its last step in either direction. They change in
-the same transaction as the outcome that causes the step, under the queue's lock, so every
-run and every replica sees one state.
+policy's rate), `epoch`, the time of its last step in either direction, `ceiling_at`, since
+when the interval is at its ceiling, and the time of the last strain. They change in the
+same transaction as the outcome that causes the step, under the queue's lock, so every run
+and every replica sees one state.
 
 **Policy.** `QueueLimits.adaptive` holds `max_interval` (the slowest interval, default
-1 minute), `decrease_factor` (default ½), `recovery_step` (default 0.1) and `enabled`
-(default on). It belongs to the queue: global policies set it, a run that sets it is
-rejected. A queue whose policy has no rate limit (`T = 0`) has nothing to slow, and a queue
-whose own interval is above `max_interval` is not slowed. Let `T₀` be the queue's interval
-under its policy.
+1 minute), `decrease_factor` (default ½), `recovery_step` (default 0.1), `max_outage`
+(default 10 minutes) and `enabled` (default on). It belongs to the queue: global policies
+set it, a run that sets it is rejected. A queue whose policy has no rate limit (`T = 0`)
+has nothing to slow, and a queue whose own interval is above `max_interval` is not slowed.
+Let `T₀` be the queue's interval under its policy.
 
 **Steps.** At most one step per epoch: an outcome counts only if its attempt was
 dispatched at or after `epoch`. Requests that fail together are one step, and a request
-sent before a step, whose answer says nothing about the pace the step set, takes none.
+sent before a step, whose answer says nothing about the pace the step set, takes none. A
+single worker's strained outcome is enough for a step: the narrow signal and the epoch rule
+are what bound a worker that is wrong.
 
 - *Strain:* the rate is multiplied by `decrease_factor`: `T ← min(T / decrease_factor,
   max(max_interval, T₀))`. `epoch = now`, and `tat = max(tat, now + T)`, so the next
-  request waits a whole new interval, counted from the failure.
-- *Success* (without `strain`) while slowed: the rate grows by `recovery_step` of the
-  policy's rate: `1/T ← 1/T + recovery_step/T₀`. At `T ≤ T₀` the queue is back at its
-  policy and the state is cleared. `epoch = now`. Recovery is linear where the decrease is
-  geometric. Failures that are not signs of strain, and permanent failures, change
+  request waits a whole new interval, counted from the failure. The same holds for the
+  `own_tat` of runs with limits of their own.
+- *Answer without strain* while slowed: the rate grows by `recovery_step` of the policy's
+  rate: `1/T ← 1/T + recovery_step/T₀`. At `T ≤ T₀` the queue is back at its policy and the
+  state is cleared. `epoch = now`. Recovery is linear where the decrease is geometric. An
+  answer is an outcome with an HTTP answer that is no sign of strain and no queue block: a
+  success, a 404, a failure of the spider's parser. An outcome without an answer changes
   nothing.
+- *Forgetting:* a slowdown that no step and no strain outcome has touched for
+  `max_outage` is cleared, so an idle queue does not start its next run at the pace of an
+  old outage. Switching adaptive pacing off clears it at the next outcome.
 
-**Limits in force.** While `T > T₀` the limits are `T` as the interval, a burst of 1 and
-a concurrency of 1: at a rate cut for a failing site, requests that are already waiting
-on it must not pile up, and the success that recovers the rate needs one request to have
-finished. A run with limits of its own is held to the same: the interval in force is the
-longer of the run's and the queue's current one, and the concurrency and burst drop too
-when the queue's is the longer. A run can be slower than the queue, not faster than the
-site allows. A queue block still stops every run.
+**Limits in force.** While `T > T₀` the interval is `T`, and concurrency and burst are
+scaled by `T₀ / T` (rounded up for concurrency, down for burst, at least 1; no
+concurrency limit stays none). A cut in rate is then a cut of the same size for a queue
+that is bound by latency, and one request at a time is reached only near the ceiling. A run
+with limits of its own is held to the same: the interval in force is the longer of the
+run's and the queue's current one, and the run is admitted against the queue's state as
+well as its own, so runs with limits of their own do not add up to more than the queue
+allows. A run can be slower than the queue, not faster than the site allows. A queue block
+still stops every run.
 
-**Retries.** A task that failed with `strain` is judged against `max_strain_attempts`
-(default 10, never below `max_attempts`) instead of `max_attempts`: while the queue is
-slowed, the failures of one task say little about the task, and the task waits for the
-queue's pace like every other. The bound is the attempt count, so a site that stays down
-ends its tasks, after more attempts and at a slower pace. A retried task rejoins its
-backlog after its policy backoff and is picked like any other, so a task with an early place
-in its backlog can take several of the few attempts a long outage allows. With adaptive
-pacing off, `strain` is ignored and `max_attempts` applies.
+**Retries.** A task has two budgets. Failures with `strain` count against
+`max_strain_attempts` (default 10, never below `max_attempts`), the others against
+`max_attempts`, whatever came before: a 500 after four 503s is the first failure of its
+own. The task's strain attempts are kept with the task; the attempt history is kept
+whole. The task waits for the queue's pace like every other: it rejoins its backlog after
+its policy backoff and is picked like any other, so a task with an early place in its
+backlog can take several of the few attempts a long outage allows. A strain retry that
+`max_attempts` alone would not allow is *extended*. While the queue has sat at its ceiling
+for `max_outage` the site is down, not struggling: an extended retry then fails the task,
+and strain failures count against `max_attempts` again. With adaptive pacing off, `strain`
+is ignored and `max_attempts` applies.
+
+What a site that stays down costs: once at the ceiling `C` with one request in flight, the
+queue dispatches one task per `C`. A backlog of `N` tasks drains in about
+`N · max_attempts · C` after `max_outage`, `N · max_strain_attempts · C` before it. The
+levers are `max_interval`, `max_attempts`, `task_ttl` and the run's deadline; a queue
+block empties nothing. Failures that are not the site's (a name that does not resolve)
+carry no strain and drain at the policy's rate as before.
 
 **Reset.** Lifting the block of a queue (`BlockQueue` with no time) also resets the
 slowdown and cancels the wait it caused. The operator sees `interval`, the number of
 steps and the time of the last strain with the queue's limiter state.
 
-**Limitations.** Recovery needs a successful request, so a queue that is slowed and idle
-stays slowed until its next success. A queue is slowed by the failures of any run, and
-leaves the slowdown by the successes of any run. A strain signal on a success (slow
-answers) is not set by the SDK; the outcome may carry it, and it counts as a strain step.
+**Limitations.** A queue is slowed by the failures of any run and leaves the slowdown by
+the answers of any run. A strain signal on a success (slow answers) is not set by the SDK;
+the outcome may carry it, and it counts as a strain step. The reset is bound to the
+unblock: there is no way to hold a queue slow or to reset it without lifting a block.
+Epochs compare the store clock's transaction start times, so a failure that commits in the
+instant between a dispatch and its lock can cost one recovery round.
 
 Politeness is guaranteed at dispatch time, by the store clock. With no prefetch and one
 stream message per assignment, the time between dispatch and fetch varies by milliseconds;
@@ -755,8 +784,8 @@ supports it. Each one names the rule it proves:
 | Two runs with different limits on one queue: the queue's rate stays within its limits, `tat` never goes backwards | Shared politeness |
 | A run with a looser override exceeds the queue limit for itself; other runs back off while it runs and resume within one interval after it stops | Override replaces, still counts, capped |
 | A block stops every run on the queue, including overridden ones | Blocks |
-| Strain halves the queue's rate up to the ceiling, successes restore it, requests that fail together are one step, and one request is in flight at a time while slowed | Adaptive pacing |
-| A run with limits of its own is held to the queue's slowed interval; with adaptive pacing off, strain changes nothing; lifting the block resets the slowdown | Adaptive pacing |
+| Strain halves the queue's rate up to the ceiling, answers without strain restore it, requests that fail together are one step, and the next request waits a whole new interval from the failure | Adaptive pacing |
+| Runs with limits of their own are held to the queue's slowed state, together; with adaptive pacing off, strain changes nothing; lifting the block resets the slowdown; an idle slowdown is forgotten; strain attempts are counted apart and end with an outage | Adaptive pacing |
 | Run A on 500 queues and run B on one shared queue, equal weights: B gets 50% ± 10% of the shared queue over a minute | Per-queue fairness |
 | A backlog idle, paused, or held back by a far `not_before` while another advances by 10,000 dispatches gets ≤ its fair share when it becomes eligible | No banked credit |
 | Two runs of equal weight in different pools on one queue, both pools with free slots: each gets 50% ± 10%. With no free slot in one pool, the other keeps the queue's rate less the refusal period per forfeited turn | Fairness across pools |

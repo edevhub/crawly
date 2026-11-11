@@ -169,6 +169,7 @@ CREATE TABLE queues (
   strain_at        timestamptz,                                 -- start of the current epoch
   strain_steps     bigint        NOT NULL DEFAULT 0,
   last_strain_at   timestamptz,
+  ceiling_at       timestamptz,                                 -- since when the interval is at its ceiling
   last_used_at  timestamptz      NOT NULL DEFAULT now()         -- for cleanup
 );
 
@@ -254,6 +255,7 @@ CREATE TABLE tasks (
   parent_task_id   uuid,
   parent_bucket    smallint,                         -- the bucket in the parent's task_id
   attempt          int         NOT NULL DEFAULT 0,
+  strain_attempts  int         NOT NULL DEFAULT 0,    -- attempts that ended in a retry with strain
   lease_nonce      bigint,
   worker_id        text,
   worker_version   text,
@@ -563,11 +565,16 @@ Used for worker completions (`Source = Worker`) and the reaper (`Source = Reaper
 6. **Queue:** `in_flight -= 1`; if `Block > 0`:
    `blocked_until = greatest(blocked_until, now() + $block)`, `block_reason = $code`.
    The adaptive state moves with the outcome (ADR 0001, Adaptive pacing), in the same
-   row update: a `Strain` outcome takes a strain step (`slow_interval_ns`, `strain_at`,
-   `strain_steps`, and `tat = greatest(tat, now() + interval)`); a success takes a
-   recovery step. `last_strain_at` is set for every `Strain` outcome. Both compare the
-   attempt's `dispatched_at` with `strain_at`, which the task row already has. When the
-   interval got shorter, the `ready_at` of the locked backlogs that wait for a time is
+   row update: it is decayed and, when adaptive pacing is off, cleared; a `Strain` outcome
+   takes a strain step (`slow_interval_ns`, `strain_at`, `ceiling_at`, `strain_steps`,
+   `tat = greatest(tat, now() + interval)`, and the same for the `own_tat` of the locked
+   backlogs of runs with limits of their own); an `Answered` outcome takes a recovery step.
+   `last_strain_at` is set for every `Strain` outcome. Both compare the attempt's
+   `dispatched_at` with `strain_at`, which the task row already has. An `Extended` retry
+   becomes a failure while the queue has been at its ceiling for the policy's
+   `max_outage`. A retry with `Strain` adds one to `tasks.strain_attempts`, which the
+   lease context carries to the core. When the interval got shorter, the `ready_at` of the
+   locked backlogs that wait for a time is
    lowered to their new admission time: a value computed for the longer interval would be
    late.
 7. **Backlog** of the task: `in_flight -= 1`, result counter `+= 1`, `queue_blocks += 1` if

@@ -179,8 +179,10 @@ The codes end up in the run's stats (`Stats.ByCode`), so they are what you alert
 
 The HTTP adapter classifies responses itself: 2xx is parsed, 429 retries and blocks the
 site for the `Retry-After` delay (without one it signals strain, see Policies), 502, 503
-and 504 retry and signal strain, 408 and the other 5xx retry, other statuses fail, timeouts
-and failed connections retry and signal strain, and a redirect is
+and 504 retry and signal strain, 408 and the other 5xx retry, other statuses fail, request
+timeouts and connections the site refused, reset or closed retry and signal strain (a name
+that does not resolve, a proxy or certificate error and a cancelled request retry without
+it), and a redirect is
 not followed: its target is added as a new task, so that the Frontier paces and deduplicates
 it like any other page. A parser can still return
 `worker.Retry` or `worker.Fail` for a 2xx page, for example a captcha served with status 200.
@@ -375,16 +377,21 @@ These are the global policies. A run's own policy is given at `CreateRun` (see a
 ### Slowing down a site that is struggling
 
 A fixed rate does not follow the site. When a spider reports a failure as a sign of strain
-(the HTTP adapter does for 502, 503 and 504, a 429 without `Retry-After`, timeouts and
-failed connections; `worker.Strain()` does for a handler that fetches by itself), the site's
-queue halves its rate, down to one request a minute, and one request at a time is in flight
-while it is slowed. Requests that fail together are one step. Each success then raises the
-rate again by a tenth of the policy's rate, until the queue is back at the policy. A task
-that fails because of strain is given `maxStrainAttempts` attempts (10) instead of
-`maxAttempts`, so a site that was down for a while does not cost pages; a site that stays
-down still ends its tasks. The queue's state is shared by all runs and all Frontier
-replicas, and `GetQueue` shows it (`current_interval`, `strain_steps`, `last_strain_time`).
-`BlockQueue` with no time, the operator's unblock, resets it.
+on the site (the HTTP adapter does for 502, 503 and 504, a 429 without `Retry-After`, a
+request that timed out and a connection the site refused or reset; `worker.Strain()` does
+for a handler that fetches by itself), the site's queue halves its rate, down to one request
+a minute, and its concurrency and burst come down in the same proportion. Requests that fail
+together are one step. Each answer from the site that is no sign of strain (a success, a
+404) then raises the rate again by a tenth of the policy's rate, until the queue is back at
+the policy. A run's own limits do not escape it. A task keeps a budget of its own for such
+failures, `maxStrainAttempts` (10), next to `maxAttempts` for the others, so a site that was
+down for a while does not cost pages. Once the queue has sat at its ceiling for `maxOutage`
+(10 minutes) the site counts as down, and strain failures count against `maxAttempts`
+again. A site that stays down still takes a while to drain, about one task per ceiling
+interval: lower `maxInterval` or `maxAttempts` for sites where that is too slow. The queue's
+state is shared by all runs and all Frontier replicas, and `GetQueue` shows it
+(`current_interval`, `strain_steps`, `last_strain_time`). `BlockQueue` with no time, the
+operator's unblock, resets it; a slowdown nothing has touched for `maxOutage` is forgotten.
 
 It is on by default, and a global policy tunes or switches it off per site:
 
@@ -395,8 +402,14 @@ It is on by default, and a global policy tunes or switches it off per site:
 ```
 
 `"adaptive": {"enabled": false}` keeps the rate fixed. The settings belong to the site, so a
-run that sets `adaptive` is rejected. A run's own limits do not escape it: they are held to
-the queue's interval while it is slowed. A queue without a rate limit is never slowed.
+run that sets `adaptive` is rejected. A queue without a rate limit is never slowed.
+
+Upgrading: roll out the Frontier binaries before a policy file that names `adaptive` or
+`maxStrainAttempts` (an older Frontier rejects fields it does not know). Nothing changes
+for a queue until its workers run the new SDK, which is what sends the signal. From then on
+a default install slows a failing site as described, with a ceiling of one request a
+minute and 10 strain attempts per task. To keep the old behaviour everywhere, add
+`{"name": "no-adaptive", "limits": {"adaptive": {"enabled": false}}}` to the policies.
 
 A spider that finds the crawler blocked asks the Frontier to leave the site alone
 (`worker.Blocked(d)`, or `worker.BlockQueue(d)` on any outcome). One outcome blocks a site

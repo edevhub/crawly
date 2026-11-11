@@ -65,14 +65,16 @@ message QueueLimits {
 
 // Adaptive pacing of a queue (AIMD on its rate). A task outcome that carries
 // Outcome.strain cuts the queue's rate by decrease_factor, down to max_interval; each
-// later success raises it again by recovery_step of the policy's rate, up to the
-// policy's rate. At most one step is taken per epoch: an outcome counts only if its
-// attempt was dispatched after the last step, so a burst of requests that fail together
-// is one step. While the queue is slower than its limits, one request is in flight at a
-// time, and the interval applies to run limits that replace the queue's as well: a run
-// can be slower than the queue but not faster than the site allows. The state is the
-// queue's, shared by all runs and replicas. It is inert on a queue without a rate limit.
-// Unset fields inherit; with nothing configured it is on.
+// later answer from the site without strain raises it again by recovery_step of the
+// policy's rate, up to the policy's rate. At most one step is taken per epoch: an
+// outcome counts only if its attempt was dispatched after the last step, so a burst of
+// requests that fail together is one step. While the queue is slower than its limits,
+// its concurrency and burst come down in the same proportion as its rate (at least 1).
+// The interval and the concurrency apply to run limits that replace the queue's as well,
+// and the run is admitted against the queue's state too: a run can be slower than the
+// queue but not faster than the site allows. The state is the queue's, shared by all
+// runs and replicas. It is inert on a queue without a rate limit. Unset fields inherit;
+// with nothing configured it is on.
 message AdaptiveLimits {
   // false switches it off for the queue. Default true.
   optional bool enabled = 1;
@@ -84,6 +86,11 @@ message AdaptiveLimits {
   // Share of the policy's rate that is added back on a recovery step, in (0, 1].
   // Default 0.1.
   optional double recovery_step = 4;
+  // How long the queue may sit at its ceiling before the site counts as down: from then
+  // on a task that fails with strain is judged against max_attempts again, not
+  // max_strain_attempts. It is also how long a slowdown that nothing touches lasts before
+  // it is forgotten. Default 10m.
+  google.protobuf.Duration max_outage = 5;
 }
 
 message Behaviour {
@@ -101,10 +108,11 @@ message Behaviour {
   // the global policies only, and a run that sets it is rejected. Must be positive.
   // Default 24h.
   google.protobuf.Duration max_queue_block = 8;
-  // Attempts a task gets when its failures are signs of strain on the site
-  // (Outcome.strain), instead of max_attempts: the queue is slowed down meanwhile, so
-  // these failures say little about the task. Never less than max_attempts. Has no
-  // effect on a queue whose adaptive limits are off. Default 10.
+  // Attempts a task gets for failures that are signs of strain on the site
+  // (Outcome.strain), on top of max_attempts for the others: the queue is slowed down
+  // meanwhile, so these failures say little about the task. Never less than
+  // max_attempts. Has no effect on a queue whose adaptive limits are off, and ends once
+  // the queue has been at its ceiling for adaptive.max_outage. Default 10.
   optional uint32 max_strain_attempts = 9;
 }
 

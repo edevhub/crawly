@@ -603,15 +603,15 @@ func (b *brow) setReady(t time.Time) {
 // nil when another transaction holds the row.
 func lockQueue(ctx context.Context, tx pgx.Tx, key store.QueueKey, skipLocked bool) (*qrow, error) {
 	sql := `SELECT tat, in_flight, vclock, blocked_until, coalesce(block_reason, ''),
-		slow_interval_ns, strain_at, strain_steps, last_strain_at FROM queues WHERE key = $1 FOR NO KEY UPDATE`
+		slow_interval_ns, strain_at, strain_steps, last_strain_at, ceiling_at FROM queues WHERE key = $1 FOR NO KEY UPDATE`
 	if skipLocked {
 		sql += " SKIP LOCKED"
 	}
 	q := &qrow{key: key}
-	var tat, blocked, strainAt, lastStrain pgtype.Timestamptz
+	var tat, blocked, strainAt, lastStrain, ceiling pgtype.Timestamptz
 	var slow, steps int64
 	err := tx.QueryRow(ctx, sql, string(key)).Scan(&tat, &q.inFlight, &q.vclock, &blocked, &q.blockReason,
-		&slow, &strainAt, &steps, &lastStrain)
+		&slow, &strainAt, &steps, &lastStrain, &ceiling)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil //nolint:nilnil // no row is an answer here, not a failure
 	}
@@ -619,7 +619,8 @@ func lockQueue(ctx context.Context, tx pgx.Tx, key store.QueueKey, skipLocked bo
 		return nil, err
 	}
 	q.tat, q.blockedUntil = timeOf(tat), timeOf(blocked)
-	q.strain = store.Strain{Interval: time.Duration(slow), At: timeOf(strainAt), Steps: uint64(max(steps, 0)), Last: timeOf(lastStrain)}
+	q.strain = store.Strain{Interval: time.Duration(slow), At: timeOf(strainAt), Steps: uint64(max(steps, 0)), Last: timeOf(lastStrain),
+		CeilingAt: timeOf(ceiling)}
 	return q, nil
 }
 
@@ -704,10 +705,16 @@ func (s *Store) loadRuns(ctx context.Context, tx pgx.Tx, key store.QueueKey, bs 
 // run override, against the queue's otherwise.
 func admission(q *qrow, b *brow, now time.Time) (admit int, at time.Time) {
 	queue, own := b.limits(q)
-	if b.eff.Own {
-		return schedAdmitted(own, b.ownTat, now, b.inFlight)
+	if !b.eff.Own {
+		return schedAdmitted(queue, q.tat, now, q.inFlight)
 	}
-	return schedAdmitted(queue, q.tat, now, q.inFlight)
+	admit, at = schedAdmitted(own, b.ownTat, now, b.inFlight)
+	if b.eff.Adaptive.Slowed(b.eff.Queue, q.strain) {
+		// A run with limits of its own is no faster than the slowed queue.
+		qa, qat := schedAdmitted(queue, q.tat, now, q.inFlight)
+		admit, at = min(admit, qa), latest(at, qat)
+	}
+	return admit, at
 }
 
 // limits are the queue's and the run's limits as they are in force: slowed, while the
@@ -721,9 +728,9 @@ func flush(ctx context.Context, tx pgx.Tx, now time.Time, q *qrow, bs []*brow) e
 	batch := &pgx.Batch{}
 	if q != nil {
 		batch.Queue(`UPDATE queues SET tat = $2, in_flight = $3, vclock = $4, blocked_until = $5, block_reason = $6, last_used_at = $7,
-				slow_interval_ns = $8, strain_at = $9, strain_steps = $10, last_strain_at = $11
+				slow_interval_ns = $8, strain_at = $9, strain_steps = $10, last_strain_at = $11, ceiling_at = $12
 			WHERE key = $1`, string(q.key), tsz(q.tat), q.inFlight, q.vclock, tszNull(q.blockedUntil), nullString(q.blockReason), now,
-			int64(q.strain.Interval), tszNull(q.strain.At), int64(min(q.strain.Steps, math.MaxInt64)), tszNull(q.strain.Last))
+			int64(q.strain.Interval), tszNull(q.strain.At), int64(min(q.strain.Steps, math.MaxInt64)), tszNull(q.strain.Last), tszNull(q.strain.CeilingAt))
 	}
 	for _, b := range bs {
 		if !b.dirty {

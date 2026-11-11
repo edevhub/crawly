@@ -204,7 +204,7 @@ func classify(err error) *Error {
 		return e
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return &Error{Kind: KindRetry, Code: "timeout", Strain: true, Err: err}
+		return &Error{Kind: KindRetry, Code: "timeout", Err: err}
 	}
 	return &Error{Kind: KindRetry, Code: "error", Err: err}
 }

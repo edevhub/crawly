@@ -198,14 +198,15 @@ type queueRow struct {
 	strain       store.Strain
 }
 
-const queueColumns = "key, tat, in_flight, blocked_until, coalesce(block_reason, ''), slow_interval_ns, strain_at, strain_steps, last_strain_at"
+const queueColumns = "key, tat, in_flight, blocked_until, coalesce(block_reason, ''), slow_interval_ns, strain_at, strain_steps, last_strain_at, ceiling_at"
 
 func scanQueue(row pgx.CollectableRow) (queueRow, error) {
 	var q queueRow
 	var slow, steps int64
-	var at, last pgtype.Timestamptz
-	err := row.Scan(&q.key, &q.tat, &q.inFlight, &q.blocked, &q.reason, &slow, &at, &steps, &last)
-	q.strain = store.Strain{Interval: time.Duration(slow), At: timeOf(at), Steps: uint64(max(steps, 0)), Last: timeOf(last)}
+	var at, last, ceiling pgtype.Timestamptz
+	err := row.Scan(&q.key, &q.tat, &q.inFlight, &q.blocked, &q.reason, &slow, &at, &steps, &last, &ceiling)
+	q.strain = store.Strain{Interval: time.Duration(slow), At: timeOf(at), Steps: uint64(max(steps, 0)), Last: timeOf(last),
+		CeilingAt: timeOf(ceiling)}
 	return q, err
 }
 
@@ -213,6 +214,7 @@ func scanQueue(row pgx.CollectableRow) (queueRow, error) {
 func (s *Store) queueView(ctx context.Context, q queueRow, now time.Time) (store.Queue, error) {
 	key := store.QueueKey(q.key)
 	e := s.pol.For("", nil, key)
+	q.strain = e.Adaptive.Decayed(q.strain, now)
 	lim := e.Adaptive.Apply(e.Queue, q.strain)
 	tat := timeOf(q.tat)
 	v := store.Queue{Key: key, InFlight: q.inFlight, NextEligibleAt: sched.EligibleAt(lim, tat),
@@ -355,7 +357,7 @@ func (s *Store) BlockQueue(ctx context.Context, key store.QueueKey, until time.T
 		}
 		if until.IsZero() && q.strain.Interval > 0 {
 			// Back to the policy's rate: what the slowdown made the queue wait is cancelled.
-			q.strain.Interval, q.strain.At = 0, now
+			q.strain.Interval, q.strain.At, q.strain.CeilingAt = 0, now, time.Time{}
 			if q.tat.After(now) {
 				q.tat = now
 			}
