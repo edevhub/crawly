@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/edevhub/crawly/internal/testfrontier"
 	"github.com/edevhub/crawly/sdk"
 	"github.com/edevhub/crawly/sdk/policy"
@@ -216,5 +219,106 @@ func TestWatchLate(t *testing.T) {
 	}
 	if res, err = watch.Recv(); err != nil || res.GetEvent().GetType() != run.EventStats {
 		t.Fatalf("first event of an open run: %v %v", res.GetEvent(), err)
+	}
+}
+
+// TestWait: Wait returns the run in its final state, reports its events, and does not
+// wait for a run that does not exist.
+func TestWait(t *testing.T) {
+	c := client(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	if _, err := c.Wait(ctx, "nothing"); status.Code(err) != codes.NotFound {
+		t.Fatalf("a run that does not exist: %v", err)
+	}
+
+	if _, err := c.Runs.CreateRun(ctx, &run.CreateRunRequest{RunId: "w"}); err != nil {
+		t.Fatal(err)
+	}
+	var events []run.EventType
+	done := make(chan *run.Run, 1)
+	go func() {
+		got, err := c.Wait(ctx, "w", sdk.OnEvent(func(ev *run.Event) { events = append(events, ev.GetType()) }))
+		if err != nil {
+			t.Errorf("Wait: %v", err)
+		}
+		done <- got
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("Wait returned for an open run: %v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if _, err := c.Runs.CancelRun(ctx, &run.CancelRunRequest{RunId: "w"}); err != nil {
+		t.Fatal(err)
+	}
+	got := <-done
+	if got.GetState() != run.StateCancelled {
+		t.Fatalf("the final state: %v", got.GetState())
+	}
+	if len(events) == 0 || events[len(events)-1] != run.EventCancelled {
+		t.Fatalf("events: %v", events)
+	}
+
+	// A run that has ended already is returned at once.
+	if got, err := c.Wait(ctx, "w"); err != nil || got.GetState() != run.StateCancelled {
+		t.Fatalf("an ended run: %v %v", got, err)
+	}
+
+	// The caller's context ends the wait.
+	if _, err := c.Runs.CreateRun(ctx, &run.CreateRunRequest{RunId: "open"}); err != nil {
+		t.Fatal(err)
+	}
+	short, stop := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer stop()
+	if _, err := c.Wait(short, "open"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a cancelled wait: %v", err)
+	}
+}
+
+// TestWaitSurvivesRestart: the watch stream breaks when a Frontier goes away; Wait
+// reconnects and still returns the final state.
+func TestWaitSurvivesRestart(t *testing.T) {
+	f := testfrontier.Start(t)
+	c, err := sdk.NewClient(f.Addr, sdk.WithInsecure())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	if _, err := c.Runs.CreateRun(ctx, &run.CreateRunRequest{RunId: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *run.Run, 1)
+	go func() {
+		got, err := c.Wait(ctx, "r")
+		if err != nil {
+			t.Errorf("Wait: %v", err)
+		}
+		done <- got
+	}()
+	time.Sleep(200 * time.Millisecond) // the watch is open
+	f.Stop()
+	time.Sleep(500 * time.Millisecond) // Wait is retrying
+	f.Restart()
+	select {
+	case got := <-done:
+		t.Fatalf("Wait returned across the restart: %v", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// Sealed and empty: the run completes.
+	for {
+		if _, err = c.Runs.SealRun(ctx, &run.SealRunRequest{RunId: "r"}); status.Code(err) != codes.Unavailable {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := <-done; got.GetState() != run.StateCompleted {
+		t.Fatalf("the final state: %v", got.GetState())
 	}
 }

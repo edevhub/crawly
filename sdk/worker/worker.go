@@ -37,7 +37,9 @@ func WithID(id string) Option { return func(w *Worker) { w.id = id } }
 // WithBuildVersion sets the spider build version, recorded on every attempt.
 func WithBuildVersion(v string) Option { return func(w *Worker) { w.version = v } }
 
-// WithMaxConcurrentTasks sets how many tasks run at once per pool. Default 8.
+// WithMaxConcurrentTasks sets how many tasks run at once in each pool the worker
+// serves: a worker with handlers in three pools runs up to three times as many.
+// Default 8.
 func WithMaxConcurrentTasks(n int) Option { return func(w *Worker) { w.maxTasks = n } }
 
 // WithMaxTasksPerSecond limits how fast the worker takes work: it starts at most n

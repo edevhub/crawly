@@ -65,6 +65,9 @@ go run github.com/edevhub/crawly/examples/quickstart@latest -url https://example
 go get github.com/edevhub/crawly
 ```
 
+The module needs Go 1.26 or newer. With an older toolchain, `go` downloads a newer one or
+fails, depending on `GOTOOLCHAIN`.
+
 | Import | For |
 |---|---|
 | `github.com/edevhub/crawly/sdk/worker` | Writing spiders |
@@ -137,7 +140,7 @@ One worker can register any number of handlers. A task is routed by its handler 
 
 | Where | Option | Meaning |
 |---|---|---|
-| `worker.New` | `WithMaxConcurrentTasks(n)` | How many handlers run at once |
+| `worker.New` | `WithMaxConcurrentTasks(n)` | How many handlers run at once, per pool the worker serves. Default 8 |
 | | `WithMaxTasksPerSecond(n)` | How fast the worker takes work: at most `n` task starts a second, over all its pools. Protects the worker, not the sites |
 | | `WithID(id)`, `WithBuildVersion(v)` | Recorded on every attempt, for lineage |
 | | `WithShutdownGrace(d)` | How long running handlers get to finish on shutdown |
@@ -174,6 +177,14 @@ not followed: its target is added as a new task, so that the Frontier paces and 
 it like any other page. A parser can still return
 `worker.Retry` or `worker.Fail` for a 2xx page, for example a captcha served with status 200.
 
+### Delivery
+
+A task is executed **at least once**. When a worker dies or loses its lease after the
+handler did its work and before the Frontier recorded the result, the task is given out
+again and the handler runs a second time. Storing items is your code's business
+(`Result.Items` is only a count for the statistics), so write them idempotently: `Task.ID`
+is the same for every attempt of a task and is the key to use.
+
 ### Discovered tasks
 
 ```go
@@ -198,8 +209,6 @@ import (
 	"context"
 	"log"
 	"time"
-
-	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/edevhub/crawly/sdk"
 	"github.com/edevhub/crawly/sdk/run"
@@ -241,30 +250,26 @@ func main() {
 		log.Fatal(err)
 	}
 
-	watch, err := c.Runs.WatchRuns(ctx, &run.WatchRunsRequest{RunId: id, StatsInterval: durationpb.New(5 * time.Second)})
+	// Blocks until the run has ended, and reconnects when a Frontier restarts.
+	final, err := c.Wait(ctx, id, sdk.StatsEvery(5*time.Second), sdk.OnEvent(func(ev *run.Event) {
+		st := ev.GetRun().GetStats()
+		log.Printf("%v: %d ok, %d failed, %d pending, codes %v", ev.GetType(),
+			st.GetSucceeded(), st.GetFailed(), st.GetPending(), st.GetByCode())
+	}))
 	if err != nil {
 		log.Fatal(err)
 	}
-	for {
-		res, err := watch.Recv()
-		if err != nil {
-			log.Fatal(err)
-		}
-		st := res.GetEvent().GetRun().GetStats()
-		log.Printf("%v: %d ok, %d failed, %d pending, codes %v", res.GetEvent().GetType(),
-			st.GetSucceeded(), st.GetFailed(), st.GetPending(), st.GetByCode())
-		if res.GetEvent().GetType() == run.EventCompleted {
-			return
-		}
-	}
+	log.Printf("run %s: %v", id, final.GetState())
 }
 ```
 
 `CreateRun` is idempotent for the same request, so a scheduler can retry it. `Seed` sends
 tasks in batches; when it fails part of the way it returns the results of the batches
-that were committed together with the error, and seeding again is safe. `WatchRuns` with
-a `RunId` starts with the run's current state, so a watcher that subscribes after the
-run has ended is told at once. The other
+that were committed together with the error, and seeding again is safe. `Wait` returns the
+run once it is completed, cancelled or expired; it reconnects with backoff when the stream
+breaks, which happens on every restart of a Frontier, and fails with `NotFound` when the
+run does not exist. Underneath it is `WatchRuns`, a raw stream that starts with the run's
+current state when it is given a `RunId`. The other
 run calls are `PauseRun`, `ResumeRun`, `CancelRun`, `GetRun`, `ListRuns`, `ListTasks` and
 `GetTask`. `c.Queues` and `c.Policies` are the operator APIs.
 
