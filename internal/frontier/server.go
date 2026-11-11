@@ -44,6 +44,13 @@ type Config struct {
 	ReaperInterval   time.Duration
 	MaintainInterval time.Duration
 	PollInterval     time.Duration
+	// NoHandlerGrace is how long a task is handed from worker to worker while none of
+	// them has its handler, before it fails with code "no_handler". Zero: one hour.
+	NoHandlerGrace time.Duration
+	// NoHandlerDelay is how long such a task waits before it is given out again. Each
+	// round takes a politeness slot of its queue, so the delay bounds what a pool
+	// without the handler costs the queue's other tasks. Zero: five seconds.
+	NoHandlerDelay time.Duration
 }
 
 // Server is one Frontier replica.
@@ -62,6 +69,7 @@ type Server struct {
 	loops    context.Context // set by Run: the lifetime of the dispatch loops
 	draining chan struct{}   // closed by Drain
 	health   *health.Server
+	unserved sync.Map // store.TaskID -> time.Time: when a worker first lacked the task's handler
 }
 
 // New builds a replica. Call Register to expose it and Run to start its loops.
@@ -79,6 +87,12 @@ func New(cfg Config) (*Server, error) {
 		if *d <= 0 {
 			*d = time.Second
 		}
+	}
+	if cfg.NoHandlerGrace <= 0 {
+		cfg.NoHandlerGrace = time.Hour
+	}
+	if cfg.NoHandlerDelay <= 0 {
+		cfg.NoHandlerDelay = 5 * time.Second
 	}
 	s := &Server{store: cfg.Store, pol: cfg.Policies, log: cfg.Logger, cfg: cfg,
 		pools: map[store.PoolName]*pool{}, draining: make(chan struct{}), health: health.NewServer()}
@@ -200,6 +214,7 @@ func (s *Server) maintain(ctx context.Context) {
 			return
 		case <-tick.C:
 			err := s.store.Maintain(ctx)
+			s.forgetUnserved()
 			if err != nil {
 				s.log.Warn("maintain", "err", err)
 			}
@@ -354,6 +369,20 @@ func ServerOptions() []grpc.ServerOption {
 // good; a site that is still refusing after a day blocks the queue again.
 const maxQueueBlock = 24 * time.Hour
 
+// CodeNoHandler is the code of a task no worker has a handler for.
+const CodeNoHandler = "no_handler"
+
+// forgetUnserved drops the tasks that were handed back long ago and not since: they
+// were run by a worker that has their handler, or ended with their run.
+func (s *Server) forgetUnserved() {
+	s.unserved.Range(func(k, v any) bool {
+		if first, ok := v.(time.Time); ok && time.Since(first) > 2*s.cfg.NoHandlerGrace {
+			s.unserved.Delete(k)
+		}
+		return true
+	})
+}
+
 // decide turns a worker's outcome into a transition (ADR 0001, Responsibilities): the
 // spider classifies, the Frontier applies max_attempts and backoff.
 func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.FetchInfo) store.Finish {
@@ -365,6 +394,22 @@ func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.F
 	switch o.GetKind() {
 	case taskv1.Outcome_KIND_SUCCESS:
 		f.Result = store.ResultSucceeded
+	case taskv1.Outcome_KIND_RELEASED:
+		// The task was not run: nothing of the outcome but the hand-back applies.
+		f.Result, f.Block = store.ResultReleased, 0
+		if o.GetCode() != CodeNoHandler {
+			break
+		}
+		// A worker of an older build shares a pool with the build that knows the
+		// handler, as in a rolling deploy. The task goes round until a worker has
+		// its handler, and fails only when none turned up for long enough.
+		since, _ := s.unserved.LoadOrStore(info.Task, time.Now())
+		if first, ok := since.(time.Time); ok && time.Since(first) >= s.cfg.NoHandlerGrace {
+			s.unserved.Delete(info.Task)
+			f.Result, f.Record.Kind = store.ResultFailed, int32(taskv1.Outcome_KIND_FAILED)
+			break
+		}
+		f.RetryIn = s.cfg.NoHandlerDelay
 	case taskv1.Outcome_KIND_RETRY:
 		if limit := beh.GetMaxAttempts(); limit > 0 && info.Ref.Attempt >= limit {
 			f.Result = store.ResultFailed

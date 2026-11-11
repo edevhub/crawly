@@ -40,8 +40,9 @@ import (
 //
 // Return a nil error for success. Return an error built with Retry or Fail to classify
 // a failure; any other error is reported as a retryable failure with code "error". The
-// context is cancelled when the lease is lost or the worker shuts down; a handler that
-// is cancelled that way is not reported.
+// context is cancelled when the lease is lost or when the worker shuts down and its
+// grace has passed. A handler that lost its lease is not reported. A handler cut by a
+// shutdown hands its task back: another worker gets it and no attempt is counted.
 type Handler interface {
 	Handle(ctx context.Context, task *Task) (*Result, error)
 }
@@ -129,6 +130,15 @@ const (
 	KindRetry Kind = iota + 1
 	// KindFail is a permanent failure. It is never retried.
 	KindFail
+	// kindRelease hands the task back to the Frontier: it was not run to an end, and
+	// no attempt is counted.
+	kindRelease
+)
+
+// Codes of a task the worker hands back.
+const (
+	codeNoHandler = "no_handler"
+	codeShutdown  = "shutdown"
 )
 
 // Error is a classified failure. Build one with Retry or Fail.

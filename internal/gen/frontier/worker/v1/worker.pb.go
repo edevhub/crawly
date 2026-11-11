@@ -193,7 +193,7 @@ type Hello struct {
 	// Spider build version. Informational; recorded on every attempt for lineage.
 	BuildVersion string `protobuf:"bytes,2,opt,name=build_version,json=buildVersion,proto3" json:"build_version,omitempty"`
 	// Required. The pool this session serves, e.g. "default" or "browser". A task whose
-	// handler the worker lacks is reported FAILED with code "no_handler".
+	// handler the worker lacks is handed back (Outcome RELEASED, code "no_handler").
 	// Pool names match [a-z0-9_]{1,32}.
 	Pool          string `protobuf:"bytes,5,opt,name=pool,proto3" json:"pool,omitempty"`
 	unknownFields protoimpl.UnknownFields

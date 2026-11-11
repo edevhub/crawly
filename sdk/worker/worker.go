@@ -181,9 +181,11 @@ func (w *Worker) Register(name string, h Handler, opts ...RegisterOption) error 
 
 // Run connects to the Frontier and processes tasks until ctx is cancelled. It then
 // stops taking work, lets running handlers finish (up to the shutdown grace), reports
-// them and returns. Handlers still running when the grace passes are cancelled, and
-// Run waits a few more seconds for them to return; a handler that ignores its context
-// beyond that is abandoned, and logged.
+// them and returns. Handlers still running when the grace passes are cancelled and
+// their tasks handed back to the Frontier, which gives them to another worker without
+// counting an attempt. Run waits a few more seconds for the cancelled handlers to
+// return; a handler that ignores its context beyond that is abandoned, and logged, and
+// its task waits for its lease to expire.
 func (w *Worker) Run(ctx context.Context) error {
 	w.mu.Lock()
 	if w.started {
@@ -237,6 +239,7 @@ type runner struct {
 	credits  int                // granted on the current stream and not used by an assignment yet
 	unacked  []*report          // in the order the handlers finished
 	draining bool
+	cut      bool          // the shutdown grace passed: handlers were cancelled
 	idle     chan struct{} // signalled when nothing runs and nothing is unacknowledged
 	handlers sync.WaitGroup
 }
@@ -266,16 +269,26 @@ type report struct {
 }
 
 func (r *runner) run(ctx context.Context) {
-	// Handlers and sessions outlive ctx by the shutdown grace.
+	// Handlers and sessions outlive ctx by the shutdown grace. The session outlives
+	// the handlers: what was cut is handed back before it closes.
 	base, stop := context.WithCancel(context.WithoutCancel(ctx))
 	defer stop()
+	hctx, cut := context.WithCancel(base)
 	go func() {
 		<-ctx.Done()
 		r.drain()
 		select {
 		case <-r.idle:
 		case <-time.After(r.w.grace):
-			r.w.log.Warn("shutdown grace passed with tasks still running", "pool", r.pool)
+			r.w.log.Warn("shutdown grace passed with tasks still running: handing them back", "pool", r.pool)
+			r.mu.Lock()
+			r.cut = true
+			r.mu.Unlock()
+			cut()
+			select {
+			case <-r.idle:
+			case <-time.After(abandonAfter):
+			}
 		}
 		stop()
 	}()
@@ -284,7 +297,7 @@ func (r *runner) run(ctx context.Context) {
 	wait := 200 * time.Millisecond
 	for base.Err() == nil {
 		started := time.Now()
-		err := r.session(base)
+		err := r.session(base, hctx)
 		if base.Err() != nil {
 			return
 		}
@@ -341,8 +354,9 @@ func (r *runner) checkIdle() {
 	}
 }
 
-// session runs one stream until it breaks or the Frontier asks to reconnect.
-func (r *runner) session(ctx context.Context) error {
+// session runs one stream until it breaks or the Frontier asks to reconnect. Handlers
+// run under hctx, which ends before ctx at a shutdown.
+func (r *runner) session(ctx, hctx context.Context) error {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := r.client.Work(sctx)
@@ -384,7 +398,7 @@ func (r *runner) session(ctx context.Context) error {
 		case *workerv1.WorkResponse_Welcome:
 			r.w.log.Info("session opened", "pool", r.pool, "session", msg.Welcome.GetSessionId())
 		case *workerv1.WorkResponse_Assignment:
-			r.start(ctx, msg.Assignment)
+			r.start(hctx, msg.Assignment)
 		case *workerv1.WorkResponse_Revoked:
 			r.revoke(msg.Revoked.GetLeaseId(), msg.Revoked.GetReason().String())
 		case *workerv1.WorkResponse_Extended:
@@ -527,7 +541,10 @@ func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 		var err error
 		switch {
 		case reg == nil || reg.pool != r.pool:
-			err = Fail("no_handler", fmt.Errorf("no handler %q registered for pool %q", task.Handler, r.pool))
+			// Another worker of the pool may have the handler, as during a rolling
+			// deploy: the task goes back, at no cost to its attempts.
+			err = &Error{Kind: kindRelease, Code: codeNoHandler,
+				Err: fmt.Errorf("no handler %q registered for pool %q", task.Handler, r.pool)}
 		default:
 			stopBeat := r.heartbeat(hctx, act, lease.GetDuration().AsDuration())
 			res, err = r.call(hctx, reg, task)
@@ -539,6 +556,10 @@ func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 		r.sendMu.Lock()
 		r.mu.Lock()
 		delete(r.running, act.leaseID)
+		if r.cut && err != nil && ctx.Err() != nil {
+			// The shutdown cut the handler short: the task was not at fault.
+			err = &Error{Kind: kindRelease, Code: codeShutdown, Err: err}
+		}
 		var rep *report
 		if !act.revoked {
 			rep = buildReport(act, task, res, err, r.poolFor)
@@ -633,8 +654,12 @@ func buildReport(a *active, task *Task, res *Result, err error, poolFor func(han
 	if err != nil {
 		e := classify(err)
 		out.Kind, out.Code, out.Message = taskv1.Outcome_KIND_RETRY, e.Code, truncate(e.Error(), 500)
-		if e.Kind == KindFail {
+		switch e.Kind {
+		case KindFail:
 			out.Kind = taskv1.Outcome_KIND_FAILED
+		case kindRelease:
+			out.Kind = taskv1.Outcome_KIND_RELEASED
+		case KindRetry:
 		}
 		if e.RetryAfter > 0 {
 			out.RetryAfter = durationpb.New(e.RetryAfter)

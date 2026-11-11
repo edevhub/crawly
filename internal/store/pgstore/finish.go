@@ -260,7 +260,7 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 	case f.Result == store.ResultReleased:
 		// The assignment never reached a worker: the attempt did not happen. The
 		// queue's politeness state stays as dispatch advanced it.
-		due = now
+		due = now.Add(f.RetryIn)
 		own.attempts--
 		reopenTask(batch, t, due, 1)
 	case f.Result == store.ResultRetry:

@@ -19,7 +19,7 @@ message Hello {
   // Fields 3 (labels) and 4 (handlers) removed: routing is by pool name only.
   reserved 3, 4;
   // Required. The pool this session serves, e.g. "default" or "browser". A task whose
-  // handler the worker lacks is reported FAILED with code "no_handler".
+  // handler the worker lacks is handed back (Outcome RELEASED, code "no_handler").
   // Pool names match [a-z0-9_]{1,32}.
   string pool = 5;
 }

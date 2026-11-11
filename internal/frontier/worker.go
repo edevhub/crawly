@@ -383,8 +383,13 @@ func (s *Server) handleComplete(ctx context.Context, p *pool, sess *session, m *
 	}
 	st := store.FinishStale
 	if ok {
-		if st, err = s.store.Finish(ctx, s.decide(info, m.GetOutcome(), m.GetFetch())); err != nil {
+		f := s.decide(info, m.GetOutcome(), m.GetFetch())
+		if st, err = s.store.Finish(ctx, f); err != nil {
 			return err
+		}
+		if m.GetOutcome().GetKind() == taskv1.Outcome_KIND_RELEASED && st == store.FinishAccepted {
+			s.log.Debug("task handed back", "task", info.Task, "run", info.Run, "worker", sess.worker.ID,
+				"code", m.GetOutcome().GetCode(), "failed", f.Result == store.ResultFailed)
 		}
 	}
 	s.leases.Delete(ref.ID)

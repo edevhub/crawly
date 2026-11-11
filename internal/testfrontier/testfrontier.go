@@ -29,6 +29,9 @@ const Policies = `{"policies": [{"name": "fast", "limits": {"ratePerSecond": 500
 type Frontier struct {
 	// Addr is the address the replica listens on.
 	Addr string
+	// NoHandlerGrace is how long the next Restart lets a task wait for a worker that
+	// has its handler. Zero: a fraction of a second.
+	NoHandlerGrace time.Duration
 
 	tb    testing.TB
 	pol   *policy.Set
@@ -90,7 +93,11 @@ func start(tb testing.TB, addr string, pol *policy.Set, st store.Store) *Frontie
 // previous one must have been stopped.
 func (f *Frontier) Restart() {
 	f.tb.Helper()
-	srv, err := frontier.New(frontier.Config{Store: f.store, Policies: f.pol,
+	grace := f.NoHandlerGrace
+	if grace <= 0 {
+		grace = 200 * time.Millisecond
+	}
+	srv, err := frontier.New(frontier.Config{Store: f.store, Policies: f.pol, NoHandlerGrace: grace, NoHandlerDelay: 50 * time.Millisecond,
 		ReaperInterval: 50 * time.Millisecond, MaintainInterval: 50 * time.Millisecond, PollInterval: 100 * time.Millisecond})
 	if err != nil {
 		f.tb.Fatal(err)

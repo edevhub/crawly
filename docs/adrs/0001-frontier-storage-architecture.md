@@ -391,7 +391,7 @@ The rules every implementation follows. `sched` implements the arithmetic.
   and a fair-queueing clock `vclock`.
 - **Pool**: a named set of workers that execute the same kind of task, e.g. `default` or
   `browser`. A task names its pool; a worker session serves one pool. A worker that lacks
-  the task's handler fails it with code `no_handler`.
+  the task's handler hands it back for another worker of the pool (ADR 0003).
 - **Backlog**: the tasks of one run on one queue in one pool. Holds `pending`
   (not dispatched, including delayed), `in_flight`, a fair-queueing tag `vtime`, an own
   GCRA timestamp `own_tat` (used only under a run override), counters for stats, and

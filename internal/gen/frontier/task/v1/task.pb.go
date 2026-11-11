@@ -48,6 +48,10 @@ const (
 	Outcome_KIND_RETRY Outcome_Kind = 2
 	// Permanent failure (404/410, unparseable). Never retried.
 	Outcome_KIND_FAILED Outcome_Kind = 3
+	// The worker hands the task back without having run it to an end: it lacks the
+	// task's handler, or it shut down. The attempt is not counted and no attempt is
+	// recorded; another worker gets the task.
+	Outcome_KIND_RELEASED Outcome_Kind = 4
 )
 
 // Enum value maps for Outcome_Kind.
@@ -57,12 +61,14 @@ var (
 		1: "KIND_SUCCESS",
 		2: "KIND_RETRY",
 		3: "KIND_FAILED",
+		4: "KIND_RELEASED",
 	}
 	Outcome_Kind_value = map[string]int32{
 		"KIND_UNSPECIFIED": 0,
 		"KIND_SUCCESS":     1,
 		"KIND_RETRY":       2,
 		"KIND_FAILED":      3,
+		"KIND_RELEASED":    4,
 	}
 )
 
@@ -157,7 +163,10 @@ type Outcome struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Kind  Outcome_Kind           `protobuf:"varint,1,opt,name=kind,proto3,enum=crawly.frontier.task.v1.Outcome_Kind" json:"kind,omitempty"`
 	// Machine-readable code for stats and alerting, e.g. "http_404", "http_429", "captcha".
-	// Reserved codes: "no_handler" (FAILED: the worker lacks the task's handler),
+	// Reserved codes: "no_handler" (RELEASED: the worker lacks the task's handler; the
+	// frontier fails the task with this code when no worker has run it for the time it
+	// is configured to wait), "shutdown" (RELEASED: the worker stopped before the handler
+	// finished),
 	// "panic" (RETRY: the handler crashed), "redirect" (SUCCESS: a redirect to another
 	// host was added as a task instead of followed), "lease_expired" (set by the frontier).
 	Code    string `protobuf:"bytes,2,opt,name=code,proto3" json:"code,omitempty"`
@@ -748,20 +757,21 @@ var File_crawly_frontier_task_v1_task_proto protoreflect.FileDescriptor
 
 const file_crawly_frontier_task_v1_task_proto_rawDesc = "" +
 	"\n" +
-	"\"crawly/frontier/task/v1/task.proto\x12\x17crawly.frontier.task.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc2\x02\n" +
+	"\"crawly/frontier/task/v1/task.proto\x12\x17crawly.frontier.task.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd5\x02\n" +
 	"\aOutcome\x129\n" +
 	"\x04kind\x18\x01 \x01(\x0e2%.crawly.frontier.task.v1.Outcome.KindR\x04kind\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\x12:\n" +
 	"\vretry_after\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\n" +
 	"retryAfter\x12A\n" +
-	"\x0fblock_queue_for\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\rblockQueueFor\"O\n" +
+	"\x0fblock_queue_for\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\rblockQueueFor\"b\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\x10\n" +
 	"\fKIND_SUCCESS\x10\x01\x12\x0e\n" +
 	"\n" +
 	"KIND_RETRY\x10\x02\x12\x0f\n" +
-	"\vKIND_FAILED\x10\x03\"\xff\x01\n" +
+	"\vKIND_FAILED\x10\x03\x12\x11\n" +
+	"\rKIND_RELEASED\x10\x04\"\xff\x01\n" +
 	"\tFetchInfo\x12\x1f\n" +
 	"\vhttp_status\x18\x01 \x01(\rR\n" +
 	"httpStatus\x12\x1b\n" +

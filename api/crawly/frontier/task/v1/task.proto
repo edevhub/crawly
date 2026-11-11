@@ -33,10 +33,17 @@ message Outcome {
     KIND_RETRY = 2;
     // Permanent failure (404/410, unparseable). Never retried.
     KIND_FAILED = 3;
+    // The worker hands the task back without having run it to an end: it lacks the
+    // task's handler, or it shut down. The attempt is not counted and no attempt is
+    // recorded; another worker gets the task.
+    KIND_RELEASED = 4;
   }
   Kind kind = 1;
   // Machine-readable code for stats and alerting, e.g. "http_404", "http_429", "captcha".
-  // Reserved codes: "no_handler" (FAILED: the worker lacks the task's handler),
+  // Reserved codes: "no_handler" (RELEASED: the worker lacks the task's handler; the
+  // frontier fails the task with this code when no worker has run it for the time it
+  // is configured to wait), "shutdown" (RELEASED: the worker stopped before the handler
+  // finished),
   // "panic" (RETRY: the handler crashed), "redirect" (SUCCESS: a redirect to another
   // host was added as a task instead of followed), "lease_expired" (set by the frontier).
   string code = 2;
