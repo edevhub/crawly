@@ -29,6 +29,8 @@ const Policies = `{"policies": [{"name": "fast", "limits": {"ratePerSecond": 500
 type Frontier struct {
 	// Addr is the address the replica listens on.
 	Addr string
+	// ServerOptions are added to the gRPC server of the next Restart.
+	ServerOptions []grpc.ServerOption
 
 	tb    testing.TB
 	pol   *policy.Set
@@ -100,7 +102,7 @@ func (f *Frontier) Restart() {
 		f.tb.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	g := grpc.NewServer(frontier.ServerOptions()...)
+	g := grpc.NewServer(append(frontier.ServerOptions(), f.ServerOptions...)...)
 	srv.Register(g)
 	f.mu.Lock()
 	f.Addr, f.server, f.grpc, f.cancel = lis.Addr().String(), srv, g, cancel

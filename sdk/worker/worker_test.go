@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -593,5 +594,70 @@ func TestFrontierShutdown(t *testing.T) {
 	e.f.Restart()
 	if st := e.crawl("after", nil, spec("https://a.example/2", "page")); st.GetSucceeded() != 1 {
 		t.Fatalf("stats: %v", st)
+	}
+}
+
+// TestLargeDiscoveries: discovered tasks that are large together are sent in several
+// batches, and a single task over the limit fails the task that discovered it.
+func TestLargeDiscoveries(t *testing.T) {
+	e := newEnv(t)
+	w := newWorker(t, e.addr)
+	var seen atomic.Int64
+	register(t, w, "list", worker.HandlerFunc(func(_ context.Context, _ *worker.Task) (*worker.Result, error) {
+		res := &worker.Result{}
+		for i := range 60 { // 6 MiB together: more than one gRPC message can carry
+			res.Tasks = append(res.Tasks, worker.NewTask{URL: "https://a.example/item/" + strconv.Itoa(i), Handler: "item",
+				Context: map[string][]byte{"meta": make([]byte, 100<<10)}})
+		}
+		return res, nil
+	}))
+	register(t, w, "item", worker.HandlerFunc(func(_ context.Context, tk *worker.Task) (*worker.Result, error) {
+		if len(tk.Context["meta"]) == 100<<10 {
+			seen.Add(1)
+		}
+		return nil, nil
+	}))
+	register(t, w, "huge", worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+		return &worker.Result{Tasks: []worker.NewTask{
+			{URL: "https://a.example/fits", Handler: "item"},
+			{URL: "https://a.example/too-large", Handler: "item", Context: map[string][]byte{"meta": make([]byte, worker.MaxTaskBytes)}},
+		}}, nil
+	}))
+	e.start(w)
+
+	st := e.crawl("large", nil, spec("https://a.example/list", "list"))
+	if st.GetSucceeded() != 61 || st.GetFailed() != 0 || seen.Load() != 60 {
+		t.Fatalf("stats: %v, %d items with their context", st, seen.Load())
+	}
+	st = e.crawl("huge", nil, spec("https://a.example/huge", "huge"))
+	if st.GetFailed() != 1 || st.GetDiscovered() != 0 || st.GetByCode()[worker.CodeTaskTooLarge] != 1 || st.GetAttempts() != 1 {
+		t.Fatalf("a task over the limit must fail its parent for good, once: %v", st)
+	}
+}
+
+// TestRefusedReport: a report the Frontier refuses as too large fails its task, once,
+// and the worker carries on with the reports and the work around it.
+func TestRefusedReport(t *testing.T) {
+	e := newEnv(t)
+	e.f.Stop()
+	e.f.ServerOptions = []grpc.ServerOption{grpc.MaxRecvMsgSize(64 << 10)}
+	e.f.Restart()
+	w := newWorker(t, e.addr)
+	register(t, w, "list", worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+		return &worker.Result{Tasks: []worker.NewTask{{URL: "https://a.example/item", Handler: "page",
+			Context: map[string][]byte{"meta": make([]byte, 100<<10)}}}}, nil
+	}))
+	register(t, w, "page", noop)
+	e.start(w)
+
+	seeds := make([]*task.Spec, 0, 21)
+	seeds = append(seeds, spec("https://a.example/list", "list"))
+	for i := range 20 { // reports around the refused one
+		seeds = append(seeds, spec("https://b.example/"+strconv.Itoa(i), "page"))
+	}
+	st := e.crawl("refused", nil, seeds...)
+	if st.GetSucceeded() != 20 || st.GetFailed() != 1 || st.GetByCode()[worker.CodeReportTooLarge] != 1 ||
+		st.GetAttempts() != 21 || st.GetByCode()["lease_expired"] != 0 {
+		t.Fatalf("the refused task must fail on its first attempt and nothing else: %v", st)
 	}
 }

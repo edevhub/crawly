@@ -37,6 +37,7 @@ message Outcome {
   Kind kind = 1;
   // Machine-readable code for stats and alerting, e.g. "http_404", "http_429", "captcha".
   // Reserved codes: "no_handler" (FAILED: the worker lacks the task's handler),
+  // "task_too_large" (FAILED: the handler returned a task over the size limit),
   // "panic" (RETRY: the handler crashed), "redirect" (SUCCESS: a redirect to another
   // host was added as a task instead of followed), "lease_expired" (set by the frontier).
   string code = 2;
@@ -62,7 +63,8 @@ message FetchInfo {
   uint32 items_emitted = 7;
 }
 
-// What clients submit (scheduler seeds, worker discoveries).
+// What clients submit (scheduler seeds, worker discoveries). A spec is limited to 1 MiB
+// as encoded; a larger one is INVALID.
 message TaskSpec {
   Request request = 1;
   // Queue the task belongs to. Empty: derived from the run's KeyRule.
