@@ -237,6 +237,35 @@ together. A handler that returns a larger one fails its own task with code
 in batches bounded by count and by size. Upgrade the workers with the Frontier or before
 it: a worker of an older SDK does not notice a task the Frontier refuses for its size.
 
+### Testing a spider, and dry runs
+
+`sdk/crawlytest` runs a Frontier inside a test, on the in-memory store. The spider is
+tested end to end, with the retries, dedup and limits it meets in production, against
+pages you recorded, and without a Frontier process or a database:
+
+```go
+func TestSpider(t *testing.T) {
+	site := httptest.NewServer(recordedPages) // your fixtures
+	defer site.Close()
+
+	f := crawlytest.Start(t)
+	w, _ := f.Worker()
+	w.Register("listing", worker.HTTP(listing))
+	w.Register("product", worker.HTTP(product))
+
+	final, err := f.Crawl(t.Context(), w,
+		[]*task.Spec{{Request: &task.Request{Url: site.URL + "/"}, Handler: "listing"}})
+	// assert on final.GetStats() and on what the parsers emitted
+}
+```
+
+`sdk/local` is the same Frontier outside a test, for a dry run of a spider against a real
+site: `local.Start()`, then `Crawl` with a `max_tasks` limit (`local.WithRun`) and a
+deadline on its context. It applies the Frontier's default policies unless
+`local.WithPolicies` gives it your policy file, so a dry run is as polite as the real
+crawl. A crawl that is cut short returns the run as it stood, with its statistics, and
+cancels it. Its state is in memory and gone when the process ends.
+
 ## Scheduling a run
 
 ```go

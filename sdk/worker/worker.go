@@ -183,6 +183,20 @@ func (w *Worker) Register(name string, h Handler, opts ...RegisterOption) error 
 	return nil
 }
 
+// Pools returns the pools the registered handlers serve, sorted.
+func (w *Worker) Pools() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var pools []string
+	for _, r := range w.handlers {
+		if !slices.Contains(pools, r.pool) {
+			pools = append(pools, r.pool)
+		}
+	}
+	slices.Sort(pools)
+	return pools
+}
+
 // Run connects to the Frontier and processes tasks until ctx is cancelled. It then
 // stops taking work, lets running handlers finish (up to the shutdown grace), reports
 // them and returns. Handlers still running when the grace passes are cancelled and

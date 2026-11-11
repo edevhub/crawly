@@ -3,6 +3,8 @@
 //   - sdk/worker: write spiders. Implement a Handler or a Parser and register it.
 //   - sdk (this package): Client, a connection for schedulers and operators.
 //   - sdk/run, sdk/task, sdk/policy, sdk/queue: the API types and service clients.
+//   - sdk/local: a Frontier inside your process, for dry runs.
+//   - sdk/crawlytest: the same inside a test, to test a spider end to end.
 //
 // The API types are aliases of the internal generated types, not copies: there is one
 // definition of each.
