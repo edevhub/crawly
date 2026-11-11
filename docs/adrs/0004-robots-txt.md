@@ -1,7 +1,6 @@
 # ADR 0004: robots.txt: gate, parser and policy
 
-- **Status:** Draft, for review. Revision 2, after a reliability review of the first
-  draft. The section "Points to confirm" lists the choices that are still open; each is
+- **Status:** Draft, for review. Revision 3, after two rounds of reliability review. The section "Points to confirm" lists the choices that are still open; each is
   written into the text below as proposed.
 - **Date:** 2026-11-11
 - **Related:** [ADR 0001: Frontier storage architecture](0001-frontier-storage-architecture.md),
@@ -35,8 +34,8 @@ Four constraints shape the design:
   under an agreement with the site, or get the rules from another system. The scheduler
   needs a way to say so, and the operator of the Frontier needs the last word.
 - **A gate must not be able to stop a run for good.** Whatever happens to the request for
-  robots.txt, every task that waits for it has to end up dispatched or ended, within a
-  time the operator sets.
+  robots.txt, a task that waits for it has to end up dispatched or ended. It may wait
+  only for what makes every task wait: a paused run or a blocked queue.
 
 ## Decision
 
@@ -51,8 +50,9 @@ Four constraints shape the design:
   that every SDK worker has built in. Its result is recorded on the origin.
 - Held tasks are judged in batches when the rules arrive. Allowed tasks join their
   backlog and disallowed ones end `SKIPPED`.
-- A held task never waits longer than the policy's `hold_grace`. A background step, not
-  the arrival of new tasks, keeps the gate moving.
+- A background step, not the arrival of new tasks, keeps the gate moving. A held task
+  waits for what makes any task wait (a paused run, a blocked queue), and ends after the
+  policy's `hold_grace` when robots.txt cannot be fetched.
 - A run can bring the rules itself or opt out. The queue's policy can forbid that, and
   an operator can pin the rules of an origin.
 
@@ -67,7 +67,7 @@ AddTasks ──► fresh rules for the origin? ──yes──► judge ──�
         Frontier: record the result on the origin
                     │
    background: judge held tasks in batches ──► backlog | SKIPPED
-               re-arm the robots task, end tasks held past hold_grace
+               re-arm the robots task, end held tasks when the fetch keeps failing
                     │
    dispatch: compare the rules' version, judge again ──► assign | SKIPPED | hold
 ```
@@ -78,23 +78,30 @@ The store keeps one record per origin, shared by every run and every queue.
 
 | Field | Meaning |
 |---|---|
-| `result` | What the last fetch saw: `FILE` (2xx), `NONE` (4xx: there is no file), `FAILED` (no usable answer), `PINNED` (set by an operator) |
-| `body` | `FILE` and `PINNED` only: the content, cut at the parse limit |
-| `status`, `final_url`, `hops`, `fetch_time` | What the fetch saw, for the operator |
-| `version` | Increases with every change of the record |
-| `claim` | The run whose robots task is under way, and until when the claim holds |
+| `result` | What the last fetch saw: `FILE` (2xx), `NONE` (4xx: there is no file), `FAILED` (no usable answer) |
+| `body` | `FILE` only: the content, cut at the parse limit |
+| `status`, `final_url`, `hops` | What the fetch saw, for the operator |
+| `fetch_time` | When the robots task that brought the result was dispatched, on the store's clock |
+| `rules_version` | Increases when `result` or `body` change, and with a pin |
+| `task` | The robots task of the origin that has not ended, if there is one |
 | `last_file` | `FAILED` only: the last `FILE` or `NONE` result before it, with its `fetch_time` |
+| `pin`, `pin_expire_time` | Rules set by an operator, and until when |
 
 - The record holds facts only. What a result means (how long it is fresh, what a 403
   means, which group applies) is decided when a task is judged, with the policy of the
   task's queue. Two queues that reach one origin can therefore read one record
   differently, and neither changes it for the other.
 - A result replaces the stored one only if its `fetch_time` is newer. Results are
-  ordered by when the fetch was made, never by when they arrived.
+  ordered by when their task was dispatched, never by when they arrived. The time is the
+  store's: a worker's clock decides neither which result wins nor how long it is fresh
+  (ADR 0003). The worker's own time of the fetch is kept for display.
+- A pin is never replaced by a fetch and never removed before `pin_expire_time`. While it
+  lasts nothing is fetched. When it ends, the last fetched result is in force again and
+  is read as stale, so it is fetched anew.
 - Each replica parses `body` and keeps the parsed form in memory. A fix in the parser
   applies to every stored file without a new fetch.
 - A record is removed when its `fetch_time` is older than the longest lifetime in the
-  policy set and no task is held on it.
+  policy set, it has no pin and no robots task, and no task is held on it.
 - Only `http` and `https` URLs have an origin. A task with another scheme is not gated.
 - The origin of a task is stored with the task, so the store can find the held and the
   pending tasks of an origin without reading task specifications.
@@ -103,29 +110,38 @@ Derived from the record and the queue's policy, the rules of an origin on a queu
 
 | Rules | When | A page task is |
 |---|---|---|
-| **fresh** | `FILE`, `NONE` or `PINNED`, and `fetch_time + lifetime` has not passed | judged |
-| **stale** | `fetch_time + lifetime` has passed, `fetch_time + lifetime + stale_grace` has not | judged by the old rules; a robots task is armed |
+| **pinned** | a pin that has not ended | judged by the pin |
+| **fresh** | `FILE` or `NONE`, and `fetch_time + lifetime` has not passed | judged |
+| **stale** | `FILE` or `NONE`, and `fetch_time + lifetime` has passed | judged by the old rules; a robots task is armed |
 | **kept** | `FAILED` with a `last_file` | judged by `last_file` (RFC 9309 allows a cached file while the file is unreachable); a robots task is armed at each `retry` |
-| **unknown** | no record, `FAILED` without `last_file`, or stale past `stale_grace` | held |
+| **unknown** | no record, `FAILED` without `last_file`, or an operator asked for a hold | held |
+
+Rules that were known once do not become unknown because a refresh is late. A refresh
+waits behind the same things as any task (a blocked queue, a paused run, other runs'
+turns), and a backlog that was admitted under a file is not taken back for that. RFC
+9309 says a cached file should not be used for longer than 24 hours; here it is used
+until the refresh that was armed at that point has run, and that is a limitation.
 
 ### Judging
 
 A page task is judged at three points. All three ask the same question of the same
 matcher.
 
-1. **When it is added**, if the rules are fresh, stale or kept. An allowed task joins
+1. **When it is added**, if the rules are pinned, fresh, stale or kept. An allowed task joins
    its backlog. A disallowed one is refused with `AddResult.STATUS_ROBOTS_DISALLOWED`
    and the code that says why (see "Codes"). It never becomes a task, takes nothing from
    the run's budget and leaves no dedup record, so the same URL can be added once the
    rules change.
-2. **In the background, when the record changes.** The held tasks of the origin are
+2. **In the background, when the rules change.** The held tasks of the origin are
    judged in bounded batches: the store hands the core a batch, the core judges, and the
    store moves each task to its backlog or ends it `SKIPPED`, in one transaction per
-   batch. When the new rules are stricter than the ones before, the pending tasks of the
-   origin are judged the same way. This step needs no worker and no credit, so a backlog
+   batch. The pending tasks of the origin are judged the same way on every change of
+   `rules_version`: two files are not ordered as stricter or looser, so every change
+   counts. When an operator asks for a hold, the pending tasks are moved to held the
+   same way. This step needs no worker and no credit, so a backlog
    that became disallowed ends without being dispatched.
 3. **When it is dispatched**, as the last check. Every assignment comes out of the claim
-   with the `version` of its origin's record. The core compares it with its own copy and
+   with the `rules_version` of its origin's record. The core compares it with its own copy and
    reloads the copy when they differ, so the check costs no store access otherwise. A
    task that is disallowed ends `SKIPPED`. A task whose rules became unknown goes back
    to held. In both cases the politeness slot the claim took is **not** given back: a
@@ -133,9 +149,11 @@ matcher.
    and a lost slot only makes the queue slower. Point 2 keeps this case rare.
 
 The decision at add is made against the record the store holds, not against the
-replica's copy: the core sends the `version` it judged by, and the store rejects the
-batch when the record has moved on. The core then reads the record again and repeats.
-A task can therefore not be held on rules that arrived a moment before.
+replica's copy. The core sends, per task, its judgement and the `rules_version` it
+judged by. The store takes the judgements whose version is the record's and returns the
+other tasks, and the core judges those again with the record it gets back. A task can
+therefore not be held on rules that arrived a moment before, and one origin that changed
+does not send a whole batch round again.
 
 ### The gate
 
@@ -153,18 +171,29 @@ A task can therefore not be held on rules that arrived a moment before.
 `Maintain`), looks at the origins that have held tasks, in bounded rounds:
 
 1. The origin has rules: judge and release the held tasks.
-2. The origin has no rules and no robots task is under way (no live `claim`), and the
-   last `FAILED` result is older than `retry`: arm a robots task in a run that holds
-   tasks there and can dispatch (not paused, with a session of the pool that has the
-   handler). A run that cannot dispatch is passed over.
-3. A task has been held for longer than `hold_grace`, counted from the moment it was
-   held, whatever the reason: it ends `SKIPPED`. The code names the reason:
-   `robots_unreachable` when fetches were made and failed, `robots_no_handler` when no
-   session of the pool has the handler, `robots_not_fetched` otherwise (the robots task
-   could not be run: the queue was blocked, the run was paused).
+2. The origin has no rules and no robots task, and the last `FAILED` result is older than
+   `retry`: arm a robots task in a run that holds tasks there and is not paused.
+3. The origin's robots task belongs to a run that is paused: drop it and arm one in
+   another run that holds tasks there, if there is one.
+4. The fetch keeps failing: when every result since a task was held is `FAILED` and the
+   task has been held for `hold_grace`, it ends `SKIPPED` with `robots_unreachable`.
+5. Nobody can fetch: when no worker of the pool has reported the `crawly.robots` handler
+   for `hold_grace`, the held tasks of that pool end `SKIPPED` with `robots_no_handler`.
+   "No worker has the handler" is read from the store's registry of handlers per pool,
+   which every replica keeps up to date for its sessions and which fails page tasks
+   whose handler nobody has in the same way (ADR 0003). It is never read from one
+   replica's sessions.
 
-A held task therefore ends at the latest `hold_grace` after it was held, and a sealed
-run with held tasks completes. Nothing in this depends on new tasks being added.
+What is left makes a held task wait and not end: a paused run and a blocked queue. Those
+make the page tasks of the run and the queue wait too, and a pause or a block is a
+request to wait. The task's TTL and the run's deadline apply to a held task as to any
+other. A held task therefore ends, or its run is paused, or its queue is blocked, and a
+sealed run with held tasks completes under the same conditions as one without. Nothing
+in this depends on new tasks being added.
+
+The transaction that ends the last held task of a sealed run completes the run. The
+rule for completion reads: a run completes when it is sealed and has no pending,
+delayed, held or in-flight page tasks.
 
 ### The robots task
 
@@ -182,10 +211,12 @@ run with held tasks completes. Nothing in this depends on new tasks being added.
 - It takes nothing from `RunLimits.max_tasks`, has depth 0 and no parent, and is counted
   in `RunStats.robots` only: not in the run's task counters, not in `by_code`, and not
   towards `max_failed` and `max_consecutive_failures`. `ListTasks` shows it.
-- At most one robots task per origin is under way. Arming one sets the origin's `claim`
-  to the run, valid for `retry`. While the claim is valid no other run arms one: a
-  second run that needs the same rules waits for the first run's result. When the claim
-  runs out without a result, the next round arms a new task, in the same or another run.
+- At most one robots task per origin exists that has not ended. The record names it
+  (`task`), and no run arms another while it is there: a second run that needs the same
+  rules waits for the first run's result. The record is cleared in the transaction that
+  ends the task, whatever ends it, the end of its run included. A task that waits behind
+  a queue block or other runs' turns stays the one task of its origin for as long as it
+  waits.
 - A robots task does not keep a run alive. A run completes when it has no page tasks
   left, and a robots task it still has is dropped with the run's other tasks. A result
   that arrives for a dropped task is discarded, as for any revoked lease.
@@ -206,8 +237,8 @@ run with held tasks completes. Nothing in this depends on new tasks being added.
   the task's fetch timeout.
 - It always reports `SUCCESS` with a `RobotsResult`, whatever the site answered, a
   failure before an answer included: the final status, the final URL, the hops, the
-  body, `Retry-After` if the site sent one, the time of the fetch, and whether the fetch
-  failed before an answer. The handler does not interpret any of it.
+  body, `Retry-After` if the site sent one, the worker's time of the fetch (for display),
+  and whether the fetch failed before an answer. The handler does not interpret any of it.
 - A worker that is not built on the SDK implements the same contract.
 
 **How it can end, and what follows.**
@@ -219,9 +250,9 @@ run with held tasks completes. Nothing in this depends on new tasks being added.
 | `RobotsResult` with more than five redirects | `NONE` | The same |
 | `RobotsResult` with 5xx, 429, timeout or connection failure | `FAILED` | A `Retry-After` blocks the queue, capped like any block. The next task is armed after `retry` |
 | The attempt is lost (worker crash, lease expiry, panic) | none | The task is retried like any task, up to `max_attempts`. After the last attempt: `FAILED` |
-| The task expires by TTL, or its run ends | none | The claim runs out, and the background step arms a task in a run that still holds tasks |
-| No session has the handler | none | The task waits. Held tasks end with `robots_no_handler` after `hold_grace` |
-| A replica of an older build takes the result | none | The older build drops `RobotsResult`. The claim runs out and a new task is armed |
+| The task expires by TTL, or its run ends or is paused | none | The record is cleared, and the background step arms a task in a run that still holds tasks |
+| No worker has the handler | none | The task waits. Held tasks end with `robots_no_handler` after `hold_grace` |
+| A replica of an older build takes the result | none | The older build drops `RobotsResult` and ends the task. The background step arms a new one |
 
 Treating 429 as `FAILED` is stricter than RFC 9309, which counts every 4xx as "the file
 is unavailable". A 429 says the client is too fast, and reading it as "everything is
@@ -236,9 +267,8 @@ Every refusal and skip that robots.txt causes has a code:
 | `robots_disallowed` | A rule of the file disallows the URL |
 | `robots_forbidden` | robots.txt answered 401 or 403, and the queue's policy reads that as a refusal |
 | `robots_crawl_delay` | The origin asks for a delay above the policy's ceiling |
-| `robots_unreachable` | robots.txt could not be fetched for `hold_grace` |
-| `robots_no_handler` | No worker of the pool could fetch robots.txt for `hold_grace` |
-| `robots_not_fetched` | The robots task could not be run for `hold_grace` |
+| `robots_unreachable` | Every fetch of robots.txt failed for `hold_grace` |
+| `robots_no_handler` | No worker of the pool had the `crawly.robots` handler for `hold_grace` |
 
 - A refusal at add carries the code in `AddResult.code`, and a skipped task carries it
   as the code of its state.
@@ -266,11 +296,15 @@ honour it.
 
 - The delay is that of the group that matches the queue's product token. It applies to
   the queues the origin's tasks are dispatched on.
-- **Where it lives.** The queue's limiter row keeps the delays of the origins judged
-  onto the queue: origin, delay and the time the origin's rules stop being fresh, the
-  longest few. The floor of the queue is the longest delay that has not run out. An
-  origin's entry ends with the freshness of its rules, so an origin that is no longer
-  crawled stops slowing the queue after one lifetime.
+- **Where it lives.** The queue's limiter row keeps the delays of the origins whose tasks
+  were dispatched on the queue: origin, delay and the time the origin's rules stop being
+  fresh, the longest few. The floor of the queue is the longest delay that has not run
+  out. An origin's entry ends with the freshness of its rules, so an origin that is no
+  longer crawled stops slowing the queue after one lifetime. The row is written in the
+  dispatch transaction, which holds it already, and never when tasks are added. When
+  more origins of one queue have delays than the row keeps, a delay that was dropped
+  applies again with the next dispatch of that origin; until then the floor can be
+  below it. That is a limitation.
 - **Where it applies.** In the store's limiter step, on top of the limits the policy
   resolves. The resolved limits stay static and cacheable (ADR 0001); the floor is
   state of the queue, like a block. While the floor is above the policy's interval, the
@@ -318,8 +352,13 @@ message Robots {
 - `Crawl-delay` in a run's file is ignored. A run that wants a slower pace on a queue
   sets its own limits there, as it does today.
 - `MODE_IGNORE` with no files is the opt-out.
-- A run that was created before this design is stored as `MODE_IGNORE`. It finishes as
-  it started.
+- A run without a stored setting is read as `MODE_IGNORE`. That is every run created
+  before the upgrade, and every run created through a replica of an older build while
+  the upgrade lasts: the older build does not write the setting, whatever the scheduler
+  sent. Such a run finishes as it started. A run created through a replica of this
+  build always has a stored setting, and "unspecified" is stored as `MODE_OBEY`.
+- A pin overrides both: while an operator has pinned an origin, every run is judged by
+  the pin there, a run with `MODE_IGNORE` or its own file included.
 
 ### What the policy says
 
@@ -332,11 +371,10 @@ it is read from the global policies only, and a run that sets it is rejected.
 | `enforce` | `false` | `true`: robots.txt is obeyed on this queue whatever the run says. A run's `MODE_IGNORE` and its `files` do not apply here |
 | `product_token` | none | The token matched against `User-agent` lines. Without it only the `*` groups apply. It must be the token the workers send in their `User-Agent` |
 | `lifetime` | 24h | How long a result is fresh. RFC 9309 says a cached file should not be used for longer than 24 hours |
-| `stale_grace` | 1h | How long stale rules stay in force while a new fetch is under way. After it the rules are unknown and tasks are held |
 | `forbidden` | `ALLOW` | What a 401 or 403 on robots.txt means: `ALLOW` (RFC 9309) or `DISALLOW` |
 | `max_crawl_delay` | 1m | The ceiling for `Crawl-delay` |
-| `retry` | 5m | The interval between robots tasks for an origin whose fetch failed, and the length of a claim |
-| `hold_grace` | 1h | The longest a task is held |
+| `retry` | 5m | The interval between robots tasks for an origin whose fetch failed |
+| `hold_grace` | 1h | How long a task is held while every fetch fails, or while no worker has the handler |
 
 - The product token is one per queue. Two crawlers with different identities that share
   a Frontier are judged by the same group on a queue they share. That is a limitation.
@@ -374,8 +412,10 @@ Matching:
   never from `*` when a group names the token.
 - **Path.** The rule is compared with the path and query of the URL, case-sensitively.
   Both are normalised the same way before the comparison, as the RFC requires: octets
-  outside ASCII and reserved characters are percent-encoded, percent-encoded unreserved
-  characters are decoded, and escapes are upper case. `*` matches any sequence of
+  outside ASCII are percent-encoded, a percent-escape of an unreserved character is
+  decoded, a percent-escape of a reserved character stays an escape, and escapes are
+  upper case. The delimiters of the path and the query (`/`, `?`, `=`, `&`) stay as
+  they are written. `*` matches any sequence of
   characters and `$` anchors the end.
 - **Precedence.** The rule with the longest pattern wins. Between an `Allow` and a
   `Disallow` of the same length, `Allow` wins. The RFC says this of equivalent rules;
@@ -401,7 +441,7 @@ fuzzing: it must not fail, hang or allocate beyond a bound on any input of 500 K
   tasks spent held; refusals and skips by code; records by result; compiled files in
   memory, hits and misses; matcher time.
 - Log lines: the first hold of a run on an origin; a result recorded, with status and
-  hops; a robots task that ended without a result; held tasks ended by `hold_grace`,
+  hops; a robots task that ended without a result; held tasks ended after `hold_grace`,
   with the code and the count.
 - `RunStats.held` is a counter of its own, so `delayed` keeps its meaning. `RunStats`
   lists the origins a run is held on, bounded like its blocked queues.
@@ -416,10 +456,11 @@ fuzzing: it must not fail, hang or allocate beyond a bound on any input of 500 K
 **What the operator can do.**
 
 - `RefreshRobots(origin)`: the rules become stale now, so a robots task is armed and the
-  old rules hold for `stale_grace` at most. With `hold: true` they become unknown now:
-  tasks are held until the new result is there.
-- `PinRobots(origin, content, expire_time)`: the operator sets the rules of an origin,
-  for every run that obeys robots.txt. Nothing is fetched while the pin lasts. Pinning
+  old rules hold until its result is there. With `hold: true` they become unknown now:
+  the pending tasks of the origin are moved to held in the background, and tasks are
+  held until the new result is there.
+- `PinRobots(origin, content, expire_time)`: the operator sets the rules of an origin
+  for every run, whatever the run's setting. Nothing is fetched while the pin lasts. Pinning
   `Disallow: /` stops the crawl of an origin at once, and the background step ends its
   pending tasks. `UnpinRobots` removes the pin.
 - `BlockQueue` stays what it is: a stop for a queue and a time. A pin is for an origin
@@ -450,18 +491,23 @@ compatible with the build before it. For this design that means:
   without the last check. For the length of the rollout, tasks that go through an older
   replica are not judged. That is a limitation, and it holds for `enforce` too.
 - An older replica that is given a robots task treats it as an ordinary task and drops
-  the `RobotsResult`. The claim runs out and a new task is armed. The cost is one more
-  fetch per origin touched that way.
-- Runs that exist at the upgrade are stored as `MODE_IGNORE`.
+  the `RobotsResult`. The background step arms a new one. The cost is one more fetch per
+  origin touched that way.
+- Runs that exist at the upgrade, and runs created through an older replica during it,
+  have no stored setting and are read as `MODE_IGNORE`.
 
-The order that avoids the unjudged window is two steps: roll out the build with
+The order that keeps older builds out of it is two steps: roll out the build with
 `robots: {obey: false}` in the policies, then roll out the policies with `obey: true`.
 The second step is a policy rollout, during which replicas run with two policy sets, as
-with every policy change (ADR 0001); a replica with the old set does not hold or judge.
+with every policy change (ADR 0001). A replica with the old set does not hold or judge
+the tasks that go through it, so the unjudged window is as long as that rollout and
+covers those tasks. It does not touch what the other replicas held: a replica releases
+the held tasks of a queue that does not obey only when every registered replica runs
+its policy set, which the store knows from the set each replica registered with.
 
-**Going back.** Rolling the policies back to `obey: false` is safe: the background step
-releases the held tasks of a queue that does not obey, and stops arming robots tasks.
-Rolling the build back comes after that. An older build does not release held tasks, so
+**Going back.** Rolling the policies back to `obey: false` is safe: once every replica
+runs that set, the background step releases the held tasks and stops arming robots
+tasks. Rolling the build back comes after that. An older build does not release held tasks, so
 a rollback of the build while tasks are held leaves them held until the newer build
 runs again.
 
@@ -476,17 +522,17 @@ runs again.
 
 ## Scaling and limits
 
-- **Records.** One row per origin, with up to 500 KiB of body for a `FILE` result and
-  none otherwise. The store holds as many as there are origins crawled within one
+- **Records.** One row per origin, with up to 500 KiB of body for a `FILE` result or a
+  pin and none otherwise. The store holds as many as there are origins crawled within one
   lifetime, the in-memory store in memory. A record is written when a robots task ends
   and when an operator acts, and read by replicas whose copy has an older version.
 - **Held tasks.** State per task. Judging them costs one transaction per batch, and the
   batches of one origin follow each other; no transaction grows with the number of held
   tasks.
 - **Judging.** One match against the compiled rules of one origin. No store access when
-  the replica's copy has the version the claim returned.
-- **Fetches.** One robots task per origin at a time, whatever the number of runs, and
-  one per lifetime while the origin is crawled.
+  the replica's copy has the `rules_version` the claim returned.
+- **Fetches.** One robots task per origin at a time, whatever the number of runs and
+  however long it waits, and one per lifetime while the origin is crawled.
 - **The background step** is bounded per round, like the other steps of `Maintain`, and
   several replicas can run it at once.
 - Limitation: one record per origin. A site that answers robots.txt differently by
@@ -496,6 +542,9 @@ runs again.
   ceiling.
 - Limitation: a task claimed and then skipped or held again costs the queue one
   interval.
+- Limitation: stale rules stay in force until the refresh has run, however long the
+  refresh waits behind a block, a pause or other runs.
+- Limitation: a held task waits as long as its run is paused or its queue is blocked.
 - Limitation: the redirect hops of a robots.txt fetch are not paced by the queues of
   the hosts they reach.
 
@@ -563,4 +612,10 @@ runs again.
    rules, in `RunStats.robots`.
 9. **A run's own files.** robots.txt text keyed by origin, for that run only, with
    `Crawl-delay` ignored.
-10. **The pin.** An operator can set the rules of an origin for every run.
+10. **The pin.** An operator can set the rules of an origin for every run, a run that
+    opted out included.
+11. **Late refresh.** Rules that were known stay in force until the refresh has run.
+    The stricter choice, holding the backlog once the rules are a given time past their
+    lifetime, takes back work that was admitted and was left out.
+12. **`hold_grace`.** It ends held tasks only when every fetch fails or no worker has
+    the handler. A paused run or a blocked queue makes them wait.
