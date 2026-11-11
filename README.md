@@ -202,6 +202,33 @@ Discovered tasks are deduplicated per run by a normalised URL (scheme + host + p
 sorted query; scheme and host lowercased, path and query as they are). Set `DedupKey` when
 a site needs special rules: case-insensitive paths, tracking parameters, POST bodies.
 
+### Testing a spider, and dry runs
+
+`sdk/crawlytest` runs a Frontier inside a test, on the in-memory store. The spider is
+tested end to end, with the retries, dedup and limits it meets in production, against
+pages you recorded, and without a Frontier process or a database:
+
+```go
+func TestSpider(t *testing.T) {
+	site := httptest.NewServer(recordedPages) // your fixtures
+	defer site.Close()
+
+	f := crawlytest.Start(t)
+	w, _ := f.Worker()
+	w.Register("listing", worker.HTTP(listing))
+	w.Register("product", worker.HTTP(product))
+
+	final, err := f.Crawl(t.Context(), w, nil,
+		&task.Spec{Request: &task.Request{Url: site.URL + "/"}, Handler: "listing"})
+	// assert on final.GetStats() and on what the parsers emitted
+}
+```
+
+`sdk/local` is the same Frontier outside a test, for a dry run of a spider against a real
+site: `local.Start()`, then `Crawl` with a `max_tasks` limit. It applies the Frontier's
+default policies unless `local.WithPolicies` gives it your policy file, so a dry run is as
+polite as the real crawl. Its state is in memory and gone when the process ends.
+
 ## Scheduling a run
 
 ```go
