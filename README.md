@@ -185,6 +185,29 @@ Outcomes are plain Go errors:
 
 The codes end up in the run's stats (`Stats.ByCode`), so they are what you alert on.
 
+### Labels
+
+`ByCode` counts attempts by outcome. A label is a second dimension, counted per task:
+give a task a `Label` (a seed through `task.Spec.Label`, a discovered task through
+`worker.NewTask.Label`) and `Stats.ByLabel` reports, for each label, how many of its tasks
+succeeded, failed, expired or were cancelled, and the codes the failed ones ended with. A
+scheduler can judge a run per section of its source from that, for example failed pages
+per category against a tolerance, without putting the section into the outcome code.
+
+- A discovered task that sets no label gets the label of the task that discovered it, so a
+  label follows a subtree, redirects included. `NewTask.Label` replaces it, `NewTask.NoLabel`
+  clears it. The handler reads the label of its task as `Task.Label`.
+- A label matches `[A-Za-z0-9_.:/-]{1,64}`, and a run takes at most 100 distinct labels (the
+  Frontier setting `MaxLabelsPerRun`). A task with another label is added as `INVALID`, and so
+  is a task that would bring the run over the limit; tasks with a label the run already
+  has are not affected.
+- The label is not part of the dedup key: a repeat of a task with another label is a
+  duplicate and keeps the first one's label.
+- `Stats.Invalid` counts the tasks the run rejected as invalid, for any reason. The worker
+  logs the rejected tasks of a discovered batch with the first one's URL and label.
+- Every label that was added appears in `ByLabel`, with zero counts until a task ends.
+  Tasks without a label are not listed. `ListTasks` takes a `label` to list one section.
+
 The HTTP adapter classifies responses itself: 2xx is parsed, 429 retries and blocks the
 site for the `Retry-After` delay (without one it signals strain, see Policies), 502, 503
 and 504 retry and signal strain, 408 and the other 5xx retry, other statuses fail, request

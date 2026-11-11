@@ -475,7 +475,8 @@ func (r *runner) session(ctx, hctx context.Context) error {
 			if st := msg.DiscoverAck.GetStatus(); st != workerv1.DiscoverAck_STATUS_ACCEPTED {
 				r.w.log.Warn("discovered tasks were discarded: the lease was lost", "batch", msg.DiscoverAck.GetBatchId(), "status", st.String())
 			}
-			r.ackBatch(msg.DiscoverAck.GetBatchId())
+			batch := r.ackBatch(msg.DiscoverAck.GetBatchId())
+			r.warnRejected(batch, msg.DiscoverAck.GetResults())
 		case *workerv1.WorkResponse_CompleteAck:
 			if st := msg.CompleteAck.GetStatus(); st != workerv1.CompleteAck_STATUS_ACCEPTED {
 				r.w.log.Warn("a result was discarded: the lease was lost", "lease", msg.CompleteAck.GetLeaseId(), "status", st.String())
@@ -595,15 +596,42 @@ func (r *runner) failRefused() {
 	}
 }
 
-func (r *runner) ackBatch(id string) {
+// ackBatch forgets an acknowledged batch and returns it, or nil if it is not known.
+func (r *runner) ackBatch(id string) *workerv1.DiscoverBatch {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, rep := range r.unacked {
 		if i := slices.IndexFunc(rep.batches, func(b *workerv1.DiscoverBatch) bool { return b.GetBatchId() == id }); i >= 0 {
+			b := rep.batches[i]
 			rep.batches = slices.Delete(rep.batches, i, i+1)
-			return
+			return b
 		}
 	}
+	return nil
+}
+
+// warnRejected logs the tasks of an acknowledged batch that the Frontier rejected as
+// invalid: they are dropped, and nothing else tells the spider's author. One line per
+// batch, with the first rejected task.
+func (r *runner) warnRejected(b *workerv1.DiscoverBatch, results []*taskv1.AddResult) {
+	n, first := 0, -1
+	for i, res := range results {
+		if res.GetStatus() == taskv1.AddResult_STATUS_INVALID {
+			if n == 0 {
+				first = i
+			}
+			n++
+		}
+	}
+	if n == 0 {
+		return
+	}
+	attrs := []any{"batch", b.GetBatchId(), "rejected", n, "of", len(results)}
+	if first >= 0 && first < len(b.GetTasks()) {
+		t := b.GetTasks()[first]
+		attrs = append(attrs, "first_url", t.GetRequest().GetUrl(), "first_label", t.GetLabel(), "first_pool", t.GetPool())
+	}
+	r.w.log.Warn("discovered tasks were rejected as invalid (a bad label, pool, queue key or URL, a task that is too large, or a label beyond the run's limit)", attrs...)
 }
 
 func (r *runner) ackComplete(leaseID string) {
@@ -651,7 +679,7 @@ func (r *runner) revoke(leaseID, reason, why string) {
 func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 	lease, pt := a.GetLease(), a.GetTask()
 	task := &Task{ID: pt.GetTaskId(), RunID: pt.GetRunId(), QueueKey: pt.GetQueueKey(), Handler: pt.GetHandler(),
-		ParentID: pt.GetParentTaskId(), Depth: pt.GetDepth(), Attempt: lease.GetAttempt(),
+		ParentID: pt.GetParentTaskId(), Depth: pt.GetDepth(), Attempt: lease.GetAttempt(), Label: pt.GetLabel(),
 		URL: pt.GetRequest().GetUrl(), Method: pt.GetRequest().GetMethod(), Body: pt.GetRequest().GetBody(),
 		Header: http.Header{}, Context: pt.GetContext(), FetchTimeout: pt.GetFetchTimeout().AsDuration()}
 	if task.Method == "" {
@@ -918,6 +946,12 @@ func taskSpec(parent *Task, nt NewTask, poolFor func(handler string) string) *ta
 		QueueKey: nt.QueueKey, DedupKey: nt.DedupKey, Handler: nt.Handler, Pool: nt.Pool, Priority: nt.Priority, Context: nt.Context}
 	if ts.Handler == "" {
 		ts.Handler = parent.Handler
+	}
+	switch {
+	case nt.Label != "":
+		ts.Label = &nt.Label
+	case nt.NoLabel:
+		ts.Label = new(string)
 	}
 	if ts.Pool == "" {
 		ts.Pool = poolFor(ts.Handler)

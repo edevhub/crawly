@@ -273,7 +273,7 @@ func (h *httpHandler) Handle(ctx context.Context, t *Task) (*Result, error) {
 			// with a 303 to its own URL is not: the GET it asks for is another request.
 			return &Result{Fetch: fetch}, Fail("redirect_loop", errors.New("the page redirects to itself"))
 		}
-		next := NewTask{URL: loc.String(), Context: t.Context}
+		next := NewTask{URL: loc.String(), Context: t.Context, Label: t.Label}
 		if repeats {
 			// 307 and 308 repeat the request as it was.
 			next.Method, next.Body, next.Header = t.Method, t.Body, redirectHeader(t.Header, resp.Request.URL, loc)

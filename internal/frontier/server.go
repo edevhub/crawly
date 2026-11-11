@@ -34,8 +34,12 @@ import (
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/policy"
 	"github.com/edevhub/crawly/internal/store"
+	"github.com/edevhub/crawly/internal/tasklabel"
 	"github.com/edevhub/crawly/internal/wire"
 )
+
+// DefaultMaxLabelsPerRun is Config.MaxLabelsPerRun when it is not set.
+const DefaultMaxLabelsPerRun = 100
 
 // Config configures a Frontier replica.
 type Config struct {
@@ -65,6 +69,9 @@ type Config struct {
 	// serves nothing itself: the caller exposes the registry. Nil: the metrics are
 	// kept in a registry nobody reads. A registry takes one replica.
 	Metrics prometheus.Registerer
+	// MaxLabelsPerRun is how many distinct task labels a run accepts. A task whose
+	// label would be one more is INVALID. Zero: 100.
+	MaxLabelsPerRun int
 }
 
 // Server is one Frontier replica.
@@ -117,6 +124,9 @@ func New(cfg Config) (*Server, error) {
 	cfg.NoHandlerGrace = max(cfg.NoHandlerGrace, 4*cfg.MaintainInterval)
 	if cfg.NoHandlerDelay <= 0 {
 		cfg.NoHandlerDelay = 5 * time.Second
+	}
+	if cfg.MaxLabelsPerRun <= 0 {
+		cfg.MaxLabelsPerRun = DefaultMaxLabelsPerRun
 	}
 	if cfg.Metrics == nil {
 		cfg.Metrics = prometheus.NewRegistry()
@@ -644,9 +654,11 @@ func (s *Server) runSpec(ctx context.Context, id store.RunID) (store.RunSpec, er
 	return r.Spec, nil
 }
 
-// newTasks turns submitted specs into store tasks: pool, queue key, fingerprint, TTL.
-// A spec that cannot be accepted becomes an Invalid entry, so results stay in order.
-func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.NewTask {
+// newTasks turns submitted specs into store tasks: pool, queue key, fingerprint, TTL,
+// label. A spec that cannot be accepted becomes an Invalid entry, so results stay in
+// order. inherit is the label of the discovering task, for a spec that sets none; it is
+// empty for seeds.
+func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec, inherit string) []store.NewTask {
 	out := make([]store.NewTask, len(specs))
 	for i, ts := range specs {
 		pool, queue, fp, err := identify(spec.KeyRule, ts)
@@ -654,8 +666,20 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 			out[i].Invalid = true
 			continue
 		}
+		label := inherit
+		if ts.Label != nil {
+			label = ts.GetLabel()
+		}
+		if label != "" && !tasklabel.Valid(label) {
+			out[i].Invalid = true
+			continue
+		}
 		stored := proto.CloneOf(ts)
 		stored.QueueKey, stored.Pool = queue, string(pool)
+		stored.Label = nil
+		if label != "" {
+			stored.Label = &label
+		}
 		if stored.GetRequest().GetMethod() != "" {
 			// Methods are case-sensitive on the wire. One spelling is stored and sent,
 			// the one the dedup key counts, so that "post" and "POST" are one request.
@@ -666,7 +690,7 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 			out[i].Invalid = true
 			continue
 		}
-		out[i] = store.NewTask{Fingerprint: fp, Queue: store.QueueKey(queue), Pool: pool, Handler: storedHandler(ts.GetHandler()), Priority: ts.GetPriority(), Spec: raw,
+		out[i] = store.NewTask{Fingerprint: fp, Queue: store.QueueKey(queue), Pool: pool, Handler: storedHandler(ts.GetHandler()), Priority: ts.GetPriority(), Spec: raw, Label: label,
 			TTL: s.pol.Resolve(spec.Policy, queue).Behaviour.GetTaskTtl().AsDuration()}
 		if ts.GetNotBeforeTime() != nil {
 			out[i].NotBefore = ts.GetNotBeforeTime().AsTime()

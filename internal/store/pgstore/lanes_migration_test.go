@@ -273,7 +273,7 @@ func TestMigrationDown(t *testing.T) {
 		t.Fatalf("after Down the backlog's ready_at is %v, want %v", got, want)
 	}
 	var n int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_class WHERE relname IN ('lanes', 'pool_handlers', 'unserved_sweep', 'tasks_claim_h')`).Scan(&n); err != nil || n != 0 {
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relname IN ('lanes', 'pool_handlers', 'unserved_sweep', 'tasks_claim_h')`).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("%d objects of migration 2 are left: %v", n, err)
 	}
 	if _, err := p.Up(ctx); err != nil { // and it can be applied again

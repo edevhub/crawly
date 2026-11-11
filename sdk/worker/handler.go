@@ -62,6 +62,9 @@ type Task struct {
 	ParentID string // the task that discovered this one; empty for seeds
 	Depth    uint32 // 0 for seeds, parent depth + 1 for discovered tasks
 	Attempt  uint32 // 1 for the first dispatch
+	// Label is the task's label in the run statistics, after inheritance; empty for none.
+	// Tasks the handler discovers carry it on unless they set their own (see NewTask).
+	Label string
 
 	URL    string
 	Method string // "GET" when the task named none
@@ -119,6 +122,15 @@ type NewTask struct {
 	DedupKey  string
 	Priority  int32
 	NotBefore time.Time
+	// Label puts the task in a label of the run statistics (RunStats.ByLabel), for
+	// example the section of a site. Empty: the task keeps the label of the task that
+	// discovered it, which is how a label follows a subtree. Must match
+	// [A-Za-z0-9_.:/-]{1,64}, otherwise the task is INVALID, as it is when the run
+	// already has as many labels as the Frontier allows. The label is not part of the
+	// dedup key.
+	Label string
+	// NoLabel clears the label the task would inherit. Label must be empty then.
+	NoLabel bool
 	// Context is opaque spider data, handed back with the task. The whole task, with
 	// Context, must fit into MaxTaskBytes.
 	Context map[string][]byte

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -261,6 +262,7 @@ type visit struct {
 type failedTask struct {
 	id      [16]byte
 	attempt int32
+	label   string
 }
 
 // sweepLane handles one lane in a transaction of its own. It returns how many tasks it
@@ -303,14 +305,14 @@ func (s *Store) sweepLane(ctx context.Context, tx pgx.Tx, now time.Time, l sweep
 				LIMIT $7 FOR UPDATE SKIP LOCKED)
 			UPDATE tasks t SET state = 'failed', finished_at = $8, attempt = t.attempt + 1
 			FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id
-			RETURNING t.task_id, t.attempt`,
+			RETURNING t.task_id, t.attempt, t.label`,
 			own.meta.createdOn, l.run, l.queue, l.pool, l.handler, now.Add(-grace), maintainTasks, now)
 		if err != nil {
 			return 0, false, err
 		}
 		failed, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (failedTask, error) {
 			var f failedTask
-			err := row.Scan(&f.id, &f.attempt)
+			err := row.Scan(&f.id, &f.attempt, &f.label)
 			return f, err
 		})
 		if err != nil {
@@ -330,6 +332,13 @@ func (s *Store) sweepLane(ctx context.Context, tx pgx.Tx, now time.Time, l sweep
 		}
 		batch.Queue(`INSERT INTO backlog_codes (queue_key, run_no, code, count) VALUES ($1, $2, $3, $4)
 			ON CONFLICT (queue_key, run_no, code) DO UPDATE SET count = backlog_codes.count + EXCLUDED.count`, l.queue, l.run, store.CodeNoHandler, n)
+		perLabel := map[string]int64{}
+		for _, f := range failed {
+			perLabel[f.label]++
+		}
+		for _, label := range slices.Sorted(maps.Keys(perLabel)) {
+			countFailed(batch, l.queue, l.run, label, store.CodeNoHandler, perLabel[label])
+		}
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 			return 0, false, err
 		}

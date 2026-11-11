@@ -33,9 +33,14 @@ ALTER TABLE runs SET (fillfactor = 70);
 
 ALTER TABLE replicas ADD COLUMN IF NOT EXISTS abort_rules boolean NOT NULL DEFAULT false;
 
+-- A concurrent build or drop waits for the transactions that were open when it began,
+-- and stops nobody while it waits: the lock timeout is lifted for these statements, or
+-- one long transaction anywhere in the database would fail the migration.
+SET lock_timeout = 0;
 DROP INDEX CONCURRENTLY IF EXISTS runs_draining_v2; -- what an interrupted build left
 CREATE INDEX CONCURRENTLY runs_draining_v2 ON runs (run_no) WHERE state IN ('cancelled', 'expired', 'aborted');
 DROP INDEX CONCURRENTLY IF EXISTS runs_draining;
+RESET lock_timeout;
 ALTER INDEX IF EXISTS runs_draining_v2 RENAME TO runs_draining;
 
 -- +goose Down
@@ -53,7 +58,9 @@ ALTER TABLE runs
   DROP COLUMN IF EXISTS abort_code,
   DROP COLUMN IF EXISTS abort_task;
 ALTER TABLE replicas DROP COLUMN IF EXISTS abort_rules;
+SET lock_timeout = 0;
 DROP INDEX CONCURRENTLY IF EXISTS runs_draining_v2; -- what an interrupted build left
 CREATE INDEX CONCURRENTLY runs_draining_v2 ON runs (run_no) WHERE state IN ('cancelled', 'expired');
 DROP INDEX CONCURRENTLY IF EXISTS runs_draining;
+RESET lock_timeout;
 ALTER INDEX IF EXISTS runs_draining_v2 RENAME TO runs_draining;

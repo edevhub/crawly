@@ -322,6 +322,12 @@ func TestHTTPRedirects(t *testing.T) {
 	if res.Fetch.HTTPStatus != 302 || res.Fetch.FinalURL != site.URL+"/same" {
 		t.Fatalf("same-host redirect: fetch %+v", res.Fetch)
 	}
+	// The target keeps the label of the task.
+	labelled := get(site.URL + "/same")
+	labelled.Label = "section"
+	if res, err = HTTP(p).Handle(ctx, labelled); err != nil || len(res.Tasks) != 1 || res.Tasks[0].Label != "section" {
+		t.Fatalf("redirect of a labelled task: %+v %v", res, err)
+	}
 
 	// Unless the spider opts in: followed, and the parser sees the final URL.
 	p = &echo{}
