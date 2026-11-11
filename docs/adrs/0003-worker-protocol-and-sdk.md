@@ -34,10 +34,24 @@ This ADR borrows it.
   `build_version`. A worker process that serves several pools opens one session per pool.
 - A session for a pool that has no tasks yet is valid: it receives work as soon as the first
   task of that pool is added.
-- A worker that receives a task whose handler it does not have reports `FAILED` with code
-  `no_handler`, as Temporal fails an unregistered activity type. It is a permanent failure,
-  counted in the run's stats like any other code. Spiders agree on pool names the same way
-  they agree on handler names.
+- A worker that receives a task whose handler it does not have **hands it back**: outcome
+  `RELEASED`, code `no_handler`. A handler name is a contract between builds, and in a
+  rolling deploy the workers of the old build share a pool with the build that added a
+  handler. The Frontier returns the task to its backlog without counting an attempt, holds
+  it for a short delay and gives it out again, to whichever session is next. It fails the
+  task with code `no_handler` only when no worker could run it for a configured time (one
+  hour by default). The time starts with the first worker that lacks the handler and ends
+  with the first worker that runs the task, whatever the result, so a long deploy does not
+  fail a task that is being served.
+  - Dispatch does not select by handler. The store claims work by pool and queue, and a
+    handler filter under that would leave a backlog whose head no session can run. The
+    price of the simpler rule is that every round of a handed-back task takes a politeness
+    slot of its queue; the delay bounds that.
+  - The time is kept per replica, in memory, one entry per task that is going round. A
+    restart starts it again. Replicas that restart more often than the configured time
+    therefore never fail such a task: it keeps going round until a worker has its handler
+    or its run ends. The Frontier logs the first hand-back of a task and its failure; the
+    run's stats show the code only once the task failed.
 
 ### Credits
 
@@ -116,8 +130,32 @@ Unchanged: `SUCCESS`, `RETRY` (with optional `retry_after`), `FAILED`, any of th
 `block_queue_for`. The spider classifies; the Frontier applies `max_attempts` and backoff,
 as Temporal's retry policy does, with `FAILED` in the place of a non-retryable error type.
 
-Codes the SDK reports itself: `no_handler` (`FAILED`), `panic` (a handler panicked:
-`RETRY`) and `redirect` (`SUCCESS`: the target of the redirect was added as a task).
+`RELEASED` is the fourth outcome, and the SDK's own: the worker did not run the task to an
+end and hands it back. The Frontier undoes the dispatch as it does for an assignment that
+never reached a worker: the task is pending again, no attempt is recorded and the attempt
+number is used again. The SDK sends it in two cases:
+
+- the worker lacks the task's handler (code `no_handler`, see Pools);
+- the worker shut down and its grace passed while the handler ran (code `shutdown`). The
+  handler's context is cancelled, the task is handed back and the session stays open until
+  that is acknowledged. A deploy during a slow page therefore never uses up `max_attempts`
+  of a task that was not at fault.
+
+A handler cannot return it: a spider that could hand back any task at will could keep a
+task alive for ever. For the same reason the Frontier accepts `RELEASED` with these two
+codes only, and treats any other code as `FAILED`.
+
+An outcome the handler classified itself stands, also when it arrives at the moment of the
+cut: only a handler that returns its cancellation is handed back.
+
+A Frontier says in `Welcome.releases` that it understands `RELEASED`. To a Frontier that
+does not, the SDK sends what it sent before: `FAILED` for a missing handler, and nothing
+for a cut handler, whose lease then expires. Workers and Frontier can therefore be
+upgraded in any order.
+
+Codes the SDK reports itself: `no_handler` and `shutdown` (`RELEASED`), `panic` (a handler
+panicked: `RETRY`) and `redirect` (`SUCCESS`: the target of the redirect was added as a
+task).
 
 ### Redirects and dedup keys
 
@@ -248,7 +286,7 @@ choice in the caller's code.
 | Schedule-to-close timeout | `task_ttl`, measured from add, across retries, enforced while pending |
 | Retry policy, non-retryable errors | `Behaviour` (`max_attempts`, backoff), `FAILED` |
 | Activity heartbeat, context cancellation | SDK lease timer, cancellation on `LeaseRevoked` |
-| Unregistered activity type | `FAILED`, code `no_handler` |
+| Unregistered activity type | Handed back (`RELEASED`, code `no_handler`); `FAILED` when no worker has the handler for long enough |
 | Fairness keys and weights | Per-queue fair queueing by run weight (ADR 0001) |
 | Priority tiers above fairness | Priority **below** fairness, inside a run's backlog (ADR 0001) |
 | `TaskQueueActivitiesPerSecond` | Not built (ADR 0001, Alternatives) |
@@ -269,7 +307,7 @@ choice in the caller's code.
 - Routing is by name only. A new kind of worker is a new pool name in the scheduler's or
   spider's task specs, and sessions for it.
 - A misrouted task (wrong pool, missing handler) fails visibly with `no_handler` instead of
-  waiting forever for a worker that matches.
+  waiting forever for a worker that matches, after the time a rolling deploy is given.
 - Spiders never think about leases, heartbeats or ordering; the SDK does.
 - The Frontier keeps one inbound goroutine per session and one dispatch loop per pool.
 

@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/testfrontier"
 	"github.com/edevhub/crawly/sdk"
 	"github.com/edevhub/crawly/sdk/run"
@@ -593,6 +594,149 @@ func TestFrontierShutdown(t *testing.T) {
 
 	e.f.Restart()
 	if st := e.crawl("after", nil, spec("https://a.example/2", "page")); st.GetSucceeded() != 1 {
+		t.Fatalf("stats: %v", st)
+	}
+}
+
+// TestRollingDeploy: a worker without a task's handler hands the task back, and a
+// worker of the same pool that has the handler runs it. No task fails and no attempt
+// is spent on the way.
+func TestRollingDeploy(t *testing.T) {
+	e := newEnv(t)
+	e.f.Stop()
+	e.f.NoHandlerGrace = time.Minute
+	e.f.Restart()
+	old := newWorker(t, e.addr, worker.WithID("old"))
+	register(t, old, "listing", noop)
+	e.start(old)
+	current := newWorker(t, e.addr, worker.WithID("current"))
+	var products atomic.Int64
+	register(t, current, "listing", noop)
+	register(t, current, "product", worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+		products.Add(1)
+		return nil, nil
+	}))
+	e.start(current)
+
+	const n = 40
+	seeds := make([]*task.Spec, n)
+	for i := range seeds {
+		seeds[i] = spec("https://a.example/product/"+strconv.Itoa(i), "product")
+	}
+	st := e.crawl("rolling", nil, seeds...)
+	if st.GetSucceeded() != n || st.GetFailed() != 0 || st.GetAttempts() != n || products.Load() != n {
+		t.Fatalf("stats: %v, %d products handled", st, products.Load())
+	}
+}
+
+// TestNoHandler: a task whose handler no worker has fails once it waited long enough.
+func TestNoHandler(t *testing.T) {
+	e := newEnv(t)
+	w := newWorker(t, e.addr)
+	register(t, w, "page", noop)
+	e.start(w)
+	st := e.crawl("unknown", nil, spec("https://a.example/", "nobody"))
+	if st.GetFailed() != 1 || st.GetByCode()["no_handler"] != 1 || st.GetAttempts() != 1 {
+		t.Fatalf("stats: %v", st)
+	}
+}
+
+// TestShutdownHandsBack: a handler still running when the shutdown grace passes is
+// cancelled and its task handed back: the next worker runs it as its first attempt.
+func TestShutdownHandsBack(t *testing.T) {
+	e := newEnv(t)
+	started := make(chan struct{})
+	first := newWorker(t, e.addr, worker.WithShutdownGrace(50*time.Millisecond))
+	register(t, first, "slow", worker.HandlerFunc(func(ctx context.Context, _ *worker.Task) (*worker.Result, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	stop := e.start(first)
+	e.open("cut", nil, spec("https://a.example/", "slow"))
+	<-started
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	var attempt atomic.Uint32
+	second := newWorker(t, e.addr)
+	register(t, second, "slow", worker.HandlerFunc(func(_ context.Context, tk *worker.Task) (*worker.Result, error) {
+		attempt.Store(tk.Attempt)
+		return nil, nil
+	}))
+	e.start(second)
+	st := e.wait("cut")
+	if st.GetSucceeded() != 1 || st.GetAttempts() != 1 || attempt.Load() != 1 || len(st.GetByCode()) != 0 {
+		t.Fatalf("the cut task must be run again as attempt 1: %v, attempt %d", st, attempt.Load())
+	}
+}
+
+// TestOutcomeAtShutdownStands: an outcome the handler classified itself is reported
+// as it is, also when it arrives at the moment the shutdown cuts the handler.
+func TestOutcomeAtShutdownStands(t *testing.T) {
+	e := newEnv(t)
+	started := make(chan struct{})
+	w := newWorker(t, e.addr, worker.WithShutdownGrace(50*time.Millisecond))
+	register(t, w, "slow", worker.HandlerFunc(func(ctx context.Context, _ *worker.Task) (*worker.Result, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, worker.Fail("gone", nil)
+	}))
+	stop := e.start(w)
+	e.open("verdict", nil, spec("https://a.example/", "slow"))
+	<-started
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	// No worker is left: the run completes only if the failure was reported.
+	if st := e.wait("verdict"); st.GetFailed() != 1 || st.GetByCode()["gone"] != 1 {
+		t.Fatalf("stats: %v", st)
+	}
+}
+
+// olderFrontier makes a Frontier answer as one that does not know the hand-back.
+type olderFrontier struct{ grpc.ServerStream }
+
+func (o olderFrontier) SendMsg(m any) error {
+	if res, ok := m.(*workerv1.WorkResponse); ok && res.GetWelcome() != nil {
+		res.GetWelcome().Releases = false
+	}
+	return o.ServerStream.SendMsg(m)
+}
+
+// TestOlderFrontier: a Frontier that does not say it takes tasks back is not sent a
+// hand-back, which it would turn into a permanent failure of a task that can still be
+// run. A missing handler fails as it did, and a task cut by a shutdown is left to its
+// lease.
+func TestOlderFrontier(t *testing.T) {
+	e := newEnv(t)
+	e.f.Stop()
+	e.f.ServerOptions = []grpc.ServerOption{grpc.StreamInterceptor(
+		func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, h grpc.StreamHandler) error {
+			return h(srv, olderFrontier{ss})
+		})}
+	e.f.Restart()
+
+	started := make(chan struct{})
+	first := newWorker(t, e.addr, worker.WithShutdownGrace(50*time.Millisecond))
+	register(t, first, "slow", worker.HandlerFunc(func(ctx context.Context, _ *worker.Task) (*worker.Result, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	stop := e.start(first)
+	e.open("old", nil, spec("https://a.example/slow", "slow"), spec("https://a.example/nobody", "nobody"))
+	<-started
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	second := newWorker(t, e.addr)
+	register(t, second, "slow", noop)
+	e.start(second)
+	st := e.wait("old")
+	if st.GetSucceeded() != 1 || st.GetFailed() != 1 || st.GetByCode()["no_handler"] != 1 ||
+		st.GetByCode()["lease_expired"] != 1 || st.GetByCode()["shutdown"] != 0 {
 		t.Fatalf("stats: %v", st)
 	}
 }

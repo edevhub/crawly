@@ -172,6 +172,7 @@ Outcomes are plain Go errors:
 | `worker.Fail(code, err)` | Permanent failure; never retried |
 | any other error | Transient failure, code `error` (`timeout` for a deadline) |
 | a panic | Transient failure, code `panic` |
+| the worker shuts down before the handler returns | The task is handed back to the Frontier: another worker runs it, and no attempt is counted |
 
 The codes end up in the run's stats (`Stats.ByCode`), so they are what you alert on.
 
@@ -372,6 +373,13 @@ statistics, that long after it ended. With PostgreSQL the tasks and attempts liv
 monthly partitions, and `-retain-tasks 2160h` drops a partition once every run in it is
 older than that and has no work left; the in-memory store deletes a run's tasks with the
 run.
+
+**Deploys.** A worker that is given a task for a handler it does not have hands the task
+back, and the Frontier gives it to another worker of the pool. A rolling deploy that adds
+or renames a handler therefore loses nothing while both builds run. A task whose handler no
+worker has fails with code `no_handler` after `-no-handler-grace` (one hour by default). A
+worker that stops lets its handlers finish for `WithShutdownGrace`, then cancels them and
+hands their tasks back, so a deploy never uses up a task's attempts.
 
 **Logs.** A lease that expires is logged at `WARN` with its run, task and queue: the worker
 that held it has died or is stuck.
