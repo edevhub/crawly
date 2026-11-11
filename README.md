@@ -218,16 +218,18 @@ func TestSpider(t *testing.T) {
 	w.Register("listing", worker.HTTP(listing))
 	w.Register("product", worker.HTTP(product))
 
-	final, err := f.Crawl(t.Context(), w, nil,
-		&task.Spec{Request: &task.Request{Url: site.URL + "/"}, Handler: "listing"})
+	final, err := f.Crawl(t.Context(), w,
+		[]*task.Spec{{Request: &task.Request{Url: site.URL + "/"}, Handler: "listing"}})
 	// assert on final.GetStats() and on what the parsers emitted
 }
 ```
 
 `sdk/local` is the same Frontier outside a test, for a dry run of a spider against a real
-site: `local.Start()`, then `Crawl` with a `max_tasks` limit. It applies the Frontier's
-default policies unless `local.WithPolicies` gives it your policy file, so a dry run is as
-polite as the real crawl. Its state is in memory and gone when the process ends.
+site: `local.Start()`, then `Crawl` with a `max_tasks` limit (`local.WithRun`) and a
+deadline on its context. It applies the Frontier's default policies unless
+`local.WithPolicies` gives it your policy file, so a dry run is as polite as the real
+crawl. A crawl that is cut short returns the run as it stood, with its statistics, and
+cancels it. Its state is in memory and gone when the process ends.
 
 ## Scheduling a run
 

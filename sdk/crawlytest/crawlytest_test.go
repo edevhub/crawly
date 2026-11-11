@@ -2,13 +2,16 @@ package crawlytest_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/edevhub/crawly/sdk"
 	"github.com/edevhub/crawly/sdk/crawlytest"
 	"github.com/edevhub/crawly/sdk/local"
 	"github.com/edevhub/crawly/sdk/run"
@@ -63,7 +66,9 @@ func TestCrawl(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	final, err := f.Crawl(t.Context(), w, nil, &task.Spec{Request: &task.Request{Url: srv.URL + "/"}, Handler: "listing"})
+	var events atomic.Int64
+	final, err := f.Crawl(t.Context(), w, []*task.Spec{{Request: &task.Request{Url: srv.URL + "/"}, Handler: "listing"}},
+		local.WithWait(sdk.OnEvent(func(*run.Event) { events.Add(1) })))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,24 +79,136 @@ func TestCrawl(t *testing.T) {
 		st.GetByCode()["http_404"] != 1 || st.GetByCode()["http_503"] != 1 || items.Load() != 2 {
 		t.Fatalf("state %v, stats %v, %d items", final.GetState(), st, items.Load())
 	}
+	if events.Load() == 0 {
+		t.Error("the wait options were not applied")
+	}
 }
 
-// TestCrawlErrors: what cannot be crawled is an error, not a run that never ends.
-func TestCrawlErrors(t *testing.T) {
-	f := crawlytest.Start(t)
+// page is a seed for the handler "page".
+func page(url string) []*task.Spec {
+	return []*task.Spec{{Request: &task.Request{Url: url}, Handler: "page"}}
+}
+
+// newWorker is a worker of f whose handler "page" counts its calls.
+func newWorker(t *testing.T, f *local.Frontier, calls *atomic.Int64, opts ...worker.RegisterOption) *worker.Worker {
+	t.Helper()
 	w, err := f.Worker()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Crawl(t.Context(), w, nil, &task.Spec{Request: &task.Request{Url: "not a url"}, Handler: "page"}); err == nil {
-		t.Error("a seed that is not added must be an error")
+	err = w.Register("page", worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+		calls.Add(1)
+		return nil, nil
+	}), opts...)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// A worker without handlers cannot run.
-	if _, err := f.Crawl(t.Context(), w, nil, &task.Spec{Request: &task.Request{Url: "https://a.example/"}, Handler: "page"}); err == nil {
+	return w
+}
+
+// TestCrawlErrors: what cannot be crawled is an error found before a run exists, and
+// a crawl that fails later leaves no work behind for the next one.
+func TestCrawlErrors(t *testing.T) {
+	f := crawlytest.Start(t)
+	var calls atomic.Int64
+	bare, err := f.Worker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Crawl(t.Context(), bare, page("https://a.example/")); err == nil {
 		t.Error("a worker without handlers must be an error")
 	}
+	if _, err := f.Crawl(t.Context(), newWorker(t, f, &calls, worker.InPool("other")), page("https://a.example/")); err == nil {
+		t.Error("a seed for a pool the worker does not serve must be an error")
+	}
+	// A seed that is not added fails the crawl after the run was created.
+	seeds := append(page("https://a.example/first"), page("not a url")...)
+	final, err := f.Crawl(t.Context(), newWorker(t, f, &calls), seeds)
+	if err == nil || final.GetState() != run.StateCancelled {
+		t.Errorf("a seed that is not added: run %v, err %v; want the cancelled run and an error", final.GetState(), err)
+	}
+	// A worker serves one crawl: the second fails when the worker is started.
+	used := newWorker(t, f, &calls)
+	if _, err := f.Crawl(t.Context(), used, page("https://a.example/once")); err != nil {
+		t.Fatal(err)
+	}
+	if final, err := f.Crawl(t.Context(), used, page("https://a.example/twice")); err == nil || final.GetState() != run.StateCancelled {
+		t.Errorf("a used worker: run %v, err %v", final.GetState(), err)
+	}
+
+	// None of the failed crawls left a task for this one: its handler runs once.
+	calls.Store(0)
+	final, err = f.Crawl(t.Context(), newWorker(t, f, &calls), page("https://a.example/clean"))
+	if err != nil || final.GetStats().GetSucceeded() != 1 || calls.Load() != 1 {
+		t.Fatalf("after failed crawls: %v, %d handler calls, %v", final.GetStats(), calls.Load(), err)
+	}
+
 	if _, err := local.Start(local.WithPolicies([]byte("{"))); err == nil {
 		t.Error("policies that do not parse must be an error")
 	}
-	f.Close() // twice is safe: the test's clean-up closes it again
+}
+
+// TestCrawlRequest: the caller's request is not changed, so it can be used again.
+func TestCrawlRequest(t *testing.T) {
+	f := crawlytest.Start(t)
+	var calls atomic.Int64
+	req := &run.CreateRunRequest{Limits: &run.Limits{MaxTasks: 10}}
+	for i := range 2 {
+		final, err := f.Crawl(t.Context(), newWorker(t, f, &calls), page("https://a.example/"), local.WithRun(req))
+		if err != nil || final.GetStats().GetSucceeded() != 1 || final.GetLimits().GetMaxTasks() != 10 {
+			t.Fatalf("crawl %d: %v %v", i, final, err)
+		}
+	}
+	if req.GetRunId() != "" {
+		t.Errorf("the request was changed: run id %q", req.GetRunId())
+	}
+	// No seeds: the run completes at once.
+	if final, err := f.Crawl(t.Context(), newWorker(t, f, &calls), nil); err != nil || final.GetState() != run.StateCompleted {
+		t.Fatalf("no seeds: %v %v", final, err)
+	}
+}
+
+// TestCrawlCut: a crawl cut by its context returns the run as it was, cancelled, and
+// one cut by Close returns ErrClosed.
+func TestCrawlCut(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	slow := func(f *local.Frontier) *worker.Worker {
+		w, err := f.Worker(worker.WithShutdownGrace(10 * time.Millisecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Register("page", worker.HandlerFunc(func(ctx context.Context, _ *worker.Task) (*worker.Result, error) {
+			select {
+			case <-block:
+			case <-ctx.Done():
+			}
+			return nil, ctx.Err()
+		})); err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+
+	f := crawlytest.Start(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	final, err := f.Crawl(ctx, slow(f), page("https://a.example/"))
+	if !errors.Is(err, context.DeadlineExceeded) || final.GetState() != run.StateCancelled {
+		t.Fatalf("deadline: run %v, err %v", final.GetState(), err)
+	}
+
+	closing, err := local.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.AfterFunc(300*time.Millisecond, closing.Close)
+	started := time.Now()
+	if _, err := closing.Crawl(t.Context(), slow(closing), page("https://a.example/")); !errors.Is(err, local.ErrClosed) {
+		t.Fatalf("closed: %v", err)
+	}
+	if took := time.Since(started); took > 10*time.Second {
+		t.Fatalf("the crawl outlived its frontier by %v", took)
+	}
+	closing.Close() // twice is safe
 }
