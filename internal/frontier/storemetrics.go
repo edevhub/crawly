@@ -23,7 +23,7 @@ var answers = []error{store.ErrNotFound, store.ErrConflict, store.ErrRunClosed, 
 var (
 	storeMethods = []string{"CreateRun", "SealRun", "PauseRun", "ResumeRun", "CancelRun", "GetRun", "ListRuns", "RunEvents",
 		"LastEventCursor", "AddTasks", "Dispatch", "Lease", "ExtendLease", "Finish", "ExpiredLeases", "GetTask", "ListTasks",
-		"GetQueue", "ListQueues", "BlockQueue", "PoolStats", "Start", "Maintain", "Now"}
+		"GetQueue", "ListQueues", "BlockQueue", "PoolStats", "Start", "ServeHandlers", "SweepUnserved", "Maintain", "Now"}
 	storeErrorKinds = []string{"unavailable", "timeout", "other"}
 )
 
@@ -163,6 +163,14 @@ func (t timedStore) PoolStats(ctx context.Context, limit int) ([]store.PoolStats
 
 func (t timedStore) Start(ctx context.Context, r store.Replica) error {
 	return timedErr(t, "Start", func() error { return t.Store.Start(ctx, r) })
+}
+
+func (t timedStore) ServeHandlers(ctx context.Context, sets []store.PoolHandlers) error {
+	return timedErr(t, "ServeHandlers", func() error { return t.Store.ServeHandlers(ctx, sets) })
+}
+
+func (t timedStore) SweepUnserved(ctx context.Context, grace time.Duration) (store.Unserved, error) {
+	return timed(t, "SweepUnserved", func() (store.Unserved, error) { return t.Store.SweepUnserved(ctx, grace) })
 }
 
 func (t timedStore) Maintain(ctx context.Context) error {

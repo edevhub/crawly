@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/poolname"
 	"github.com/edevhub/crawly/internal/store"
+	"github.com/edevhub/crawly/internal/wire"
 )
 
 // maxCredits bounds what one session can hold, against a misbehaving worker.
@@ -49,13 +51,15 @@ func (p *pool) wakeUp() {
 }
 
 type session struct {
-	id     store.SessionID
-	worker store.WorkerInfo
-	pool   store.PoolName
-	since  time.Time // when the session opened
-	ctx    context.Context
-	cancel context.CancelFunc
-	out    chan *workerv1.WorkResponse
+	id       store.SessionID
+	worker   store.WorkerInfo
+	pool     store.PoolName
+	since    time.Time // when the session opened
+	handlers []string  // what the worker declared in Hello; none: it is offered every task
+	sig      string    // the handlers as one string: sessions with the same one are given the same work
+	ctx      context.Context
+	cancel   context.CancelFunc
+	out      chan *workerv1.WorkResponse
 
 	credits int                           // guarded by pool.mu
 	served  uint64                        // guarded by pool.mu: pool.served when it last got work; 0: never
@@ -170,6 +174,10 @@ func (w workerService) Work(stream grpc.BidiStreamingServer[workerv1.WorkRequest
 	if !poolname.Valid(hello.GetPool()) {
 		return status.Errorf(codes.InvalidArgument, "pool %q does not match %s", hello.GetPool(), poolname.Pattern)
 	}
+	handlers, err := sessionHandlers(hello.GetHandlers())
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 	s.mu.Lock()
@@ -178,7 +186,7 @@ func (w workerService) Work(stream grpc.BidiStreamingServer[workerv1.WorkRequest
 	s.mu.Unlock()
 	sess := &session{id: id, ctx: ctx, cancel: cancel, out: make(chan *workerv1.WorkResponse, 256), since: time.Now(),
 		pool:   store.PoolName(hello.GetPool()),
-		worker: store.WorkerInfo{ID: hello.GetWorkerId(), Version: hello.GetBuildVersion()},
+		worker: store.WorkerInfo{ID: hello.GetWorkerId(), Version: hello.GetBuildVersion()}, handlers: handlers, sig: strings.Join(handlers, "\x00"),
 		leases: map[store.LeaseID]store.RunID{}, undelivered: map[store.LeaseID]store.LeaseRef{}}
 	p := s.pool(loops, store.PoolName(hello.GetPool()))
 	p.mu.Lock()
@@ -243,7 +251,7 @@ func (w workerService) Work(stream grpc.BidiStreamingServer[workerv1.WorkRequest
 	sess.send(&workerv1.WorkResponse{Msg: &workerv1.WorkResponse_Welcome{Welcome: &workerv1.Welcome{
 		SessionId: string(id), ServerTime: timestamppb.New(now), Releases: true}}})
 	s.m.opened.WithLabelValues(s.m.pools.label(hello.GetPool())).Inc()
-	s.log.Info("session opened", "session", id, "pool", p.name, "worker", sess.worker.ID)
+	s.log.Info("session opened", "session", id, "pool", p.name, "worker", sess.worker.ID, "build", sess.worker.Version, "handlers", handlers)
 	defer s.log.Info("session closed", "session", id)
 
 	ended := func() error {
@@ -299,6 +307,20 @@ func (w workerService) Work(stream grpc.BidiStreamingServer[workerv1.WorkRequest
 			return status.Error(codes.Unavailable, err.Error())
 		}
 	}
+}
+
+// sessionHandlers validates the handlers a worker declared and returns them sorted and
+// without repeats. None is allowed: the session is then offered every task of its pool.
+func sessionHandlers(declared []string) ([]string, error) {
+	if len(declared) > wire.MaxSessionHandlers {
+		return nil, status.Errorf(codes.InvalidArgument, "a session can name at most %d handlers", wire.MaxSessionHandlers)
+	}
+	for _, h := range declared {
+		if h == "" || !wire.ValidHandler(h) {
+			return nil, status.Errorf(codes.InvalidArgument, "handler name %.32q is empty, longer than %d bytes or holds a NUL byte", h, wire.MaxHandlerBytes)
+		}
+	}
+	return slices.Compact(slices.Sorted(slices.Values(declared))), nil
 }
 
 // leaseInfo returns the context of a lease: from this replica's own dispatches, or
@@ -444,16 +466,18 @@ func (s *Server) dispatchLoop(ctx context.Context, p *pool) {
 	}
 }
 
-// dispatchRound hands out work until the store has none ready or no session has a
-// free credit. It returns when the store expects more work, if it said.
+// dispatchRound hands out work until the store has none ready for any session that has
+// a free credit. It returns when the store expects more work, if it said.
 func (s *Server) dispatchRound(ctx context.Context, p *pool) time.Time {
+	var next time.Time
+	idle := map[string]bool{} // handler sets the store had nothing for in this round
 	for ctx.Err() == nil {
 		p.mu.Lock()
 		// The session that has waited longest for work goes first, so that work is
 		// shared between the workers of a pool whatever their free credits are.
 		var sess *session
 		for c := range p.sessions {
-			if c.credits > 0 && c.ctx.Err() == nil && (sess == nil || c.served < sess.served) {
+			if c.credits > 0 && c.ctx.Err() == nil && !idle[c.sig] && (sess == nil || c.served < sess.served) {
 				sess = c
 			}
 		}
@@ -463,9 +487,9 @@ func (s *Server) dispatchRound(ctx context.Context, p *pool) time.Time {
 		}
 		p.mu.Unlock()
 		if sess == nil {
-			return time.Time{} // a Credit wakes the loop
+			return next // a Credit wakes the loop
 		}
-		res, err := s.store.Dispatch(ctx, store.DispatchRequest{Session: sess.id, Worker: sess.worker, Pool: p.name, Slots: slots})
+		res, err := s.store.Dispatch(ctx, store.DispatchRequest{Session: sess.id, Worker: sess.worker, Pool: p.name, Handlers: sess.handlers, Slots: slots})
 		if len(res.Assignments) > 0 {
 			p.mu.Lock()
 			p.served++
@@ -496,7 +520,11 @@ func (s *Server) dispatchRound(ctx context.Context, p *pool) time.Time {
 			return time.Time{}
 		}
 		if len(res.Assignments) == 0 {
-			return res.NextReadyAt
+			// Sessions with other handlers may still be served.
+			idle[sess.sig] = true
+			if at := res.NextReadyAt; !at.IsZero() && (next.IsZero() || at.Before(next)) {
+				next = at
+			}
 		}
 	}
 	return time.Time{}

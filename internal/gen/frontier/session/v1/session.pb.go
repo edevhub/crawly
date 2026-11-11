@@ -41,7 +41,10 @@ type Session struct {
 	// have not been completed.
 	UnfinishedAssignments uint32 `protobuf:"varint,7,opt,name=unfinished_assignments,json=unfinishedAssignments,proto3" json:"unfinished_assignments,omitempty"`
 	// The replica that holds the session.
-	ReplicaId     string `protobuf:"bytes,8,opt,name=replica_id,json=replicaId,proto3" json:"replica_id,omitempty"`
+	ReplicaId string `protobuf:"bytes,8,opt,name=replica_id,json=replicaId,proto3" json:"replica_id,omitempty"`
+	// Hello.handlers, as the worker sent them. Empty: the worker declared none and is
+	// offered every task.
+	Handlers      []string `protobuf:"bytes,9,rep,name=handlers,proto3" json:"handlers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -132,11 +135,18 @@ func (x *Session) GetReplicaId() string {
 	return ""
 }
 
+func (x *Session) GetHandlers() []string {
+	if x != nil {
+		return x.Handlers
+	}
+	return nil
+}
+
 var File_crawly_frontier_session_v1_session_proto protoreflect.FileDescriptor
 
 const file_crawly_frontier_session_v1_session_proto_rawDesc = "" +
 	"\n" +
-	"(crawly/frontier/session/v1/session.proto\x12\x1acrawly.frontier.session.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xb1\x02\n" +
+	"(crawly/frontier/session/v1/session.proto\x12\x1acrawly.frontier.session.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xcd\x02\n" +
 	"\aSession\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1b\n" +
@@ -147,7 +157,8 @@ const file_crawly_frontier_session_v1_session_proto_rawDesc = "" +
 	"\acredits\x18\x06 \x01(\rR\acredits\x125\n" +
 	"\x16unfinished_assignments\x18\a \x01(\rR\x15unfinishedAssignments\x12\x1d\n" +
 	"\n" +
-	"replica_id\x18\b \x01(\tR\treplicaIdBFZDgithub.com/edevhub/crawly/internal/gen/frontier/session/v1;sessionv1b\x06proto3"
+	"replica_id\x18\b \x01(\tR\treplicaId\x12\x1a\n" +
+	"\bhandlers\x18\t \x03(\tR\bhandlersBFZDgithub.com/edevhub/crawly/internal/gen/frontier/session/v1;sessionv1b\x06proto3"
 
 var (
 	file_crawly_frontier_session_v1_session_proto_rawDescOnce sync.Once

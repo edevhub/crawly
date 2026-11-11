@@ -25,4 +25,7 @@ message Session {
   uint32 unfinished_assignments = 7;
   // The replica that holds the session.
   string replica_id = 8;
+  // Hello.handlers, as the worker sent them. Empty: the worker declared none and is
+  // offered every task.
+  repeated string handlers = 9;
 }

@@ -54,9 +54,9 @@ const (
 // codeUndelivered is the release code of an assignment that never reached its worker.
 const codeUndelivered = "undelivered"
 
-// reservedCodes are the codes the Frontier itself gives outcomes and releases. They keep
+// metricCodes are the codes the Frontier itself gives outcomes and releases. They keep
 // their label whatever the workers report.
-var reservedCodes = []string{CodeNoHandler, CodeShutdown, codeUndelivered, "lease_expired", "revoked"}
+var metricCodes = []string{CodeNoHandler, CodeShutdown, codeUndelivered, "lease_expired", "revoked"}
 
 // releaseCode is the label of a released task's code: a closed set, so that an alert on
 // no_handler does not depend on what handlers report.
@@ -181,6 +181,9 @@ type metrics struct {
 	storeErrors  *prometheus.CounterVec
 	handled      *prometheus.CounterVec
 	handling     *prometheus.HistogramVec
+	unserved     *prometheus.CounterVec
+	strained     *prometheus.CounterVec
+	runsEnded    *prometheus.CounterVec
 }
 
 func newMetrics(reg prometheus.Registerer, class func(string) string) (*metrics, error) {
@@ -190,7 +193,7 @@ func newMetrics(reg prometheus.Registerer, class func(string) string) (*metrics,
 	histogram := func(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
 		return prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: namespace, Name: name, Help: help, Buckets: buckets}, labels)
 	}
-	m := &metrics{class: class, pools: newCapped(maxPools), codes: newCapped(maxCodes, reservedCodes...),
+	m := &metrics{class: class, pools: newCapped(maxPools), codes: newCapped(maxCodes, metricCodes...),
 		dispatched: counter("dispatched_tasks_total", "Tasks handed to workers, by pool and the policy of the queue.", "pool", "policy"),
 		dispatchWait: histogram("dispatch_wait_seconds",
 			"How long a task was eligible before it was dispatched, by the policy of its queue: what politeness, blocks and busy workers cost.",
@@ -216,6 +219,13 @@ func newMetrics(reg prometheus.Registerer, class func(string) string) (*metrics,
 		storeErrors: counter("store_errors_total",
 			"Store calls that failed, by method and kind (unavailable, timeout, other). Answers such as not found and a stale lease are not failures. A timeout includes a caller's own deadline.",
 			"method", "kind"),
+		unserved: counter("unserved_failed_tasks_total",
+			"Tasks this replica's sweep failed because no session ran their handler for the grace period (code no_handler, no attempt recorded), by pool.", "pool"),
+		strained: counter("strained_attempts_total",
+			"Attempts that ended in a retry the outcome marked as strain on the site (the queue is then slowed), by the policy of the queue.", "policy"),
+		runsEnded: counter("runs_ended_total",
+			"Runs that reached a final state, by state (completed, cancelled, expired, aborted) and, for aborted, the rule that ended it (code, max_failed, consecutive_failures). Every replica reads the whole run event log and counts every event, so take the max over replicas, not the sum.",
+			"state", "rule"),
 		handled: counter("grpc_server_handled_total", "gRPC calls this replica finished, by service, method and status code.",
 			"grpc_service", "grpc_method", "grpc_code"),
 		handling: histogram("grpc_server_handling_seconds", "How long unary gRPC calls took, by service and method. Streams are not timed: they last as long as their session.",
@@ -223,7 +233,7 @@ func newMetrics(reg prometheus.Registerer, class func(string) string) (*metrics,
 	}
 	m.workers = newRecent(maxWorkers, workerWindow, func(w string) { m.expiries.DeletePartialMatch(prometheus.Labels{"worker": w}) })
 	for _, c := range []prometheus.Collector{m.dispatched, m.dispatchWait, m.outcomes, m.attempts, m.released, m.expiries, m.blocks,
-		m.fetch, m.added, m.opened, m.storeTime, m.storeErrors, m.handled, m.handling} {
+		m.fetch, m.added, m.opened, m.storeTime, m.storeErrors, m.handled, m.handling, m.unserved, m.strained, m.runsEnded} {
 		if err := reg.Register(c); err != nil {
 			return nil, err
 		}
@@ -234,7 +244,46 @@ func newMetrics(reg prometheus.Registerer, class func(string) string) (*metrics,
 			m.storeErrors.WithLabelValues(method, kind)
 		}
 	}
+	for _, state := range []string{"completed", "cancelled", "expired"} {
+		m.runsEnded.WithLabelValues(state, "")
+	}
+	for _, rule := range abortRules {
+		m.runsEnded.WithLabelValues("aborted", rule)
+	}
 	return m, nil
+}
+
+// abortRules names the rules of a run's limits that end it, as the label of runs_ended_total.
+var abortRules = map[store.AbortRule]string{
+	store.AbortOnCode: "code", store.AbortMaxFailed: "max_failed", store.AbortConsecutiveFailures: "consecutive_failures",
+}
+
+// runEnded records the event that ended a run; other events are not counted.
+func (m *metrics) runEnded(ev *store.RunEvent) {
+	switch ev.Type {
+	case store.EventCompleted:
+		m.runsEnded.WithLabelValues("completed", "").Inc()
+	case store.EventCancelled:
+		m.runsEnded.WithLabelValues("cancelled", "").Inc()
+	case store.EventExpired:
+		m.runsEnded.WithLabelValues("expired", "").Inc()
+	case store.EventAborted:
+		rule := otherLabel
+		if a := ev.Run.Abort; a != nil {
+			if r, ok := abortRules[a.Rule]; ok {
+				rule = r
+			}
+		}
+		m.runsEnded.WithLabelValues("aborted", rule).Inc()
+	case store.EventCreated, store.EventSealed, store.EventPaused, store.EventResumed:
+	}
+}
+
+// unservedFailed records the tasks a sweep failed.
+func (m *metrics) unservedFailed(failed []store.FailedTasks) {
+	for _, f := range failed {
+		m.unserved.WithLabelValues(m.pools.label(string(f.Pool))).Add(float64(f.Tasks))
+	}
 }
 
 // initPool creates the series of a pool that has none yet.
@@ -242,6 +291,7 @@ func (m *metrics) initPool(pool store.PoolName) {
 	p := m.pools.label(string(pool))
 	m.attempts.WithLabelValues(p)
 	m.opened.WithLabelValues(p)
+	m.unserved.WithLabelValues(p)
 	for _, code := range []string{CodeNoHandler, CodeShutdown, codeUndelivered} {
 		m.released.WithLabelValues(p, code)
 	}
@@ -289,6 +339,9 @@ func (m *metrics) finished(info store.LeaseInfo, kind taskv1.Outcome_Kind, f sto
 		m.released.WithLabelValues(pool, releaseCode(f.Record.Code)).Inc()
 	} else {
 		m.attempts.WithLabelValues(pool).Inc()
+	}
+	if f.Strain {
+		m.strained.WithLabelValues(class).Inc()
 	}
 	if f.Block > 0 {
 		m.blocks.WithLabelValues(class).Inc()

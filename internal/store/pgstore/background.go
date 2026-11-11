@@ -37,9 +37,9 @@ func (s *Store) Start(ctx context.Context, r store.Replica) error {
 				return err
 			}
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO replicas (replica_id, policy_hash, started_at, seen_at) VALUES ($1, $2, $3, $3)
+		_, err = tx.Exec(ctx, `INSERT INTO replicas (replica_id, policy_hash, started_at, seen_at, abort_rules) VALUES ($1, $2, $3, $3, true)
 			ON CONFLICT (replica_id) DO UPDATE SET policy_hash = EXCLUDED.policy_hash, started_at = EXCLUDED.started_at,
-				seen_at = EXCLUDED.seen_at`, r.ID, r.PolicyHash, now)
+				seen_at = EXCLUDED.seen_at, abort_rules = true`, r.ID, r.PolicyHash, now)
 		return err
 	})
 	if err != nil || !changed {
@@ -48,8 +48,8 @@ func (s *Store) Start(ctx context.Context, r store.Replica) error {
 	return s.resetReadiness(ctx)
 }
 
-// resetReadiness makes every backlog that waits for a time or a slot ready now, in
-// batches in primary key order. Backlogs of paused and ended runs keep NULL.
+// resetReadiness makes every lane that waits for a time or a slot ready now, in
+// batches in primary key order. Lanes of paused and ended runs keep NULL.
 func (s *Store) resetReadiness(ctx context.Context) error {
 	var queue string
 	var run int64
@@ -59,13 +59,15 @@ func (s *Store) resetReadiness(ctx context.Context) error {
 		nextQueue, nextRun, nextPool := queue, run, pool
 		err := s.tx(ctx, func(tx pgx.Tx, now time.Time) error {
 			nextQueue, nextRun, nextPool = queue, run, pool
+			// The backlogs are locked first, in key order, as every other writer of
+			// lanes does: a trigger writes the backlog's readiness after its lanes.
 			rows, err := tx.Query(ctx, `WITH c AS (
 					SELECT queue_key, run_no, pool_id FROM backlogs
-					WHERE pending > 0 AND ready_at IS NOT NULL AND (queue_key, run_no, pool_id) > ($1, $2, $3)
-					ORDER BY queue_key, run_no, pool_id LIMIT $5 FOR UPDATE)
-				UPDATE backlogs b SET ready_at = $4 FROM c
-				WHERE b.queue_key = c.queue_key AND b.run_no = c.run_no AND b.pool_id = c.pool_id
-				RETURNING b.queue_key, b.run_no, b.pool_id`, queue, run, pool, now, sweepBatch)
+					WHERE pending > 0 AND (queue_key, run_no, pool_id) > ($1, $2, $3)
+					ORDER BY queue_key, run_no, pool_id LIMIT $5 FOR NO KEY UPDATE),
+				u AS (UPDATE lanes l SET ready_at = $4 FROM c
+					WHERE l.queue_key = c.queue_key AND l.run_no = c.run_no AND l.pool_id = c.pool_id AND l.ready_at IS NOT NULL)
+				SELECT queue_key, run_no, pool_id FROM c`, queue, run, pool, now, sweepBatch)
 			if err != nil {
 				return err
 			}
@@ -259,6 +261,9 @@ const (
 	queueIdle = 24 * time.Hour
 	// replicaIdle is how long a replica that stopped reporting is kept.
 	replicaIdle = time.Hour
+	// replicaLive is how recently a replica must have reported to count as running when
+	// the abort rules are accepted. Replicas report every Maintain round.
+	replicaLive = time.Minute
 	// auditEvery is how many rounds pass between two ledger audits.
 	auditEvery = 60
 	// auditSample is how many backlogs an audit checks.
@@ -304,7 +309,8 @@ func (s *Store) expireRuns(ctx context.Context, now time.Time) error {
 				if st.Ended() {
 					return nil
 				}
-				return s.end(ctx, tx, m.no, store.RunExpired, now)
+				_, err := s.end(ctx, tx, m.no, store.RunExpired, nil, now)
+				return err
 			})
 		}
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -327,11 +333,11 @@ func scanBacklogRef(row pgx.CollectableRow) (backlogRef, error) {
 	return b, err
 }
 
-// drain moves the tasks of cancelled and expired runs to their final state, one
+// drain moves the tasks of cancelled, aborted and expired runs to their final state, one
 // backlog per transaction, and releases the slots their in-flight tasks held.
 func (s *Store) drain(ctx context.Context, _ time.Time) error {
 	rows, err := s.db.Query(ctx, `SELECT b.queue_key, b.run_no, b.pool_id FROM runs r JOIN backlogs b ON b.run_no = r.run_no
-		WHERE r.state IN ('cancelled', 'expired') AND (b.pending > 0 OR b.in_flight > 0)
+		WHERE r.state IN ('cancelled', 'expired', 'aborted') AND (b.pending > 0 OR b.in_flight > 0)
 		ORDER BY b.queue_key, b.run_no, b.pool_id LIMIT $1`, maintainBacklogs)
 	if err != nil {
 		return wrap(err)
@@ -364,7 +370,7 @@ func (s *Store) drainBacklog(ctx context.Context, tx pgx.Tx, now time.Time, ref 
 			own = b
 		}
 	}
-	if own == nil || own.meta == nil || (own.state != store.RunCancelled && own.state != store.RunExpired) {
+	if own == nil || own.meta == nil || (own.state != store.RunCancelled && own.state != store.RunExpired && own.state != store.RunAborted) {
 		return nil
 	}
 	final := taskCancelled
@@ -563,10 +569,11 @@ func (s *Store) retain(ctx context.Context, now time.Time) error {
 	// The run is locked before its backlogs, against the lock order: these backlogs
 	// have no work left, so nothing else locks them.
 	rows, err := s.db.Query(ctx, `WITH old AS (
-			SELECT run_no FROM runs r WHERE state IN ('completed', 'cancelled', 'expired') AND finished_at < $1
+			SELECT run_no FROM runs r WHERE state IN ('completed', 'cancelled', 'expired', 'aborted') AND finished_at < $1
 				AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.run_no = r.run_no AND (b.pending > 0 OR b.in_flight > 0))
 			ORDER BY run_no LIMIT $2 FOR UPDATE SKIP LOCKED),
 		codes AS (DELETE FROM backlog_codes WHERE run_no IN (SELECT run_no FROM old)),
+		lns AS (DELETE FROM lanes WHERE run_no IN (SELECT run_no FROM old)),
 		logs AS (DELETE FROM backlogs WHERE run_no IN (SELECT run_no FROM old))
 		DELETE FROM runs WHERE run_no IN (SELECT run_no FROM old) RETURNING run_no`, now.Add(-s.keepRuns), maintainRuns)
 	if err != nil {

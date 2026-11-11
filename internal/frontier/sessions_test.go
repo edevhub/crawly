@@ -21,7 +21,7 @@ func TestListSessionsPages(t *testing.T) {
 		p.mu.Lock()
 		for i := range 3 {
 			p.sessions[&session{id: store.SessionID(fmt.Sprintf("r/%s%d", pool, i)), pool: pool, ctx: ended, since: base.Add(time.Duration(i) * time.Second),
-				worker: store.WorkerInfo{ID: "w"}, leases: map[store.LeaseID]store.RunID{"l": "r"}, credits: 2}] = struct{}{}
+				worker: store.WorkerInfo{ID: "w"}, handlers: []string{"parse", "fetch"}, leases: map[store.LeaseID]store.RunID{"l": "r"}, credits: 2}] = struct{}{}
 		}
 		p.mu.Unlock()
 	}
@@ -42,7 +42,7 @@ func TestListSessionsPages(t *testing.T) {
 		}
 		for _, s := range res.GetSessions() {
 			got = append(got, s.GetSessionId())
-			if s.GetCredits() != 2 || s.GetUnfinishedAssignments() != 1 {
+			if s.GetCredits() != 2 || s.GetUnfinishedAssignments() != 1 || fmt.Sprint(s.GetHandlers()) != "[parse fetch]" {
 				t.Errorf("session: %v", s)
 			}
 		}

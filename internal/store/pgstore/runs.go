@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"time"
@@ -43,6 +44,20 @@ func (s *Store) CreateRun(ctx context.Context, spec store.RunSpec) (store.Run, e
 		n := int32(min(spec.Limits.MaxDepth, math.MaxInt32))
 		maxDepth = &n
 	}
+	var maxFailed *int64
+	if spec.Limits.MaxFailed > 0 {
+		n := int64(min(spec.Limits.MaxFailed, math.MaxInt64))
+		maxFailed = &n
+	}
+	var maxStreak *int32
+	if spec.Limits.MaxConsecutiveFailures > 0 {
+		n := int32(min(spec.Limits.MaxConsecutiveFailures, math.MaxInt32))
+		maxStreak = &n
+	}
+	var abortCodes []string // NULL when there are none
+	if len(spec.Limits.AbortOnCodes) > 0 {
+		abortCodes = spec.Limits.AbortOnCodes
+	}
 	now, err := s.Now(ctx)
 	if err != nil {
 		return store.Run{}, err
@@ -53,10 +68,11 @@ func (s *Store) CreateRun(ctx context.Context, spec store.RunSpec) (store.Run, e
 	var no int64
 	err = s.tx(ctx, func(tx pgx.Tx, now time.Time) error {
 		day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-		err := tx.QueryRow(ctx, `INSERT INTO runs (run_id, spec_hash, created_on, labels, policy, key_rule, deadline, max_tasks, max_depth, paused, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (run_id) DO NOTHING RETURNING run_no`,
+		err := tx.QueryRow(ctx, `INSERT INTO runs (run_id, spec_hash, created_on, labels, policy, key_rule, deadline, max_tasks, max_depth, paused, created_at,
+				abort_codes, max_failed, max_consecutive_failures)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (run_id) DO NOTHING RETURNING run_no`,
 			string(spec.ID), spec.Hash, day, labels, pol, int16(spec.KeyRule), //nolint:gosec // G115: a small enum
-			tszNull(spec.Limits.Deadline), maxTasks, maxDepth, spec.Paused, now).Scan(&no)
+			tszNull(spec.Limits.Deadline), maxTasks, maxDepth, spec.Paused, now, abortCodes, maxFailed, maxStreak).Scan(&no)
 		if errors.Is(err, pgx.ErrNoRows) {
 			var hash []byte
 			if err := tx.QueryRow(ctx, "SELECT run_no, spec_hash FROM runs WHERE run_id = $1", string(spec.ID)).Scan(&no, &hash); err != nil {
@@ -70,6 +86,19 @@ func (s *Store) CreateRun(ctx context.Context, spec store.RunSpec) (store.Run, e
 		if err != nil {
 			return err
 		}
+		if spec.Limits.HasAbortRules() {
+			// Only now that the run is new: an idempotent retry of a run that exists is
+			// answered as before. The insert is rolled back when a replica cannot enforce
+			// the rules, so that no run is created that would silently ignore them.
+			var old bool
+			if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM replicas WHERE NOT abort_rules AND seen_at > $1)",
+				now.Add(-replicaLive)).Scan(&old); err != nil {
+				return err
+			}
+			if old {
+				return fmt.Errorf("%w: a replica that does not know the abort rules is still running; upgrade every Frontier replica first", store.ErrUnsupported)
+			}
+		}
 		return s.event(ctx, tx, no, store.EventCreated, now)
 	})
 	if err != nil {
@@ -79,7 +108,7 @@ func (s *Store) CreateRun(ctx context.Context, spec store.RunSpec) (store.Run, e
 	if err != nil {
 		return store.Run{}, wrap(err)
 	}
-	return s.view(ctx, s.db, m)
+	return s.view(ctx, s.db, m, true)
 }
 
 // lifecycle runs one lifecycle change of a run, under the run's exclusive lock.
@@ -92,7 +121,7 @@ func (s *Store) lifecycle(ctx context.Context, id store.RunID,
 	if err := s.transition(ctx, m, change); err != nil {
 		return store.Run{}, err
 	}
-	return s.view(ctx, s.db, m)
+	return s.view(ctx, s.db, m, true)
 }
 
 // transition is lifecycle without the read of the result.
@@ -112,7 +141,7 @@ func (s *Store) transition(ctx context.Context, m *runMeta,
 		if err != nil {
 			return err
 		}
-		return change(tx, m, runStates[name], paused, now)
+		return change(tx, m, s.parseRunState(name), paused, now)
 	})
 }
 
@@ -183,12 +212,12 @@ func (s *Store) ResumeRun(ctx context.Context, id store.RunID) (store.Run, error
 // sweepBatch is how many backlogs one transaction of a sweep changes.
 const sweepBatch = 500
 
-// resumeSweep makes the backlogs of a resumed run ready again, in batches. It stops
+// resumeSweep makes the lanes of a resumed run ready again, in batches. It stops
 // when the run is paused again, and clears the run's resuming mark when it is done.
 //
-// Every backlog with pending tasks is reset, not only the ones dispatch took out of
-// the readiness index: while the run was paused nothing kept the others up to date, so
-// one may still wait for a slot that was freed or for a block that was lifted.
+// Every lane is reset, not only the ones dispatch took out of the readiness index:
+// while the run was paused nothing kept the others up to date, so one may still wait
+// for a slot that was freed or for a block that was lifted.
 func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 	var queue string // the sweep's position: the last backlog it reset
 	var pool int16
@@ -201,20 +230,22 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 			var name string
 			var paused, resuming bool
 			err := tx.QueryRow(ctx, "SELECT state::text, paused, resuming FROM runs WHERE run_no = $1", no).Scan(&name, &paused, &resuming)
-			if errors.Is(err, pgx.ErrNoRows) || (err == nil && (paused || !resuming || runStates[name].Ended())) {
+			if errors.Is(err, pgx.ErrNoRows) || (err == nil && (paused || !resuming || s.parseRunState(name).Ended())) {
 				done = true
 				return nil
 			}
 			if err != nil {
 				return err
 			}
+			// The backlogs are locked first, in key order, as every other writer of
+			// lanes does: a trigger writes the backlog's readiness after its lanes.
 			rows, err := tx.Query(ctx, `WITH c AS (
 					SELECT queue_key, pool_id FROM backlogs
-					WHERE run_no = $1 AND pending > 0 AND (queue_key, pool_id) > ($4, $5)
-					ORDER BY queue_key, pool_id LIMIT $3 FOR UPDATE)
-				UPDATE backlogs b SET ready_at = $2 FROM c
-				WHERE b.queue_key = c.queue_key AND b.run_no = $1 AND b.pool_id = c.pool_id
-				RETURNING b.queue_key, b.pool_id`, no, now, sweepBatch, queue, pool)
+					WHERE run_no = $1 AND (queue_key, pool_id) > ($4, $5)
+					ORDER BY queue_key, pool_id LIMIT $3 FOR NO KEY UPDATE),
+				u AS (UPDATE lanes l SET ready_at = $2 FROM c
+					WHERE l.run_no = $1 AND l.queue_key = c.queue_key AND l.pool_id = c.pool_id)
+				SELECT queue_key, pool_id FROM c`, no, now, sweepBatch, queue, pool)
 			if err != nil {
 				return err
 			}
@@ -232,11 +263,11 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 			}
 			if len(pools) == 0 {
 				done = true
-				// The mark is cleared only if no backlog is left out of the readiness
+				// The mark is cleared only if no lane is left out of the readiness
 				// index: a pause and a second resume may have come in since this
 				// sweep began, and that resume's sweep still has work to do then.
 				_, err := tx.Exec(ctx, `UPDATE runs r SET resuming = false WHERE run_no = $1 AND NOT paused
-					AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.run_no = r.run_no AND b.pending > 0 AND b.ready_at IS NULL)`, no)
+					AND NOT EXISTS (SELECT 1 FROM lanes l WHERE l.run_no = r.run_no AND l.ready_at IS NULL)`, no)
 				return err
 			}
 			return s.wake(ctx, tx, pools)
@@ -255,21 +286,39 @@ func (s *Store) CancelRun(ctx context.Context, id store.RunID) (store.Run, error
 		if st.Ended() {
 			return nil
 		}
-		return s.end(ctx, tx, m.no, store.RunCancelled, now)
+		_, err := s.end(ctx, tx, m.no, store.RunCancelled, nil, now)
+		return err
 	})
 }
 
-// end finishes a run early. The caller holds the run's exclusive lock.
-func (s *Store) end(ctx context.Context, tx pgx.Tx, no int64, st store.RunState, now time.Time) error {
-	if _, err := tx.Exec(ctx, "UPDATE runs SET state = $2::run_state, finished_at = $3, resuming = false WHERE run_no = $1",
-		no, runStateName(st), now); err != nil {
-		return err
+// end finishes a run early, with the reason when a rule of its limits ended it. It
+// reports whether it did: a run that is over already is left alone, so of two
+// transactions that end a run at once the second changes nothing. The caller holds the
+// run's row lock.
+func (s *Store) end(ctx context.Context, tx pgx.Tx, no int64, st store.RunState, why *store.AbortReason, now time.Time) (bool, error) {
+	var rule *int16
+	var code, task *string
+	if why != nil {
+		r := int16(why.Rule) //nolint:gosec // G115: a small enum
+		rule, code, task = &r, nullString(why.Code), nullString(string(why.Task))
+	}
+	tag, err := tx.Exec(ctx, `UPDATE runs SET state = $2::run_state, finished_at = $3, resuming = false,
+			abort_rule = $4, abort_code = $5, abort_task = $6
+		WHERE run_no = $1 AND state IN ('open', 'sealed')`, no, runStateName(st), now, rule, code, task)
+	if err != nil || tag.RowsAffected() == 0 {
+		return false, err
 	}
 	typ := store.EventCancelled
-	if st == store.RunExpired {
+	switch st {
+	case store.RunExpired:
 		typ = store.EventExpired
+	case store.RunAborted:
+		typ = store.EventAborted
+		s.log.Warn("run aborted", "run_no", no, "rule", why.Rule, "code", why.Code, "task", why.Task)
+	default:
+		// Cancelled: the default event.
 	}
-	return s.event(ctx, tx, no, typ, now)
+	return true, s.event(ctx, tx, no, typ, now)
 }
 
 // complete finishes a sealed run that has nothing pending or in flight. It takes the
@@ -283,13 +332,16 @@ func (s *Store) complete(ctx context.Context, tx pgx.Tx, no int64, now time.Time
 	var idle bool
 	err := tx.QueryRow(ctx, `SELECT state::text,
 		NOT EXISTS (SELECT 1 FROM backlogs WHERE run_no = $1 AND (pending > 0 OR in_flight > 0)) FROM runs WHERE run_no = $1`, no).Scan(&name, &idle)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (runStates[name] != store.RunSealed || !idle)) {
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (s.parseRunState(name) != store.RunSealed || !idle)) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, "UPDATE runs SET state = 'completed', finished_at = $2 WHERE run_no = $1", no, now); err != nil {
+	// The state is checked again: an outcome that trips an abort rule ends the run under
+	// the run's row lock only, so it can commit between the read above and this update.
+	tag, err := tx.Exec(ctx, "UPDATE runs SET state = 'completed', finished_at = $2 WHERE run_no = $1 AND state = 'sealed'", no, now)
+	if err != nil || tag.RowsAffected() == 0 {
 		return err
 	}
 	return s.event(ctx, tx, no, store.EventCompleted, now)
@@ -310,12 +362,14 @@ func (s *Store) GetRun(ctx context.Context, id store.RunID) (store.Run, error) {
 	if err != nil {
 		return store.Run{}, wrap(err)
 	}
-	return s.view(ctx, s.db, m)
+	return s.view(ctx, s.db, m, true)
 }
 
 // view reads the state and the statistics of a run. The statistics are the sum over
-// the run's backlogs.
-func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, error) {
+// the run's backlogs. The list of blocked queues is a convenience on top: it is read only
+// when asked for, and when its read fails the run is returned without it, so that it can
+// never fail the call, or the revoker's read of the event log, which does not ask for it.
+func (s *Store) view(ctx context.Context, q querier, m *runMeta, withBlocked bool) (store.Run, error) {
 	now, err := s.now(ctx, q)
 	if err != nil {
 		return store.Run{}, wrap(err)
@@ -323,7 +377,10 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, err
 	r := store.Run{Spec: m.spec, CreatedAt: m.createdAt, Stats: store.RunStats{ByCode: map[string]uint64{}}}
 	var name string
 	var sealed, finished pgtype.Timestamptz
-	err = q.QueryRow(ctx, "SELECT state::text, paused, sealed_at, finished_at FROM runs WHERE run_no = $1", m.no).Scan(&name, &r.Paused, &sealed, &finished)
+	var abortRule *int16
+	var abortCode, abortTask *string
+	err = q.QueryRow(ctx, `SELECT state::text, paused, sealed_at, finished_at, abort_rule, abort_code, abort_task
+		FROM runs WHERE run_no = $1`, m.no).Scan(&name, &r.Paused, &sealed, &finished, &abortRule, &abortCode, &abortTask)
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.forget(m)
 		return store.Run{}, store.ErrNotFound
@@ -331,7 +388,16 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, err
 	if err != nil {
 		return store.Run{}, wrap(err)
 	}
-	r.State, r.SealedAt, r.FinishedAt = runStates[name], timeOf(sealed), timeOf(finished)
+	r.State, r.SealedAt, r.FinishedAt = s.parseRunState(name), timeOf(sealed), timeOf(finished)
+	if r.State == store.RunAborted && abortRule != nil {
+		r.Abort = &store.AbortReason{Rule: store.AbortRule(*abortRule)}
+		if abortCode != nil {
+			r.Abort.Code = *abortCode
+		}
+		if abortTask != nil {
+			r.Abort.Task = store.TaskID(*abortTask)
+		}
+	}
 
 	st := &r.Stats
 	var pending, delayed int64
@@ -351,6 +417,12 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, err
 	}
 	delayed = min(delayed, pending)
 	st.Pending, st.Delayed = uint64(pending-delayed), uint64(delayed) //nolint:gosec // G115: counters are not negative
+	if withBlocked && pending > 0 && !r.State.Ended() {
+		if st.BlockedQueues, err = s.blockedQueues(ctx, q, m.no, now); err != nil {
+			s.log.Warn("pgstore: reading the blocked queues of a run failed; its stats go without them", "run_no", m.no, "err", err)
+			st.BlockedQueues = nil
+		}
+	}
 	rows, err := q.Query(ctx, "SELECT code, sum(count)::bigint FROM backlog_codes WHERE run_no = $1 GROUP BY code", m.no)
 	if err != nil {
 		return store.Run{}, wrap(err)
@@ -364,6 +436,28 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, err
 		return store.Run{}, wrap(err)
 	}
 	return r, nil
+}
+
+// blockedQueues lists the blocked queues a run's pending and delayed tasks wait on: the
+// ones with the most waiting tasks, at most store.MaxBlockedQueues.
+func (s *Store) blockedQueues(ctx context.Context, q querier, no int64, now time.Time) ([]store.BlockedQueue, error) {
+	rows, err := q.Query(ctx, `SELECT b.queue_key, q.blocked_until, coalesce(q.block_reason, ''), sum(b.pending)::bigint
+		FROM backlogs b JOIN queues q ON q.key = b.queue_key
+		WHERE b.run_no = $1 AND b.pending > 0 AND q.blocked_until > $2
+		GROUP BY b.queue_key, q.blocked_until, q.block_reason
+		ORDER BY sum(b.pending) DESC, b.queue_key LIMIT $3`, no, now, store.MaxBlockedQueues)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (store.BlockedQueue, error) {
+		var b store.BlockedQueue
+		var key string
+		var until pgtype.Timestamptz
+		var n int64
+		err := row.Scan(&key, &until, &b.Reason, &n)
+		b.Queue, b.Until, b.Waiting = store.QueueKey(key), timeOf(until), uint64(n) //nolint:gosec // G115: counters are not negative
+		return b, err
+	})
 }
 
 const defaultPage = 100
@@ -415,7 +509,7 @@ func (s *Store) ListRuns(ctx context.Context, f store.RunFilter, page store.Page
 		if !ok {
 			continue
 		}
-		r, err := s.view(ctx, s.db, m)
+		r, err := s.view(ctx, s.db, m, true)
 		if errors.Is(err, store.ErrNotFound) {
 			continue
 		}
@@ -461,7 +555,7 @@ func (s *Store) RunEvents(ctx context.Context, after store.EventCursor, limit in
 		if !ok {
 			m, err := s.meta(ctx, s.db, e.run)
 			if err == nil {
-				v, err = s.view(ctx, s.db, m)
+				v, err = s.view(ctx, s.db, m, false)
 			}
 			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				return nil, wrap(err)

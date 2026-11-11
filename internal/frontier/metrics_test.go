@@ -68,7 +68,7 @@ func TestSeriesStayBounded(t *testing.T) {
 		{"lease expiries by worker", m.expiries, maxWorkers + 1},
 		{"released by pool", m.released, maxPools + 1},
 		// The capped codes, the reserved ones and "other"; no pool, so no product.
-		{"outcomes", m.outcomes, maxCodes + len(reservedCodes) + 1},
+		{"outcomes", m.outcomes, maxCodes + len(metricCodes) + 1},
 	} {
 		if got := series(t, tc.c); got > tc.want {
 			t.Errorf("%s: %d series after %d queues, want at most %d", tc.name, got, queues*3, tc.want)
@@ -387,5 +387,65 @@ func TestEveryStoreMethodStartsAtZero(t *testing.T) {
 func TestSplitMethod(t *testing.T) {
 	if s, m := splitMethod("/crawly.frontier.run.v1.RunService/CreateRun"); s != "crawly.frontier.run.v1.RunService" || m != "CreateRun" {
 		t.Errorf("%q %q", s, m)
+	}
+}
+
+// TestRunsEndedCountsAbortsByRule: a run an abort rule ended is counted by the rule, and
+// the other ends by their state; a run that is paused is not an end.
+func TestRunsEndedCountsAbortsByRule(t *testing.T) {
+	m, err := newMetrics(prometheus.NewRegistry(), func(string) string { return "builtin" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		ev          store.RunEvent
+		state, rule string
+	}{
+		{store.RunEvent{Type: store.EventCompleted}, "completed", ""},
+		{store.RunEvent{Type: store.EventCancelled}, "cancelled", ""},
+		{store.RunEvent{Type: store.EventExpired}, "expired", ""},
+		{store.RunEvent{Type: store.EventAborted, Run: store.Run{Abort: &store.AbortReason{Rule: store.AbortOnCode}}}, "aborted", "code"},
+		{store.RunEvent{Type: store.EventAborted, Run: store.Run{Abort: &store.AbortReason{Rule: store.AbortMaxFailed}}}, "aborted", "max_failed"},
+		{store.RunEvent{Type: store.EventAborted, Run: store.Run{Abort: &store.AbortReason{Rule: store.AbortConsecutiveFailures}}}, "aborted", "consecutive_failures"},
+		{store.RunEvent{Type: store.EventAborted}, "aborted", otherLabel},
+	} {
+		ev := c.ev
+		m.runEnded(&ev)
+		if got := counterValue(t, m.runsEnded, c.state, c.rule); got != 1 {
+			t.Errorf("%s/%s = %v, want 1", c.state, c.rule, got)
+		}
+	}
+	before := series(t, m.runsEnded)
+	m.runEnded(&store.RunEvent{Type: store.EventPaused})
+	m.runEnded(&store.RunEvent{Type: store.EventCreated})
+	if after := series(t, m.runsEnded); after != before {
+		t.Errorf("events that do not end a run made series: %d -> %d", before, after)
+	}
+}
+
+// TestUnservedAndStrainAreCounted: tasks failed by the sweep are counted by pool, and
+// attempts that signalled strain by the policy of the queue, never by the queue.
+func TestUnservedAndStrainAreCounted(t *testing.T) {
+	m, err := newMetrics(prometheus.NewRegistry(), func(string) string { return "slow" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.initPool("default")
+	if got := counterValue(t, m.unserved, "default"); got != 0 {
+		t.Fatalf("starts at %v", got)
+	}
+	m.unservedFailed([]store.FailedTasks{
+		{HandlerRef: store.HandlerRef{Pool: "default", Handler: "a"}, Tasks: 3},
+		{HandlerRef: store.HandlerRef{Pool: "default", Handler: "b"}, Tasks: 4}})
+	if got := counterValue(t, m.unserved, "default"); got != 7 {
+		t.Errorf("failed tasks %v, want 7", got)
+	}
+	for i := range 50 {
+		info := store.LeaseInfo{Queue: store.QueueKey(fmt.Sprintf("q%d", i)), Pool: "default"}
+		m.finished(info, taskv1.Outcome_KIND_RETRY, store.Finish{Result: store.ResultRetry, Strain: true})
+	}
+	m.finished(store.LeaseInfo{Queue: "x", Pool: "default"}, taskv1.Outcome_KIND_RETRY, store.Finish{Result: store.ResultRetry})
+	if got, n := counterValue(t, m.strained, "slow"), series(t, m.strained); got != 50 || n != 1 {
+		t.Errorf("strained attempts %v in %d series, want 50 in 1", got, n)
 	}
 }

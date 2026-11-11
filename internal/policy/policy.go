@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	policyv1 "github.com/edevhub/crawly/internal/gen/frontier/policy/v1"
+	"github.com/edevhub/crawly/internal/sched"
 	"github.com/edevhub/crawly/internal/store"
 )
 
@@ -34,6 +35,13 @@ var (
 		MaxConcurrency: proto.Uint32(2),
 		RatePerSecond:  proto.Float64(1),
 		Burst:          proto.Uint32(1),
+		Adaptive: &policyv1.AdaptiveLimits{
+			Enabled:        new(true),
+			MaxInterval:    durationpb.New(time.Minute),
+			DecreaseFactor: new(0.5),
+			RecoveryStep:   new(0.1),
+			MaxOutage:      durationpb.New(10 * time.Minute),
+		},
 	}
 	defaultBehaviour = &policyv1.Behaviour{
 		MaxAttempts: proto.Uint32(3),
@@ -43,10 +51,11 @@ var (
 			Max:        durationpb.New(5 * time.Minute),
 			Jitter:     new(0.2),
 		},
-		FetchTimeout:     durationpb.New(30 * time.Second),
-		LeaseDuration:    durationpb.New(60 * time.Second),
-		MaxLeaseDuration: durationpb.New(10 * time.Minute),
-		MaxQueueBlock:    durationpb.New(24 * time.Hour),
+		FetchTimeout:      durationpb.New(30 * time.Second),
+		LeaseDuration:     durationpb.New(60 * time.Second),
+		MaxLeaseDuration:  durationpb.New(10 * time.Minute),
+		MaxQueueBlock:     durationpb.New(24 * time.Hour),
+		MaxStrainAttempts: proto.Uint32(10),
 	}
 )
 
@@ -242,10 +251,11 @@ func (s *Set) For(run store.RunID, rp *policyv1.RunPolicy, queue store.QueueKey)
 	}
 	r := s.Resolve(rp, string(queue))
 	e := store.Effective{
-		Limits: ToLimits(r.Limits),
-		Own:    r.Own,
-		Queue:  ToLimits(r.Queue),
-		Weight: float64(r.Weight),
+		Limits:   ToLimits(r.Limits),
+		Own:      r.Own,
+		Queue:    ToLimits(r.Queue),
+		Adaptive: ToAdaptive(r.Queue.GetAdaptive()),
+		Weight:   float64(r.Weight),
 		Lease: store.LeaseSettings{
 			Duration:    r.Behaviour.GetLeaseDuration().AsDuration(),
 			MaxDuration: r.Behaviour.GetMaxLeaseDuration().AsDuration(),
@@ -275,6 +285,13 @@ func ToLimits(l *policyv1.QueueLimits) store.Limits {
 		out.Burst = int(l.GetBurst())
 	}
 	return out
+}
+
+// ToAdaptive converts the API form of adaptive limits, with every field set, to its
+// scheduling form.
+func ToAdaptive(a *policyv1.AdaptiveLimits) sched.Adaptive {
+	return sched.Adaptive{Enabled: a.GetEnabled(), MaxInterval: a.GetMaxInterval().AsDuration(),
+		Decrease: a.GetDecreaseFactor(), Recovery: a.GetRecoveryStep(), MaxOutage: a.GetMaxOutage().AsDuration()}
 }
 
 // Match reports whether a glob matches a queue key. "*" matches any run of characters;
@@ -314,12 +331,18 @@ func specificity(pattern string) int {
 
 // ValidateRun checks a run's own policy for what a run may not set.
 func ValidateRun(rp *policyv1.RunPolicy) error {
+	if rp.GetLimits().GetAdaptive() != nil {
+		return errors.New("limits.adaptive cannot be set by a run: it slows the whole queue, so it comes from the global policies")
+	}
 	if rp.GetBehaviour().GetMaxQueueBlock() != nil {
 		return errors.New("behaviour.max_queue_block cannot be set by a run: a block stops every run on the queue, so its ceiling comes from the global policies")
 	}
 	for _, o := range rp.GetOverrides() {
 		if o.GetBehaviour().GetMaxQueueBlock() != nil {
 			return fmt.Errorf("override %q: behaviour.max_queue_block cannot be set by a run", o.GetQueueKey())
+		}
+		if o.GetLimits().GetAdaptive() != nil {
+			return fmt.Errorf("override %q: limits.adaptive cannot be set by a run", o.GetQueueKey())
 		}
 	}
 	return nil
@@ -343,6 +366,25 @@ func validateLimits(l *policyv1.QueueLimits) error {
 	if l.GetMinDelay().AsDuration() < 0 {
 		return errors.New("min_delay must not be negative")
 	}
+	return validateAdaptive(l.GetAdaptive())
+}
+
+func validateAdaptive(a *policyv1.AdaptiveLimits) error {
+	if a == nil {
+		return nil
+	}
+	if a.GetMaxInterval() != nil && a.GetMaxInterval().AsDuration() <= 0 {
+		return errors.New("adaptive.max_interval must be positive")
+	}
+	if a.GetMaxOutage() != nil && a.GetMaxOutage().AsDuration() <= 0 {
+		return errors.New("adaptive.max_outage must be positive")
+	}
+	if a.DecreaseFactor != nil && (a.GetDecreaseFactor() <= 0 || a.GetDecreaseFactor() >= 1) {
+		return errors.New("adaptive.decrease_factor must be between 0 and 1, exclusive")
+	}
+	if a.RecoveryStep != nil && (a.GetRecoveryStep() <= 0 || a.GetRecoveryStep() > 1) {
+		return errors.New("adaptive.recovery_step must be above 0 and at most 1")
+	}
 	return nil
 }
 
@@ -361,6 +403,26 @@ func mergeLimits(dst, src *policyv1.QueueLimits, name string, prov map[string]st
 	}
 	if src.MinDelay != nil {
 		dst.MinDelay, prov["limits.min_delay"] = src.MinDelay, name
+	}
+	if a := src.GetAdaptive(); a != nil {
+		if dst.Adaptive == nil {
+			dst.Adaptive = &policyv1.AdaptiveLimits{}
+		}
+		if a.Enabled != nil {
+			dst.Adaptive.Enabled, prov["limits.adaptive.enabled"] = new(a.GetEnabled()), name
+		}
+		if a.MaxInterval != nil {
+			dst.Adaptive.MaxInterval, prov["limits.adaptive.max_interval"] = a.MaxInterval, name
+		}
+		if a.MaxOutage != nil {
+			dst.Adaptive.MaxOutage, prov["limits.adaptive.max_outage"] = a.MaxOutage, name
+		}
+		if a.DecreaseFactor != nil {
+			dst.Adaptive.DecreaseFactor, prov["limits.adaptive.decrease_factor"] = new(a.GetDecreaseFactor()), name
+		}
+		if a.RecoveryStep != nil {
+			dst.Adaptive.RecoveryStep, prov["limits.adaptive.recovery_step"] = new(a.GetRecoveryStep()), name
+		}
 	}
 }
 
@@ -396,6 +458,9 @@ func mergeBehaviour(dst, src *policyv1.Behaviour, name string, prov map[string]s
 	}
 	if src.TaskTtl != nil {
 		dst.TaskTtl, prov["behaviour.task_ttl"] = src.TaskTtl, name
+	}
+	if src.MaxStrainAttempts != nil {
+		dst.MaxStrainAttempts, prov["behaviour.max_strain_attempts"] = new(src.GetMaxStrainAttempts()), name
 	}
 	if src.MaxQueueBlock != nil {
 		dst.MaxQueueBlock, prov["behaviour.max_queue_block"] = src.MaxQueueBlock, name

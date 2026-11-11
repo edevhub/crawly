@@ -48,12 +48,15 @@ type Config struct {
 	ReaperInterval   time.Duration
 	MaintainInterval time.Duration
 	PollInterval     time.Duration
-	// NoHandlerGrace is how long a task is handed from worker to worker while none of
-	// them has its handler, before it fails with code "no_handler". Zero: one hour.
+	// NoHandlerGrace is how long a task waits while no session can run its handler,
+	// before it fails with code "no_handler". Zero: one hour. At least four maintain
+	// intervals: the sessions' handlers are reported on those ticks, and a task must
+	// not fail because a report was late.
 	NoHandlerGrace time.Duration
-	// NoHandlerDelay is how long such a task waits before it is given out again. Each
-	// round takes a politeness slot of its queue, so the delay bounds what a pool
-	// without the handler costs the queue's other tasks. Zero: five seconds.
+	// NoHandlerDelay is how long a task that a session without declared handlers handed
+	// back for want of its handler waits before it is given out again. Each such round
+	// takes a politeness slot of the task's queue, so the delay bounds what a session
+	// that lacks the handler costs the queue's other tasks. Zero: five seconds.
 	NoHandlerDelay time.Duration
 	// PoolStatsInterval is how often the replica reads the store's state for the
 	// metrics. Zero: fifteen seconds.
@@ -84,6 +87,9 @@ type Server struct {
 	health    *health.Server
 	unserved  sync.Map  // store.TaskID -> time.Time: since when no worker that got the task had its handler
 	forgotten time.Time // guarded by mu: when forgetUnserved last looked at unserved
+	swept     time.Time // guarded by mu: when the sweep for tasks without a handler last ran
+	reported  string    // guarded by mu: the handlers of the sessions as last reported to the store
+	reportAt  time.Time // guarded by mu: when they were
 }
 
 // New builds a replica. Call Register to expose it and Run to start its loops.
@@ -108,6 +114,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.NoHandlerGrace <= 0 {
 		cfg.NoHandlerGrace = time.Hour
 	}
+	cfg.NoHandlerGrace = max(cfg.NoHandlerGrace, 4*cfg.MaintainInterval)
 	if cfg.NoHandlerDelay <= 0 {
 		cfg.NoHandlerDelay = 5 * time.Second
 	}
@@ -247,6 +254,7 @@ func (s *Server) maintain(ctx context.Context) {
 		case <-tick.C:
 			err := s.store.Maintain(ctx)
 			s.forgetUnserved()
+			s.sweepUnserved(ctx)
 			if err != nil {
 				s.log.Warn("maintain", "err", err)
 			}
@@ -256,8 +264,9 @@ func (s *Server) maintain(ctx context.Context) {
 	}
 }
 
-// revoker pushes LeaseRevoked to sessions holding leases of runs that were cancelled
-// or expired.
+// revoker pushes LeaseRevoked to sessions holding leases of runs that were cancelled,
+// expired or aborted. All three use REASON_RUN_CANCELLED: the worker's reaction is the
+// same, and a worker of an older build knows no other reason for a run that ended.
 func (s *Server) revoker(ctx context.Context) {
 	cursor, err := s.store.LastEventCursor(ctx)
 	if err != nil {
@@ -272,7 +281,8 @@ func (s *Server) revoker(ctx context.Context) {
 		for i := range evs {
 			ev := &evs[i]
 			cursor = ev.Cursor
-			if ev.Type == store.EventCancelled || ev.Type == store.EventExpired {
+			s.m.runEnded(ev)
+			if ev.Type == store.EventCancelled || ev.Type == store.EventExpired || ev.Type == store.EventAborted {
 				s.revokeRun(ev.Run.Spec.ID)
 			}
 		}
@@ -397,10 +407,97 @@ func ServerOptions() []grpc.ServerOption {
 }
 
 // CodeNoHandler is the code of a task no worker has a handler for.
-const CodeNoHandler = "no_handler"
+const CodeNoHandler = store.CodeNoHandler
 
 // CodeShutdown is the code of a task a worker handed back because it shut down.
 const CodeShutdown = "shutdown"
+
+// reportHandlers tells the store which handlers have a session on this replica: when
+// they change, and otherwise as a heartbeat, a tenth of the grace period (at most a
+// minute) apart. A session that names no handlers is the handler "": it can run any.
+func (s *Server) reportHandlers(ctx context.Context) error {
+	s.mu.Lock()
+	pools := slices.Collect(maps.Values(s.pools))
+	s.mu.Unlock()
+	var sets []store.PoolHandlers
+	var sig strings.Builder
+	for _, p := range pools {
+		p.mu.Lock()
+		seen := map[string]bool{}
+		for ss := range p.sessions {
+			if ss.goodbye {
+				continue
+			}
+			for _, h := range ss.handlers {
+				seen[h] = true
+			}
+			if len(ss.handlers) == 0 {
+				seen[""] = true
+			}
+		}
+		p.mu.Unlock()
+		if len(seen) > 0 {
+			hs := slices.Sorted(maps.Keys(seen))
+			sets = append(sets, store.PoolHandlers{Pool: p.name, Handlers: hs})
+			fmt.Fprintf(&sig, "%s\x00%q\x00", p.name, hs)
+		}
+	}
+	s.mu.Lock()
+	same := sig.String() == s.reported && time.Since(s.reportAt) < min(s.cfg.NoHandlerGrace/10, time.Minute)
+	s.mu.Unlock()
+	if same || len(sets) == 0 {
+		return nil
+	}
+	if err := s.store.ServeHandlers(ctx, sets); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.reported, s.reportAt = sig.String(), time.Now()
+	s.mu.Unlock()
+	return nil
+}
+
+// sweepUnserved reports the handlers this replica serves, and from time to time asks
+// the store to fail the tasks that waited the grace period for a session that has
+// their handler. It logs each failure, and, when the store says it is this replica's
+// turn, the handlers whose tasks wait.
+func (s *Server) sweepUnserved(ctx context.Context) {
+	if err := s.reportHandlers(ctx); err != nil {
+		s.log.Warn("reporting handlers", "err", err)
+		return
+	}
+	every := min(s.cfg.NoHandlerGrace/4, time.Minute)
+	s.mu.Lock()
+	due := time.Since(s.swept) >= every
+	if due {
+		s.swept = time.Now()
+	}
+	s.mu.Unlock()
+	if !due {
+		return
+	}
+	res, err := s.store.SweepUnserved(ctx, s.cfg.NoHandlerGrace)
+	if err != nil {
+		s.log.Warn("sweeping tasks without a handler", "err", err)
+		return
+	}
+	s.m.unservedFailed(res.Failed)
+	for _, f := range res.Failed {
+		s.log.Warn("no session had the handler for the grace period: the tasks failed",
+			"pool", f.Pool, "handler", f.Handler, "tasks", f.Tasks, "grace", s.cfg.NoHandlerGrace)
+	}
+	if !res.Report {
+		return
+	}
+	for _, w := range res.Waiting {
+		s.log.Warn("tasks wait for a handler that no session has",
+			"pool", w.Pool, "handler", w.Handler, "queues_and_runs", w.Lanes, "grace", s.cfg.NoHandlerGrace)
+	}
+	if res.Held {
+		s.log.Info("tasks that wait for a handler are not failed yet: a replica started less than the grace period ago",
+			"grace", s.cfg.NoHandlerGrace)
+	}
+}
 
 // forgetUnserved drops the tasks that were handed back long ago and not since: they
 // ended with their run, or their record was left behind by a store error. It looks at
@@ -446,18 +543,24 @@ func (s *Server) served(info store.LeaseInfo, w store.WorkerInfo, o *taskv1.Outc
 // decide turns a worker's outcome into a transition (ADR 0001, Responsibilities): the
 // spider classifies, the Frontier applies max_attempts and backoff.
 func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.FetchInfo) store.Finish {
-	beh := s.pol.Resolve(info.RunPolicy, string(info.Queue)).Behaviour
+	res := s.pol.Resolve(info.RunPolicy, string(info.Queue))
+	beh := res.Behaviour
+	// A sign of strain slows the queue (the store does it, with the outcome). The task
+	// has a budget of its own for such failures: they say little about it while the
+	// queue is slowed down, and max_attempts is judged against the other attempts.
+	strain := o.GetStrain() && o.GetKind() != taskv1.Outcome_KIND_RELEASED && res.Queue.GetAdaptive().GetEnabled()
 	// One outcome blocks the queue for as long as the queue's policy allows. A block
 	// stops every run on the queue, so a site's Retry-After, or a spider's mistake, must
 	// not stop it for good; a site that is still refusing when the block ends blocks the
 	// queue again. The ceiling is the queue's: Resolve keeps a run's policy out of it.
-	f := store.Finish{Lease: info.Ref, Source: store.SourceWorker, Block: min(o.GetBlockQueueFor().AsDuration(), beh.GetMaxQueueBlock().AsDuration()),
+	f := store.Finish{Lease: info.Ref, Source: store.SourceWorker, Strain: strain, Block: min(o.GetBlockQueueFor().AsDuration(), beh.GetMaxQueueBlock().AsDuration()),
 		Record: store.AttemptRecord{Kind: int32(o.GetKind()), Code: o.GetCode(), Message: o.GetMessage(), PolicySet: s.pol.Hash(),
 			HTTPStatus: fetch.GetHttpStatus(), FinalURL: fetch.GetFinalUrl(), Latency: fetch.GetLatency().AsDuration(),
 			Bytes: fetch.GetBytes(), ResponseRef: fetch.GetResponseRef(), ContentHash: fetch.GetContentHash(), ItemsEmitted: fetch.GetItemsEmitted()}}
 	switch o.GetKind() {
 	case taskv1.Outcome_KIND_SUCCESS:
 		f.Result = store.ResultSucceeded
+		f.Answered = !strain && f.Block == 0
 	case taskv1.Outcome_KIND_RELEASED:
 		// The task was not run: nothing of the outcome but the hand-back applies.
 		f.Block = 0
@@ -480,9 +583,23 @@ func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.F
 			f.Result, f.Record.Kind = store.ResultFailed, int32(taskv1.Outcome_KIND_FAILED)
 		}
 	case taskv1.Outcome_KIND_RETRY:
-		if limit := beh.GetMaxAttempts(); limit > 0 && info.Ref.Attempt >= limit {
-			f.Result = store.ResultFailed
-			break
+		limit, attempt := beh.GetMaxAttempts(), info.Ref.Attempt
+		if strain {
+			// Two budgets: the strain attempts (this one included) against
+			// max_strain_attempts, the others against max_attempts. What max_attempts
+			// alone would not allow is granted by the strain budget, and the store ends
+			// it when the queue has been at its ceiling for too long.
+			if limit > 0 && info.StrainAttempts+1 >= max(limit, beh.GetMaxStrainAttempts()) {
+				f.Result = store.ResultFailed
+				break
+			}
+			f.Extended = limit > 0 && attempt >= limit
+		} else {
+			f.Answered = f.Block == 0 && fetch.GetHttpStatus() > 0
+			if limit > 0 && attempt-min(info.StrainAttempts, attempt) >= limit {
+				f.Result = store.ResultFailed
+				break
+			}
 		}
 		f.Result = store.ResultRetry
 		if o.GetRetryAfter() != nil {
@@ -492,6 +609,7 @@ func (s *Server) decide(info store.LeaseInfo, o *taskv1.Outcome, fetch *taskv1.F
 		}
 	default:
 		f.Result = store.ResultFailed
+		f.Answered = f.Block == 0 && fetch.GetHttpStatus() > 0
 	}
 	return f
 }
@@ -548,7 +666,7 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 			out[i].Invalid = true
 			continue
 		}
-		out[i] = store.NewTask{Fingerprint: fp, Queue: store.QueueKey(queue), Pool: pool, Priority: ts.GetPriority(), Spec: raw,
+		out[i] = store.NewTask{Fingerprint: fp, Queue: store.QueueKey(queue), Pool: pool, Handler: storedHandler(ts.GetHandler()), Priority: ts.GetPriority(), Spec: raw,
 			TTL: s.pol.Resolve(spec.Policy, queue).Behaviour.GetTaskTtl().AsDuration()}
 		if ts.GetNotBeforeTime() != nil {
 			out[i].NotBefore = ts.GetNotBeforeTime().AsTime()
@@ -572,7 +690,7 @@ func grpcErr(err error) error {
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, store.ErrConflict):
 		return status.Error(codes.AlreadyExists, err.Error())
-	case errors.Is(err, store.ErrRunClosed):
+	case errors.Is(err, store.ErrRunClosed), errors.Is(err, store.ErrUnsupported):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, store.ErrUnavailable):
 		return status.Error(codes.Unavailable, err.Error())
@@ -607,4 +725,14 @@ func (s *signal) Broadcast() {
 		s.ch = nil
 	}
 	s.mu.Unlock()
+}
+
+// storedHandler is the handler a task is stored with. A name that no worker could
+// have registered is stored as unknown, "": the task is accepted, as before, and
+// every session may try it.
+func storedHandler(h string) string {
+	if wire.ValidHandler(h) {
+		return h
+	}
+	return ""
 }

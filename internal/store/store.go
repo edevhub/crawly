@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	policyv1 "github.com/edevhub/crawly/internal/gen/frontier/policy/v1"
@@ -43,6 +44,9 @@ var (
 	ErrConflict    = errors.New("store: conflict")
 	ErrRunClosed   = errors.New("store: run closed")
 	ErrUnavailable = errors.New("store: unavailable")
+	// ErrUnsupported means the deployment cannot do what was asked yet: for the abort rules,
+	// a replica that does not know them is still running.
+	ErrUnsupported = errors.New("store: not supported by every replica")
 	// ErrLeaseStale and ErrLeaseUnknown reject discovered tasks whose parent lease is
 	// not live.
 	ErrLeaseStale   = errors.New("store: lease is fenced or expired")
@@ -81,8 +85,9 @@ type Work interface {
 	// AddTasks adds seeds (Parent nil; run must be open) or discovered tasks (Parent
 	// set; the parent lease must be live). One result per task, in order.
 	AddTasks(ctx context.Context, req AddRequest) ([]AddResult, error)
-	// Dispatch claims up to req.Slots tasks of req.Pool, following the scheduling model.
-	// It never blocks waiting for work. It can return assignments together with an
+	// Dispatch claims up to req.Slots tasks of req.Pool that the session can run (see
+	// DispatchRequest.Handlers), following the scheduling model. It never blocks
+	// waiting for work. It can return assignments together with an
 	// error; every assignment returned is committed and must be delivered.
 	Dispatch(ctx context.Context, req DispatchRequest) (DispatchResult, error)
 	// Lease returns what the core needs to decide a transition for a lease. A plain
@@ -104,6 +109,7 @@ type Inspect interface {
 	GetQueue(ctx context.Context, key QueueKey) (Queue, error)
 	ListQueues(ctx context.Context, f QueueFilter, page Page) ([]Queue, string, error)
 	// BlockQueue sets (or with a zero time, clears) an operator block for all runs.
+	// Clearing it also resets the queue's adaptive slowdown.
 	BlockQueue(ctx context.Context, key QueueKey, until time.Time, reason string) (Queue, error)
 	// PoolStats sums the work of every pool across all runs, for monitoring. A store
 	// that keeps backlogs reads them and the readiness index, not the tasks (pgstore);
@@ -117,6 +123,22 @@ type Inspect interface {
 type Background interface {
 	// Start registers the replica and its policy set.
 	Start(ctx context.Context, r Replica) error
+	// ServeHandlers records that this replica has sessions that can run these handlers.
+	// It is called when the sessions change and, while they stay, more often than the
+	// grace period of SweepUnserved. SweepUnserved reads it, and so does Dispatch: work
+	// in another pool that none of the pool's sessions can run is not given first
+	// refusal on a queue.
+	ServeHandlers(ctx context.Context, sets []PoolHandlers) error
+	// SweepUnserved looks for pending tasks whose handler no session can run. It fails
+	// the ones that waited longer than grace (code CodeNoHandler, no attempt recorded)
+	// and reports the handlers whose tasks wait. A handler is served from the moment a
+	// replica reports it until grace after the last report; a task waits from its
+	// creation, and no grace ends before one has passed since the newest replica
+	// started. A call is one bounded round: the store keeps where the last round
+	// stopped, and a call that comes sooner than a quarter of grace (at most a
+	// minute) after another, from any replica, does nothing. Safe to call
+	// concurrently.
+	SweepUnserved(ctx context.Context, grace time.Duration) (Unserved, error)
 	// Notifications delivers coalesced wake-ups until ctx is done. A missed
 	// notification only delays work until the next NextReadyAt or poll.
 	Notifications(ctx context.Context) (<-chan Notification, error)
@@ -135,12 +157,18 @@ type Policies interface {
 
 // Effective is the resolved scheduling input for one run on one queue.
 type Effective struct {
-	Limits Limits        // what this run's tasks are admitted against
-	Own    bool          // Limits come from a run override: admitted on the run's own allowance
-	Queue  Limits        // the queue's shared limits, consumed by every dispatch
-	Weight float64       // fair share on this queue
-	Lease  LeaseSettings // duration and maximum duration
+	Limits Limits // what this run's tasks are admitted against
+	Own    bool   // Limits come from a run override: admitted on the run's own allowance
+	Queue  Limits // the queue's shared limits, consumed by every dispatch
+	// Adaptive is the queue's AIMD pacing. It is the queue's, not the run's: every run
+	// on the queue resolves the same value.
+	Adaptive sched.Adaptive
+	Weight   float64       // fair share on this queue
+	Lease    LeaseSettings // duration and maximum duration
 }
+
+// Strain is the adaptive state of a queue, kept with its limiter state.
+type Strain = sched.Strain
 
 // Limits are politeness limits in GCRA form: T = max(1/rate, min_delay), burst, concurrency.
 type Limits = sched.Limits
@@ -155,6 +183,48 @@ type LeaseSettings struct {
 type Replica struct {
 	ID         string
 	PolicyHash string
+}
+
+// CodeNoHandler is the code of a task that no worker had a handler for during the grace
+// period.
+const CodeNoHandler = "no_handler"
+
+// PoolHandlers is the set of handlers the sessions of one pool can run. The handler
+// "" stands for a session that names no handlers and so can run any: while one is
+// reported, no handler of the pool counts as unserved.
+type PoolHandlers struct {
+	Pool     PoolName
+	Handlers []string
+}
+
+// HandlerRef names a handler within a pool.
+type HandlerRef struct {
+	Pool    PoolName
+	Handler string
+}
+
+// FailedTasks counts tasks failed because no session could run their handler.
+type FailedTasks struct {
+	HandlerRef
+	Tasks int
+}
+
+// WaitingHandler is a handler whose tasks wait because no session can run it.
+type WaitingHandler struct {
+	HandlerRef
+	Lanes int // the queues and runs with such tasks; counted up to a bound
+}
+
+// Unserved is what SweepUnserved found.
+type Unserved struct {
+	Waiting []WaitingHandler // handlers with pending tasks that no live session can run
+	Failed  []FailedTasks    // tasks failed by this call
+	// Held is set when tasks wait and nothing may fail yet, because a replica
+	// started less than the grace period ago.
+	Held bool
+	// Report is set on at most one call in a while, cluster-wide: the caller logs
+	// what waits then, so that the replicas do not each log the same lines.
+	Report bool
 }
 
 // Notification is a coalesced wake-up for the dispatch loop or run watchers.
@@ -175,12 +245,14 @@ type Page struct {
 type RunState int
 
 // RunOpen accepts seeds; RunSealed takes no more and drains; the other states are final.
+// RunAborted is a run a rule of its RunLimits ended.
 const (
 	RunOpen RunState = iota + 1
 	RunSealed
 	RunCompleted
 	RunCancelled
 	RunExpired
+	RunAborted
 )
 
 // Ended reports whether the run has reached a final state.
@@ -196,11 +268,57 @@ const (
 	KeyExplicit
 )
 
-// RunLimits caps what a run may do.
+// RunLimits caps what a run may do, and says when it ends early.
 type RunLimits struct {
 	Deadline time.Time // zero: none
 	MaxTasks uint64    // 0: none
 	MaxDepth uint32    // 0: none
+	// The abort rules. Finish evaluates them in the transaction that applies an attempt.
+	AbortOnCodes           []string // empty: none; an attempt recorded with one of these codes ends the run
+	MaxFailed              uint64   // 0: none; tasks failed for good
+	MaxConsecutiveFailures uint32   // 0: none; tasks failed for good with no success applied between
+}
+
+// AbortRule is the rule of RunLimits that ended a run.
+type AbortRule int
+
+// AbortOnCode is the abort_on_codes rule, AbortMaxFailed max_failed and AbortConsecutiveFailures max_consecutive_failures.
+const (
+	AbortOnCode AbortRule = iota + 1
+	AbortMaxFailed
+	AbortConsecutiveFailures
+)
+
+// AbortReason is why a run was aborted: the rule, and the attempt that tripped it.
+type AbortReason struct {
+	Rule AbortRule
+	Code string // of the attempt; may be empty
+	Task TaskID
+}
+
+// HasAbortRules reports whether any abort rule is set.
+func (l RunLimits) HasAbortRules() bool {
+	return len(l.AbortOnCodes) > 0 || l.MaxFailed > 0 || l.MaxConsecutiveFailures > 0
+}
+
+// CountsFailures reports whether a rule needs the run's failure counters.
+func (l RunLimits) CountsFailures() bool { return l.MaxFailed > 0 || l.MaxConsecutiveFailures > 0 }
+
+// Trip reports which rule an applied attempt trips. code is the attempt's code,
+// failed the number of tasks that have failed for good, run included, and streak the
+// number of them in a row. Both stores call it, so the rules read the same in both. When
+// several rules trip at once the code rule wins, then the streak, then the total.
+func (l RunLimits) Trip(code string, failed, streak uint64) (AbortRule, bool) {
+	switch {
+	case code != "" && slices.Contains(l.AbortOnCodes, code):
+		return AbortOnCode, true
+	case l.MaxConsecutiveFailures > 0 && streak >= uint64(l.MaxConsecutiveFailures):
+		return AbortConsecutiveFailures, true
+	case l.MaxFailed > 0 && failed >= l.MaxFailed:
+		return AbortMaxFailed, true
+	default:
+		return 0, false
+	}
 }
 
 // RunSpec is the immutable definition of a run.
@@ -222,6 +340,7 @@ type Run struct {
 	CreatedAt  time.Time
 	SealedAt   time.Time
 	FinishedAt time.Time
+	Abort      *AbortReason // set when State is RunAborted
 	Stats      RunStats
 }
 
@@ -232,6 +351,20 @@ type RunStats struct {
 	Attempts, QueueBlocks                 uint64
 	Discovered, Duplicates, OverBudget    uint64
 	ByCode                                map[string]uint64
+	// BlockedQueues are the blocked queues the run's pending and delayed tasks wait on,
+	// the ones with the most waiting tasks first, at most MaxBlockedQueues.
+	BlockedQueues []BlockedQueue
+}
+
+// MaxBlockedQueues bounds RunStats.BlockedQueues.
+const MaxBlockedQueues = 20
+
+// BlockedQueue is a blocked queue a run waits on.
+type BlockedQueue struct {
+	Queue   QueueKey
+	Until   time.Time
+	Reason  string
+	Waiting uint64 // the run's pending and delayed tasks on the queue
 }
 
 // RunFilter selects runs by state and labels; empty fields match everything.
@@ -252,6 +385,8 @@ const (
 	EventCompleted
 	EventCancelled
 	EventExpired
+	// EventAborted is 9, as in the API: 8 is the statistics event, which is not logged.
+	EventAborted RunEventType = 9
 )
 
 // RunEvent is one entry of the run event log.
@@ -276,6 +411,7 @@ type NewTask struct {
 	Fingerprint Fingerprint
 	Queue       QueueKey
 	Pool        PoolName
+	Handler     string // the handler that runs the task; empty: unknown, offered to every session
 	Priority    int32
 	NotBefore   time.Time     // zero: immediately
 	TTL         time.Duration // 0: none
@@ -306,7 +442,11 @@ type DispatchRequest struct {
 	Session SessionID
 	Worker  WorkerInfo
 	Pool    PoolName
-	Slots   int
+	// Handlers are the task handlers the session can run. Only tasks of these handlers
+	// are claimed, and tasks with no handler, which any session may try. Empty: the
+	// session names none, and every task of the pool is claimed.
+	Handlers []string
+	Slots    int
 }
 
 // WorkerInfo identifies a worker process.
@@ -360,6 +500,9 @@ type LeaseInfo struct {
 	Parent      TaskID
 	// Worker is the worker the lease was dispatched to.
 	Worker WorkerInfo
+	// StrainAttempts is how many earlier attempts of the task ended in a retry with
+	// strain. Attempt minus StrainAttempts is what max_attempts is judged against.
+	StrainAttempts uint32
 }
 
 // FinishSource says who ends an attempt, which decides how the lease is checked.
@@ -394,7 +537,20 @@ type Finish struct {
 	Result  TaskResult
 	RetryIn time.Duration // Retry and Released: not before this delay
 	Block   time.Duration // > 0: block the task's queue for all runs
-	Record  AttemptRecord
+	// Strain says the attempt failed for a reason that is a sign of strain on the
+	// site. The store moves the queue's adaptive state with it, in the same
+	// transaction, and counts the attempt as a strain attempt of the task when it is
+	// retried.
+	Strain bool
+	// Answered says the site answered, and not with a sign of strain: a success, a
+	// 404, any outcome that carries an HTTP answer. It is a step back towards the
+	// policy's rate. Neither flag set changes nothing.
+	Answered bool
+	// Extended says a Retry is granted only by the task's strain budget, past what
+	// max_attempts allows. The store turns it into a failure while the queue is in an
+	// outage (sched.Adaptive.Outage).
+	Extended bool
+	Record   AttemptRecord
 }
 
 // AttemptRecord is what is kept about one finished attempt.
@@ -478,6 +634,7 @@ type Queue struct {
 	AdmissibleNow  int // sched.Unlimited when nothing bounds it
 	BlockedUntil   time.Time
 	BlockReason    string
+	Strain         Strain // zero Interval: the queue runs at its policy's rate
 	Backlogs       []Backlog
 }
 

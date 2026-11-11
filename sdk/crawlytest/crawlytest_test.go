@@ -212,3 +212,36 @@ func TestCrawlCut(t *testing.T) {
 	}
 	closing.Close() // twice is safe
 }
+
+// TestCrawlAborted: a rule of the run's limits ends the crawl, and Crawl returns the
+// aborted run with the reason, with no error and without waiting for the rest.
+func TestCrawlAborted(t *testing.T) {
+	f := crawlytest.Start(t)
+	w, err := f.Worker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	if err := w.Register("page", worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+		calls.Add(1)
+		return nil, worker.Fail("blocked", errors.New("refused"), worker.BlockQueue(time.Hour))
+	})); err != nil {
+		t.Fatal(err)
+	}
+	seeds := []*task.Spec{
+		{Request: &task.Request{Url: "https://a.example/1"}, Handler: "page"},
+		{Request: &task.Request{Url: "https://a.example/2"}, Handler: "page"},
+		{Request: &task.Request{Url: "https://a.example/3"}, Handler: "page"},
+	}
+	req := &run.CreateRunRequest{Limits: &run.Limits{AbortOnCodes: []string{"blocked"}}}
+	final, err := f.Crawl(t.Context(), w, seeds, local.WithRun(req))
+	if err != nil || final.GetState() != run.StateAborted {
+		t.Fatalf("run %v, err %v; want an aborted run", final.GetState(), err)
+	}
+	if why := final.GetAbortReason(); why.GetRule() != run.AbortOnCode || why.GetCode() != "blocked" {
+		t.Fatalf("abort reason: %v", why)
+	}
+	if calls.Load() == 0 || calls.Load() > 3 {
+		t.Fatalf("%d calls", calls.Load())
+	}
+}

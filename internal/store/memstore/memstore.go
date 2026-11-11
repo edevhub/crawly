@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	taskv1 "github.com/edevhub/crawly/internal/gen/frontier/task/v1"
 	"github.com/edevhub/crawly/internal/safeconv"
 	"github.com/edevhub/crawly/internal/sched"
 	"github.com/edevhub/crawly/internal/store"
@@ -39,6 +41,12 @@ type Store struct {
 	seq    uint64
 	served uint64
 	keep   time.Duration // how long ended runs are kept; 0: for ever
+	log    *slog.Logger
+	// Handlers that have a session (ServeHandlers), when each was last reported, and
+	// when this store started (SweepUnserved).
+	handlers map[store.HandlerRef]time.Time
+	started  time.Time
+	reported time.Time // when SweepUnserved last asked its caller to log
 }
 
 // Option configures a Store.
@@ -46,6 +54,9 @@ type Option func(*Store)
 
 // WithClock replaces the store clock, for tests.
 func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = now } }
+
+// WithLogger sets the logger the store reports aborted runs to. Default: none.
+func WithLogger(l *slog.Logger) Option { return func(s *Store) { s.log = l } }
 
 // WithRetention makes Maintain delete ended runs, with their tasks, once they have
 // been ended for this long. The default keeps them for ever.
@@ -62,10 +73,14 @@ func New(pol store.Policies, opts ...Option) *Store {
 		ttl:    map[*task]struct{}{},
 		leased: map[*task]struct{}{},
 		subs:   map[chan store.Notification]struct{}{},
+		log:    slog.New(slog.DiscardHandler),
+
+		handlers: map[store.HandlerRef]time.Time{},
 	}
 	for _, o := range opts {
 		o(s)
 	}
+	s.started = s.now()
 	return s
 }
 
@@ -80,6 +95,8 @@ type run struct {
 	tasks                     []*task
 	backlogs                  []*backlog
 	stats                     store.RunStats // counters only; ledger figures are computed
+	failures, streak          uint64         // the abort rules' counters: tasks failed for good, and in a row
+	abort                     *store.AbortReason
 }
 
 func (r *run) dispatchable() bool {
@@ -93,6 +110,7 @@ type queue struct {
 	vclock       float64
 	blockedUntil time.Time
 	blockReason  string
+	strain       store.Strain
 	backlogs     []*backlog
 	offer        *offer
 	served       uint64
@@ -122,11 +140,14 @@ type task struct {
 	depth     uint32
 	parent    store.TaskID
 	spec      []byte
+	handler   string
+	created   time.Time
 	priority  int32
 	seq       uint64
 	notBefore time.Time
 	eligible  time.Time // when the task last became eligible: creation, not-before or retry time
 	expiresAt time.Time
+	strained  uint32          // attempts that ended in a retry with strain
 	state     store.TaskState // Pending, InFlight or a final state; Delayed is derived
 	attempt   uint32
 	nonce     string
@@ -230,6 +251,7 @@ func (s *Store) CancelRun(_ context.Context, id store.RunID) (store.Run, error) 
 func (s *Store) end(r *run, state store.RunState) {
 	now := s.now()
 	r.state, r.finished = state, now
+	// Cancelled and aborted runs drop their tasks as cancelled.
 	final, counter := store.TaskCancelled, &r.stats.Cancelled
 	if state == store.RunExpired {
 		final, counter = store.TaskExpired, &r.stats.Expired
@@ -255,9 +277,12 @@ func (s *Store) end(r *run, state store.RunState) {
 		s.wakeQueue(b.q)
 	}
 	r.active = 0
-	if state == store.RunExpired {
+	switch state {
+	case store.RunExpired:
 		s.event(r, store.EventExpired)
-	} else {
+	case store.RunAborted:
+		s.event(r, store.EventAborted)
+	default:
 		s.event(r, store.EventCancelled)
 	}
 }
@@ -331,7 +356,9 @@ func (s *Store) LastEventCursor(context.Context) (store.EventCursor, error) {
 }
 
 func (s *Store) event(r *run, typ store.RunEventType) {
-	s.events = append(s.events, store.RunEvent{Cursor: store.EventCursor(len(s.events) + 1), Type: typ, Run: s.view(r), At: s.now()})
+	v := s.view(r)
+	v.Stats.BlockedQueues = nil // lifecycle events carry no list of blocked queues, as in the other store
+	s.events = append(s.events, store.RunEvent{Cursor: store.EventCursor(len(s.events) + 1), Type: typ, Run: v, At: s.now()})
 	s.send(store.Notification{Runs: true})
 }
 
@@ -350,8 +377,31 @@ func (s *Store) view(r *run) store.Run {
 			}
 		}
 	}
+	if !r.state.Ended() {
+		st.BlockedQueues = r.blockedQueues(now)
+	}
 	return store.Run{Spec: r.spec, State: r.state, Paused: r.paused, CreatedAt: r.created,
-		SealedAt: r.sealed, FinishedAt: r.finished, Stats: st}
+		SealedAt: r.sealed, FinishedAt: r.finished, Abort: r.abort, Stats: st}
+}
+
+// blockedQueues lists the blocked queues the run's undispatched tasks wait on.
+func (r *run) blockedQueues(now time.Time) []store.BlockedQueue {
+	var out []store.BlockedQueue
+	for _, b := range r.backlogs {
+		if len(b.pending) == 0 || !now.Before(b.q.blockedUntil) {
+			continue
+		}
+		i := slices.IndexFunc(out, func(o store.BlockedQueue) bool { return o.Queue == b.q.key })
+		if i < 0 {
+			out = append(out, store.BlockedQueue{Queue: b.q.key, Until: b.q.blockedUntil, Reason: b.q.blockReason})
+			i = len(out) - 1
+		}
+		out[i].Waiting += safeconv.Uint64(len(b.pending))
+	}
+	slices.SortFunc(out, func(a, b store.BlockedQueue) int {
+		return cmp.Or(cmp.Compare(b.Waiting, a.Waiting), cmp.Compare(a.Queue, b.Queue))
+	})
+	return out[:min(len(out), store.MaxBlockedQueues)]
 }
 
 // ---- tasks
@@ -380,7 +430,8 @@ func (s *Store) AddTasks(_ context.Context, req store.AddRequest) ([]store.AddRe
 	out := make([]store.AddResult, len(req.Tasks))
 	open := r.state == store.RunOpen || (req.Parent != nil && r.state == store.RunSealed)
 	woken := map[store.PoolName]bool{}
-	for i, nt := range req.Tasks {
+	for i := range req.Tasks {
+		nt := &req.Tasks[i]
 		switch {
 		case nt.Invalid:
 			out[i].Status = store.AddInvalid
@@ -400,7 +451,7 @@ func (s *Store) AddTasks(_ context.Context, req store.AddRequest) ([]store.AddRe
 			}
 			s.seq++
 			t := &task{id: store.TaskID("t" + strconv.FormatUint(s.seq, 36)), r: r, fp: nt.Fingerprint,
-				depth: depth, parent: parent, spec: nt.Spec, priority: nt.Priority, seq: s.seq,
+				depth: depth, parent: parent, spec: nt.Spec, handler: nt.Handler, created: now, priority: nt.Priority, seq: s.seq,
 				notBefore: nt.NotBefore, eligible: later(now, nt.NotBefore), state: store.TaskPending}
 			if nt.TTL > 0 {
 				t.expiresAt = now.Add(nt.TTL)
@@ -453,10 +504,57 @@ func (b *backlog) insert(t *task) {
 	b.pending = slices.Insert(b.pending, i, t)
 }
 
-// eligible counts the tasks that can be claimed now and reports the earliest time a
-// delayed one becomes claimable.
-func (b *backlog) eligible(now time.Time) (n int, next time.Time) {
+// handlerSet says which tasks a session can run: those of its handlers, and those
+// with no handler. A nil set runs everything.
+type handlerSet map[string]struct{}
+
+func newHandlerSet(handlers []string) handlerSet {
+	if len(handlers) == 0 {
+		return nil
+	}
+	h := make(handlerSet, len(handlers))
+	for _, n := range handlers {
+		h[n] = struct{}{}
+	}
+	return h
+}
+
+func (h handlerSet) runs(t *task) bool {
+	if h == nil || t.handler == "" {
+		return true
+	}
+	_, ok := h[t.handler]
+	return ok
+}
+
+// servedWindow is how recently a handler must have been reported to count as served
+// when another pool's first refusal is decided.
+const servedWindow = 5 * time.Minute
+
+// servedSet is what the pool's sessions can run, as they reported it lately: a session
+// that names no handlers can run anything (nil); with none, only tasks of unknown
+// handler can be run.
+func (s *Store) servedSet(pool store.PoolName, now time.Time) handlerSet {
+	set := handlerSet{}
+	for ref, seen := range s.handlers {
+		if ref.Pool != pool || now.Sub(seen) > servedWindow {
+			continue
+		}
+		if ref.Handler == "" {
+			return nil
+		}
+		set[ref.Handler] = struct{}{}
+	}
+	return set
+}
+
+// eligible counts the tasks that the set can run and that can be claimed now, and
+// reports the earliest time a delayed one becomes claimable.
+func (b *backlog) eligible(now time.Time, h handlerSet) (n int, next time.Time) {
 	for _, t := range b.pending {
+		if !h.runs(t) {
+			continue
+		}
 		if t.notBefore.After(now) {
 			if next.IsZero() || t.notBefore.Before(next) {
 				next = t.notBefore
@@ -480,10 +578,11 @@ func (s *Store) Dispatch(_ context.Context, req store.DispatchRequest) (store.Di
 			res.NextReadyAt = t
 		}
 	}
+	h := newHandlerSet(req.Handlers)
 	var qs []*queue
 	for _, q := range s.queues {
 		for _, b := range q.backlogs {
-			if b.pool == req.Pool && len(b.pending) > 0 && b.r.dispatchable() {
+			if b.pool == req.Pool && b.r.dispatchable() && slices.ContainsFunc(b.pending, h.runs) {
 				qs = append(qs, q)
 				break
 			}
@@ -499,14 +598,15 @@ func (s *Store) Dispatch(_ context.Context, req store.DispatchRequest) (store.Di
 			note(now) // more may be ready: the caller asks again when it has slots
 			break
 		}
-		slots -= s.dispatchQueue(q, req, slots, now, &res, note)
+		slots -= s.dispatchQueue(q, req, h, slots, now, &res, note)
 	}
 	return res, nil
 }
 
 // dispatchQueue claims up to slots tasks of req.Pool from one queue and returns how many.
-func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, slots int, now time.Time,
+func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, h handlerSet, slots int, now time.Time,
 	res *store.DispatchResult, note func(time.Time)) int {
+	q.strain = s.pol.For("", nil, q.key).Adaptive.Decayed(q.strain, now)
 	taken := 0
 	for taken < slots {
 		if now.Before(q.blockedUntil) {
@@ -522,7 +622,13 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, slots int, no
 			if !b.r.dispatchable() {
 				continue
 			}
-			elig, next := b.eligible(now)
+			// Another pool's tasks are judged by their pool's sessions, not this one's:
+			// the ones that have had a session lately.
+			bh := h
+			if b.pool != req.Pool {
+				bh = s.servedSet(b.pool, now)
+			}
+			elig, next := b.eligible(now, bh)
 			if elig == 0 {
 				if b.pool == req.Pool {
 					note(next)
@@ -530,9 +636,16 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, slots int, no
 				continue
 			}
 			e := s.pol.For(b.r.spec.ID, b.r.spec.Policy, q.key)
+			slowed := e.Adaptive.Slowed(e.Queue, q.strain)
+			e.Queue, e.Limits = e.Adaptive.Apply(e.Queue, q.strain), e.Adaptive.Apply(e.Limits, q.strain)
 			admit, at := sched.Admitted(e.Queue, q.tat, now, q.inFlight), sched.EligibleAt(e.Queue, q.tat)
 			if e.Own {
 				admit, at = sched.Admitted(e.Limits, b.ownTat, now, b.inFlight), sched.EligibleAt(e.Limits, b.ownTat)
+				if slowed {
+					// A run with limits of its own is no faster than the slowed queue.
+					qa := sched.Admitted(e.Queue, q.tat, now, q.inFlight)
+					admit, at = min(admit, qa), latest(at, sched.EligibleAt(e.Queue, q.tat))
+				}
 			}
 			if admit == 0 {
 				// Refused by rate: ready at a known time. Refused by concurrency: a
@@ -569,7 +682,7 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, slots int, no
 			continue
 		}
 		n := min(slots-taken, bestAdmit)
-		claimed := best.claim(n, now)
+		claimed := best.claim(n, now, h)
 		n = len(claimed)
 		if bestEff.Own {
 			best.ownTat = sched.Advance(bestEff.Limits, best.ownTat, now, n)
@@ -617,12 +730,12 @@ func before(a, b *backlog) bool {
 	return a.pool < b.pool
 }
 
-// claim removes up to n claimable tasks, highest priority first.
-func (b *backlog) claim(n int, now time.Time) []*task {
+// claim removes up to n claimable tasks the set can run, highest priority first.
+func (b *backlog) claim(n int, now time.Time, h handlerSet) []*task {
 	var out []*task
 	keep := b.pending[:0]
 	for _, t := range b.pending {
-		if len(out) < n && !t.notBefore.After(now) {
+		if len(out) < n && !t.notBefore.After(now) && h.runs(t) {
 			out = append(out, t)
 			continue
 		}
@@ -638,7 +751,7 @@ func (b *backlog) claim(n int, now time.Time) []*task {
 func (s *Store) info(t *task) store.LeaseInfo {
 	return store.LeaseInfo{Ref: store.LeaseRef{ID: t.leaseID(), Attempt: t.attempt}, Task: t.id, Run: t.r.spec.ID,
 		RunPolicy: t.r.spec.Policy, Queue: t.b.q.key, Pool: t.b.pool, Fingerprint: t.fp, Depth: t.depth, Parent: t.parent,
-		Worker: t.worker}
+		Worker: t.worker, StrainAttempts: t.strained}
 }
 
 // byLease finds the task of a lease. Accepted means the lease is the task's current
@@ -730,6 +843,15 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 		}
 		r.stats.QueueBlocks++
 	}
+	e := s.pol.For(r.spec.ID, r.spec.Policy, q.key)
+	q.strain = e.Adaptive.Decayed(q.strain, now)
+	if f.Result == store.ResultRetry && f.Extended && e.Adaptive.Outage(q.strain, now) {
+		f.Result = store.ResultFailed // the site is down: the extended budget ends
+	}
+	if f.Result == store.ResultRetry && f.Strain {
+		t.strained++
+	}
+	s.adapt(q, r, f, t.dispatch, now)
 	switch f.Result {
 	case store.ResultRetry:
 		t.state, t.notBefore, t.eligible = store.TaskPending, now.Add(f.RetryIn), now.Add(f.RetryIn)
@@ -740,15 +862,59 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 	case store.ResultFailed:
 		t.state = store.TaskFailed
 		r.stats.Failed++
+		if f.Source != store.SourceReaper { // a lease that expired is the fleet's failure, not the site's
+			r.failures++
+			r.streak++
+		}
 		r.active--
 	default:
 		t.state = store.TaskSucceeded
 		r.stats.Succeeded++
+		r.streak = 0
 		r.active--
+	}
+	if rule, ok := r.spec.Limits.Trip(f.Record.Code, r.failures, r.streak); ok {
+		// The outcome is applied: now the rule ends the run, in the same critical section.
+		r.abort = &store.AbortReason{Rule: rule, Code: f.Record.Code, Task: t.id}
+		s.log.Warn("run aborted", "run", r.spec.ID, "rule", rule, "code", f.Record.Code, "task", t.id)
+		s.end(r, store.RunAborted)
+		s.wakeQueue(q)
+		return store.FinishAccepted, nil
 	}
 	s.complete(r)
 	s.wakeQueue(q)
 	return store.FinishAccepted, nil
+}
+
+func latest(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// adapt moves the queue's adaptive state with an attempt that ended.
+func (s *Store) adapt(q *queue, r *run, f store.Finish, dispatched, now time.Time) {
+	e := s.pol.For(r.spec.ID, r.spec.Policy, q.key)
+	if !e.Adaptive.Enabled {
+		q.strain.Interval, q.strain.At, q.strain.CeilingAt = 0, now, time.Time{} // switched off: forgotten
+		return
+	}
+	before := q.strain
+	switch {
+	case f.Strain:
+		q.strain = e.Adaptive.Strained(e.Queue.Interval, q.strain, now, dispatched)
+	case f.Answered:
+		q.strain = e.Adaptive.Answered(e.Queue.Interval, q.strain, now, dispatched)
+	}
+	if q.strain.Interval > before.Interval {
+		// The next request waits a whole new interval, counted from now, for every run.
+		next := now.Add(q.strain.Interval)
+		q.tat = latest(q.tat, next)
+		for _, b := range q.backlogs {
+			b.ownTat = latest(b.ownTat, next)
+		}
+	}
 }
 
 // ExpiredLeases returns up to limit leases past their expiry, oldest first.
@@ -856,9 +1022,14 @@ func (s *Store) ListTasks(_ context.Context, f store.TaskFilter, page store.Page
 }
 
 func (s *Store) queueView(q *queue, now time.Time) store.Queue {
-	lim := s.pol.For("", nil, q.key).Queue
+	e := s.pol.For("", nil, q.key)
+	q.strain = e.Adaptive.Decayed(q.strain, now)
+	lim := e.Adaptive.Apply(e.Queue, q.strain)
 	v := store.Queue{Key: q.key, InFlight: q.inFlight, NextEligibleAt: sched.EligibleAt(lim, q.tat),
-		AdmissibleNow: sched.Admitted(lim, q.tat, now, q.inFlight), BlockReason: q.blockReason}
+		AdmissibleNow: sched.Admitted(lim, q.tat, now, q.inFlight), BlockReason: q.blockReason, Strain: q.strain}
+	if !e.Adaptive.Enabled {
+		v.Strain.Interval = 0
+	}
 	if now.Before(q.blockedUntil) {
 		v.BlockedUntil, v.AdmissibleNow = q.blockedUntil, 0
 	} else {
@@ -927,14 +1098,110 @@ func (s *Store) BlockQueue(_ context.Context, key store.QueueKey, until time.Tim
 	defer s.mu.Unlock()
 	q := s.queue(key)
 	q.blockedUntil, q.blockReason = until, reason
+	if now := s.now(); until.IsZero() && q.strain.Interval > 0 {
+		// Back to the policy's rate: what the slowdown made the queue wait is cancelled.
+		q.strain.Interval, q.strain.At, q.strain.CeilingAt = 0, now, time.Time{}
+		if q.tat.After(now) {
+			q.tat = now
+		}
+	}
 	s.wakeQueue(q)
 	return s.queueView(q, s.now()), nil
 }
 
 // ---- background
 
-// Start does nothing: the in-memory store has no replica state.
-func (s *Store) Start(context.Context, store.Replica) error { return nil }
+// Start records the start of a replica: no task fails for want of a handler until a
+// grace period has passed since the newest start.
+func (s *Store) Start(context.Context, store.Replica) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.started = s.now()
+	return nil
+}
+
+// ServeHandlers records that the handlers have sessions now.
+func (s *Store) ServeHandlers(_ context.Context, sets []store.PoolHandlers) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	for _, set := range sets {
+		for _, h := range set.Handlers {
+			s.handlers[store.HandlerRef{Pool: set.Pool, Handler: h}] = now
+		}
+	}
+	return nil
+}
+
+// SweepUnserved fails the pending tasks that waited longer than grace for a session
+// that can run their handler, and reports the handlers whose tasks wait.
+func (s *Store) SweepUnserved(_ context.Context, grace time.Duration) (store.Unserved, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	var out store.Unserved
+	mayFail := now.Sub(s.started) >= grace
+	served := func(pool store.PoolName, handler string) bool {
+		for _, h := range []string{handler, ""} { // "": a session that can run any
+			if seen, ok := s.handlers[store.HandlerRef{Pool: pool, Handler: h}]; ok && now.Sub(seen) <= grace {
+				return true
+			}
+		}
+		return false
+	}
+	waiting := map[store.HandlerRef]map[*backlog]bool{}
+	failed := map[store.HandlerRef]int{}
+	for _, r := range s.order {
+		if !r.dispatchable() {
+			continue
+		}
+		for _, b := range r.backlogs {
+			for _, t := range slices.Clone(b.pending) {
+				ref := store.HandlerRef{Pool: b.pool, Handler: t.handler}
+				if t.handler == "" || served(b.pool, t.handler) {
+					continue // served, or no handler named: any session may try it
+				}
+				if now.Sub(t.created) < grace || !mayFail {
+					if waiting[ref] == nil {
+						waiting[ref] = map[*backlog]bool{}
+					}
+					waiting[ref][b] = true
+					continue
+				}
+				if i := slices.Index(b.pending, t); i >= 0 {
+					b.pending = slices.Delete(b.pending, i, i+1)
+				}
+				delete(s.ttl, t)
+				t.attempt++
+				t.attempts = append(t.attempts, store.Attempt{Attempt: t.attempt, DispatchedAt: now, FinishedAt: now, Record: store.AttemptRecord{
+					Kind: int32(taskv1.Outcome_KIND_FAILED), Code: store.CodeNoHandler, Message: "no worker had the handler " + t.handler + " for " + grace.String()}})
+				t.state = store.TaskFailed
+				r.stats.Failed++
+				r.stats.ByCode[store.CodeNoHandler]++
+				r.active--
+				failed[ref]++
+				s.complete(r)
+			}
+		}
+	}
+	for ref, bs := range waiting {
+		out.Waiting = append(out.Waiting, store.WaitingHandler{HandlerRef: ref, Lanes: len(bs)})
+	}
+	for ref, n := range failed {
+		out.Failed = append(out.Failed, store.FailedTasks{HandlerRef: ref, Tasks: n})
+	}
+	slices.SortFunc(out.Waiting, func(a, b store.WaitingHandler) int { return cmpRef(a.HandlerRef, b.HandlerRef) })
+	slices.SortFunc(out.Failed, func(a, b store.FailedTasks) int { return cmpRef(a.HandlerRef, b.HandlerRef) })
+	out.Held = !mayFail && len(out.Waiting) > 0
+	if now.Sub(s.reported) >= min(grace, 10*time.Minute) {
+		s.reported, out.Report = now, true
+	}
+	return out, nil
+}
+
+func cmpRef(a, b store.HandlerRef) int {
+	return cmp.Or(cmp.Compare(a.Pool, b.Pool), cmp.Compare(a.Handler, b.Handler))
+}
 
 // Notifications delivers wake-ups until ctx is done. A full channel drops wake-ups, which only delays work.
 func (s *Store) Notifications(ctx context.Context) (<-chan store.Notification, error) {
@@ -1121,10 +1388,17 @@ func (s *Store) readySince(q *queue, b *backlog, now time.Time) (time.Time, bool
 	if oldest.IsZero() {
 		return time.Time{}, false
 	}
+	// The pace is the one Dispatch applies: slowed while the queue is strained.
 	e := s.pol.For(b.r.spec.ID, b.r.spec.Policy, q.key)
+	strain := e.Adaptive.Decayed(q.strain, now)
+	slowed := e.Adaptive.Slowed(e.Queue, strain)
+	e.Queue, e.Limits = e.Adaptive.Apply(e.Queue, strain), e.Adaptive.Apply(e.Limits, strain)
 	admit, at := sched.Admitted(e.Queue, q.tat, now, q.inFlight), sched.EligibleAt(e.Queue, q.tat)
 	if e.Own {
 		admit, at = sched.Admitted(e.Limits, b.ownTat, now, b.inFlight), sched.EligibleAt(e.Limits, b.ownTat)
+		if slowed {
+			admit, at = min(admit, sched.Admitted(e.Queue, q.tat, now, q.inFlight)), latest(at, sched.EligibleAt(e.Queue, q.tat))
+		}
 	}
 	if admit == 0 {
 		return time.Time{}, false

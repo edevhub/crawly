@@ -36,7 +36,8 @@ func (ss sessionService) ListSessions(_ context.Context, req *sessionv1.ListSess
 			out.Sessions = append(out.Sessions, &sessionv1.Session{
 				SessionId: string(sess.id), WorkerId: sess.worker.ID, BuildVersion: sess.worker.Version, Pool: string(p.name),
 				ConnectedTime: timestamppb.New(sess.since), Credits: safeconv.Uint32(sess.credits),
-				UnfinishedAssignments: safeconv.Uint32(len(sess.leases)), ReplicaId: s.cfg.ReplicaID})
+				UnfinishedAssignments: safeconv.Uint32(len(sess.leases)), ReplicaId: s.cfg.ReplicaID,
+				Handlers: slices.Clone(sess.handlers)})
 		}
 		p.mu.Unlock()
 	}

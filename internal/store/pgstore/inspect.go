@@ -196,23 +196,33 @@ type queueRow struct {
 	tat, blocked pgtype.Timestamptz
 	inFlight     int
 	reason       string
+	strain       store.Strain
 }
 
-const queueColumns = "key, tat, in_flight, blocked_until, coalesce(block_reason, '')"
+const queueColumns = "key, tat, in_flight, blocked_until, coalesce(block_reason, ''), slow_interval_ns, strain_at, strain_steps, last_strain_at, ceiling_at"
 
 func scanQueue(row pgx.CollectableRow) (queueRow, error) {
 	var q queueRow
-	err := row.Scan(&q.key, &q.tat, &q.inFlight, &q.blocked, &q.reason)
+	var slow, steps int64
+	var at, last, ceiling pgtype.Timestamptz
+	err := row.Scan(&q.key, &q.tat, &q.inFlight, &q.blocked, &q.reason, &slow, &at, &steps, &last, &ceiling)
+	q.strain = store.Strain{Interval: time.Duration(slow), At: timeOf(at), Steps: uint64(max(steps, 0)), Last: timeOf(last),
+		CeilingAt: timeOf(ceiling)}
 	return q, err
 }
 
 // queueView builds the queue as the API shows it, with its active backlogs.
 func (s *Store) queueView(ctx context.Context, q queueRow, now time.Time) (store.Queue, error) {
 	key := store.QueueKey(q.key)
-	lim := s.pol.For("", nil, key).Queue
+	e := s.pol.For("", nil, key)
+	q.strain = e.Adaptive.Decayed(q.strain, now)
+	lim := e.Adaptive.Apply(e.Queue, q.strain)
 	tat := timeOf(q.tat)
 	v := store.Queue{Key: key, InFlight: q.inFlight, NextEligibleAt: sched.EligibleAt(lim, tat),
-		AdmissibleNow: sched.Admitted(lim, tat, now, q.inFlight)}
+		AdmissibleNow: sched.Admitted(lim, tat, now, q.inFlight), Strain: q.strain}
+	if !e.Adaptive.Enabled {
+		v.Strain.Interval = 0
+	}
 	if until := timeOf(q.blocked); now.Before(until) {
 		v.BlockedUntil, v.BlockReason, v.AdmissibleNow = until, q.reason, 0
 	}
@@ -313,8 +323,8 @@ func (s *Store) ListQueues(ctx context.Context, f store.QueueFilter, page store.
 		qs, next = qs[:size], qs[size-1].key
 	}
 	out := make([]store.Queue, 0, len(qs))
-	for _, q := range qs {
-		v, err := s.queueView(ctx, q, now)
+	for i := range qs {
+		v, err := s.queueView(ctx, qs[i], now)
 		if err != nil {
 			return nil, "", wrap(err)
 		}
@@ -346,10 +356,19 @@ func (s *Store) BlockQueue(ctx context.Context, key store.QueueKey, until time.T
 		if until.IsZero() {
 			q.blockReason = ""
 		}
+		if until.IsZero() && q.strain.Interval > 0 {
+			// Back to the policy's rate: what the slowdown made the queue wait is cancelled.
+			q.strain.Interval, q.strain.At, q.strain.CeilingAt = 0, now, time.Time{}
+			if q.tat.After(now) {
+				q.tat = now
+			}
+		}
 		// A block that was lifted or shortened leaves readiness late: bring it back.
 		for _, b := range bs {
-			if b.live && b.ready.After(now) && !b.ready.Equal(forever) {
-				b.setReady(now)
+			for _, l := range b.lanes {
+				if b.live && l.ready.After(now) && !l.ready.Equal(forever) {
+					l.setReady(now)
+				}
 			}
 		}
 		refresh(q, bs, now)
@@ -365,20 +384,24 @@ func (s *Store) BlockQueue(ctx context.Context, key store.QueueKey, until time.T
 }
 
 // PoolStats sums the work of every pool across all runs. The totals come from the
-// backlogs that have work (backlogs_active), one row per backlog and no task is read;
-// the due queues come from the readiness index (backlogs_ready), the dueLimit oldest
-// backlogs of each pool. A backlog of a paused or ended run is not ready, whatever its
-// index entry says: the entry is only lowered by the next dispatch round (heal).
+// backlogs that have work (backlogs_active), one row per backlog, each with the
+// earliest readiness of its lanes (lanes is where readiness is kept; backlogs.ready_at
+// is only a copy for the build before); no task is read. The due queues come from the
+// readiness index of the lanes (lanes_ready_pool), the dueLimit oldest lanes of each
+// pool. A backlog of a paused or ended run is not ready, whatever its lanes say: they
+// are only lowered by the next dispatch round (heal).
 func (s *Store) PoolStats(ctx context.Context, dueLimit int) ([]store.PoolStats, error) {
 	now, err := s.Now(ctx)
 	if err != nil {
 		return nil, err
 	}
 	rows, err := s.db.Query(ctx, `SELECT p.name,
-			coalesce(sum(b.pending) FILTER (WHERE b.ready_at <= $1 AND r.state IN ('open', 'sealed') AND NOT r.paused), 0),
-			coalesce(sum(b.pending) FILTER (WHERE NOT (b.ready_at <= $1 AND r.state IN ('open', 'sealed') AND NOT r.paused)), 0),
+			coalesce(sum(b.pending) FILTER (WHERE l.ready_at <= $1 AND r.state IN ('open', 'sealed') AND NOT r.paused), 0),
+			coalesce(sum(b.pending) FILTER (WHERE NOT (l.ready_at <= $1 AND r.state IN ('open', 'sealed') AND NOT r.paused)), 0),
 			coalesce(sum(b.in_flight), 0)
 		FROM backlogs b JOIN pools p ON p.pool_id = b.pool_id JOIN runs r ON r.run_no = b.run_no
+		LEFT JOIN LATERAL (SELECT min(ready_at) AS ready_at FROM lanes
+			WHERE run_no = b.run_no AND queue_key = b.queue_key AND pool_id = b.pool_id) l ON true
 		WHERE b.pending > 0 OR b.in_flight > 0 GROUP BY p.name ORDER BY p.name`, now)
 	if err != nil {
 		return nil, wrap(err)
@@ -400,9 +423,11 @@ func (s *Store) PoolStats(ctx context.Context, dueLimit int) ([]store.PoolStats,
 	}
 	rows, err = s.db.Query(ctx, `SELECT p.name, d.queue_key, min(d.ready_at)
 		FROM pools p CROSS JOIN LATERAL (
-			SELECT b.queue_key, b.ready_at FROM backlogs b JOIN runs r ON r.run_no = b.run_no
-			WHERE b.pool_id = p.pool_id AND b.ready_at <= $1 AND b.pending > 0 AND r.state IN ('open', 'sealed') AND NOT r.paused
-			ORDER BY b.ready_at LIMIT $2) d
+			SELECT l.queue_key, l.ready_at FROM lanes l
+			JOIN backlogs b ON b.run_no = l.run_no AND b.queue_key = l.queue_key AND b.pool_id = l.pool_id
+			JOIN runs r ON r.run_no = l.run_no
+			WHERE l.pool_id = p.pool_id AND l.ready_at <= $1 AND b.pending > 0 AND r.state IN ('open', 'sealed') AND NOT r.paused
+			ORDER BY l.ready_at LIMIT $2) d
 		GROUP BY p.name, d.queue_key ORDER BY min(d.ready_at), d.queue_key`, now, dueLimit)
 	if err != nil {
 		return nil, wrap(err)

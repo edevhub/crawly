@@ -140,11 +140,11 @@ func testMetrics(t *testing.T, start startFunc) { //nolint:thelper // a test bod
 
 	// The Frontier's side. The policy of the test Frontier matches every queue.
 	g := gather(t, f.Metrics)
-	g.want(t, atLeast(5), "crawly_frontier_dispatched_tasks_total", "pool", "default", "policy", "fast")
-	g.want(t, atLeast(5), "crawly_frontier_dispatch_wait_seconds", "policy", "fast")
+	g.want(t, atLeast(4), "crawly_frontier_dispatched_tasks_total", "pool", "default", "policy", "fast")
+	g.want(t, atLeast(4), "crawly_frontier_dispatch_wait_seconds", "policy", "fast")
 	g.want(t, equals(1), "crawly_frontier_task_outcomes_total", "kind", "retry", "code", "http_503", "result", "retry")
 	g.want(t, atLeast(3), "crawly_frontier_task_outcomes_total", "kind", "success", "result", "succeeded")
-	g.want(t, atLeast(1), "crawly_frontier_released_tasks_total", "pool", "default", "code", "no_handler")
+	g.want(t, equals(0), "crawly_frontier_released_tasks_total", "pool", "default", "code", "no_handler")
 	g.want(t, atLeast(4), "crawly_frontier_attempts_total", "pool", "default")
 	g.want(t, equals(1), "crawly_frontier_queue_blocks_total", "policy", "fast")
 	g.want(t, equals(1), "crawly_frontier_fetch_duration_seconds", "policy", "fast")
@@ -166,6 +166,16 @@ func testMetrics(t *testing.T, start startFunc) { //nolint:thelper // a test bod
 	})
 	gather(t, f.Metrics).want(t, equals(1), "crawly_frontier_pool_stats_up")
 	g.want(t, equals(1), "crawly_frontier_replica_info")
+	// The worker declared its handlers, so the task of a handler nobody has is not given
+	// to it: the sweep fails it once the grace period has passed.
+	eventually(t, "the sweep's failure to be counted", func() bool {
+		n, _ := gather(t, f.Metrics).sum("crawly_frontier_unserved_failed_tasks_total", "pool", "default")
+		return n == 1
+	})
+	eventually(t, "the run to be counted as ended", func() bool {
+		n, _ := gather(t, f.Metrics).sum("crawly_frontier_runs_ended_total", "state", "completed")
+		return n == 1
+	})
 	if n, _ := g.sum("crawly_frontier_store_errors_total"); n != 0 {
 		t.Errorf("no store call failed, and %v were counted as failures", n)
 	}
@@ -180,7 +190,6 @@ func testMetrics(t *testing.T, start startFunc) { //nolint:thelper // a test bod
 	wg.want(t, atLeast(1), "crawly_worker_sessions_opened_total", "pool", "default")
 	wg.want(t, atLeast(3), "crawly_worker_tasks_finished_total", "pool", "default", "handler", "page", "kind", "success")
 	wg.want(t, equals(1), "crawly_worker_tasks_finished_total", "handler", "page", "kind", "retry", "code", "http_503")
-	wg.want(t, atLeast(1), "crawly_worker_tasks_finished_total", "handler", "unregistered", "kind", "released", "code", "no_handler")
 	wg.want(t, equals(1), "crawly_worker_fetch_duration_seconds", "handler", "page")
 	wg.want(t, atLeast(4), "crawly_worker_task_duration_seconds", "handler", "page")
 	wg.want(t, equals(0), "crawly_worker_tasks_running")
@@ -294,6 +303,15 @@ func testMetricsDueWork(t *testing.T, start startFunc) { //nolint:thelper // a t
 	g.want(t, equals(0), "crawly_frontier_sessions", "pool", "default")
 	g.want(t, equals(0), "crawly_frontier_sessions", "pool", "browser")
 	g.want(t, equals(1), "crawly_frontier_pool_stats_up")
+
+	// A run that is cancelled ends: the end is counted, and its work leaves the gauges.
+	if _, err := rc.CancelRun(ctx, &run.CancelRunRequest{RunId: "due"}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the cancelled run to be counted", func() bool {
+		n, _ := gather(t, f.Metrics).sum("crawly_frontier_runs_ended_total", "state", "cancelled")
+		return n == 1
+	})
 }
 
 // clientOf returns the SDK client that runClient made for the address.

@@ -14,6 +14,7 @@ import (
 	v1 "github.com/edevhub/crawly/internal/gen/frontier/policy/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
@@ -104,8 +105,17 @@ type LimiterState struct {
 	AdmissibleNow uint32                 `protobuf:"varint,6,opt,name=admissible_now,json=admissibleNow,proto3" json:"admissible_now,omitempty"`
 	UnblockTime   *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=unblock_time,json=unblockTime,proto3" json:"unblock_time,omitempty"`
 	BlockReason   string                 `protobuf:"bytes,5,opt,name=block_reason,json=blockReason,proto3" json:"block_reason,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// The interval between requests the queue is slowed to by adaptive limits. Unset
+	// while the queue runs at its policy's rate. A BlockQueue call that lifts the block
+	// also resets it.
+	CurrentInterval *durationpb.Duration `protobuf:"bytes,7,opt,name=current_interval,json=currentInterval,proto3" json:"current_interval,omitempty"`
+	// Strain steps taken since the queue's state was created, and when the last outcome
+	// that signalled strain arrived (it is later than the last step when the queue was at
+	// its ceiling or the outcome fell in the same epoch).
+	StrainSteps    uint64                 `protobuf:"varint,8,opt,name=strain_steps,json=strainSteps,proto3" json:"strain_steps,omitempty"`
+	LastStrainTime *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=last_strain_time,json=lastStrainTime,proto3" json:"last_strain_time,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *LimiterState) Reset() {
@@ -171,6 +181,27 @@ func (x *LimiterState) GetBlockReason() string {
 		return x.BlockReason
 	}
 	return ""
+}
+
+func (x *LimiterState) GetCurrentInterval() *durationpb.Duration {
+	if x != nil {
+		return x.CurrentInterval
+	}
+	return nil
+}
+
+func (x *LimiterState) GetStrainSteps() uint64 {
+	if x != nil {
+		return x.StrainSteps
+	}
+	return 0
+}
+
+func (x *LimiterState) GetLastStrainTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.LastStrainTime
+	}
+	return nil
 }
 
 type RunBacklog struct {
@@ -261,18 +292,21 @@ var File_crawly_frontier_queue_v1_queue_proto protoreflect.FileDescriptor
 
 const file_crawly_frontier_queue_v1_queue_proto_rawDesc = "" +
 	"\n" +
-	"$crawly/frontier/queue/v1/queue.proto\x12\x18crawly.frontier.queue.v1\x1a&crawly/frontier/policy/v1/policy.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xf0\x01\n" +
+	"$crawly/frontier/queue/v1/queue.proto\x12\x18crawly.frontier.queue.v1\x1a&crawly/frontier/policy/v1/policy.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xf0\x01\n" +
 	"\x05Queue\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12Q\n" +
 	"\x10effective_limits\x18\x02 \x01(\v2&.crawly.frontier.policy.v1.QueueLimitsR\x0feffectiveLimits\x12@\n" +
 	"\alimiter\x18\x03 \x01(\v2&.crawly.frontier.queue.v1.LimiterStateR\alimiter\x12@\n" +
-	"\bbacklogs\x18\x04 \x03(\v2$.crawly.frontier.queue.v1.RunBacklogR\bbacklogs\"\x84\x02\n" +
+	"\bbacklogs\x18\x04 \x03(\v2$.crawly.frontier.queue.v1.RunBacklogR\bbacklogs\"\xb3\x03\n" +
 	"\fLimiterState\x12\x1b\n" +
 	"\tin_flight\x18\x02 \x01(\rR\binFlight\x12H\n" +
 	"\x12next_eligible_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x10nextEligibleTime\x12%\n" +
 	"\x0eadmissible_now\x18\x06 \x01(\rR\radmissibleNow\x12=\n" +
 	"\funblock_time\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\vunblockTime\x12!\n" +
-	"\fblock_reason\x18\x05 \x01(\tR\vblockReasonJ\x04\b\x01\x10\x02\"\xa0\x01\n" +
+	"\fblock_reason\x18\x05 \x01(\tR\vblockReason\x12D\n" +
+	"\x10current_interval\x18\a \x01(\v2\x19.google.protobuf.DurationR\x0fcurrentInterval\x12!\n" +
+	"\fstrain_steps\x18\b \x01(\x04R\vstrainSteps\x12D\n" +
+	"\x10last_strain_time\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\x0elastStrainTimeJ\x04\b\x01\x10\x02\"\xa0\x01\n" +
 	"\n" +
 	"RunBacklog\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x12\n" +
@@ -301,6 +335,7 @@ var file_crawly_frontier_queue_v1_queue_proto_goTypes = []any{
 	(*RunBacklog)(nil),            // 2: crawly.frontier.queue.v1.RunBacklog
 	(*v1.QueueLimits)(nil),        // 3: crawly.frontier.policy.v1.QueueLimits
 	(*timestamppb.Timestamp)(nil), // 4: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),   // 5: google.protobuf.Duration
 }
 var file_crawly_frontier_queue_v1_queue_proto_depIdxs = []int32{
 	3, // 0: crawly.frontier.queue.v1.Queue.effective_limits:type_name -> crawly.frontier.policy.v1.QueueLimits
@@ -308,11 +343,13 @@ var file_crawly_frontier_queue_v1_queue_proto_depIdxs = []int32{
 	2, // 2: crawly.frontier.queue.v1.Queue.backlogs:type_name -> crawly.frontier.queue.v1.RunBacklog
 	4, // 3: crawly.frontier.queue.v1.LimiterState.next_eligible_time:type_name -> google.protobuf.Timestamp
 	4, // 4: crawly.frontier.queue.v1.LimiterState.unblock_time:type_name -> google.protobuf.Timestamp
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	5, // 5: crawly.frontier.queue.v1.LimiterState.current_interval:type_name -> google.protobuf.Duration
+	4, // 6: crawly.frontier.queue.v1.LimiterState.last_strain_time:type_name -> google.protobuf.Timestamp
+	7, // [7:7] is the sub-list for method output_type
+	7, // [7:7] is the sub-list for method input_type
+	7, // [7:7] is the sub-list for extension type_name
+	7, // [7:7] is the sub-list for extension extendee
+	0, // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_crawly_frontier_queue_v1_queue_proto_init() }

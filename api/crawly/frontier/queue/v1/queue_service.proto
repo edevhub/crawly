@@ -13,7 +13,8 @@ option go_package = "github.com/edevhub/crawly/internal/gen/frontier/queue/v1;qu
 service QueueService {
   rpc ListQueues(ListQueuesRequest) returns (ListQueuesResponse);
   rpc GetQueue(GetQueueRequest) returns (GetQueueResponse);
-  // Applies to every run on the queue. An unset unblock_time unblocks.
+  // Applies to every run on the queue. An unset unblock_time unblocks, and also
+  // resets the slowdown of adaptive limits (LimiterState.current_interval).
   rpc BlockQueue(BlockQueueRequest) returns (BlockQueueResponse);
 }
 

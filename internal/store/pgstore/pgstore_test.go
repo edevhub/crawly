@@ -302,7 +302,7 @@ func TestMaintainFinishesResumeSweep(t *testing.T) {
 	// The state a replica leaves behind when it dies between the resume and its sweep.
 	conn := must(pgx.Connect(ctx, dsn))(t)
 	defer func() { _ = conn.Close(ctx) }()
-	must(conn.Exec(ctx, "UPDATE runs SET resuming = true; UPDATE backlogs SET ready_at = NULL"))(t)
+	must(conn.Exec(ctx, "UPDATE runs SET resuming = true; UPDATE lanes SET ready_at = NULL"))(t)
 	if got := dispatch(t, s, 10); len(got) != 0 {
 		t.Fatalf("dispatched %d before the sweep", len(got))
 	}

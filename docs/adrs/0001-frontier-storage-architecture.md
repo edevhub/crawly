@@ -23,8 +23,8 @@ tasks, report outcomes and add discovered tasks to the same run.
 
 The state has to support:
 
-- **Runs** with a lifecycle (`OPEN → SEALED → COMPLETED | CANCELLED | EXPIRED`), budgets, a
-  deadline, an immutable policy override, stats and an event stream.
+- **Runs** with a lifecycle (`OPEN → SEALED → COMPLETED | CANCELLED | EXPIRED | ABORTED`), budgets, a
+  deadline, abort rules, an immutable policy override, stats and an event stream.
 - **Tasks** deduplicated per run, with lineage (depth, parent), retries and fenced leases.
 - **Queues** identified by an opaque, global key. Politeness state is shared by every run
   with work on the queue.
@@ -106,10 +106,15 @@ deliberately override the limits.
 2. Workers lease tasks. The Frontier dispatches at each site's limit (e.g. 1 RPS,
    concurrency 2), shared with every other run on that site.
 3. A site answers 429 with Retry-After: 120. The worker reports RETRY with
-   block_queue_for=120s. All runs pause dispatch on that site for 2 minutes.
+   block_queue_for=120s. All runs pause dispatch on that site for 2 minutes. A site that
+   answers 503, or not at all, makes workers report RETRY with `strain`: the queue's rate
+   is cut, and it returns to the policy's rate as the site answers again.
 4. Workers add discovered links to the run. Dedup drops the ones the run already has.
 5. The last task finishes. Nothing is pending or in flight on a sealed run: the run
    completes, and WatchRuns emits COMPLETED with final stats.
+   Or a site blocks the crawler for a long time, and the run lists that outcome code in
+   its abort rules: the run ends ABORTED at once, with the rule and the task that tripped
+   it, instead of waiting for the block to end. The block stays on the queue.
 6. Whatever consumes the results reads the run's stats, outcome codes and items and
    decides what they mean.
 ```
@@ -178,7 +183,8 @@ belong to an implementation and its deployment (ADR 0002 has them for the first 
    [Locality rule](#locality-rule)). This is what keeps a single database contention-free
    and what makes every implementation shardable by queue.
 8. **Workers subscribe to named pools**, as Temporal workers poll a task queue. A task names
-   its pool; a worker session serves exactly one pool. There is no capability matching
+   its pool; a worker session serves exactly one pool and names the handlers it can run, and
+   is given only tasks of those handlers. There is no label or capability matching
    (ADR 0003).
 
 ## Responsibilities
@@ -193,11 +199,14 @@ belong to an implementation and its deployment (ADR 0002 has them for the first 
 | One dispatch loop per pool on each replica: it holds the free credits of the pool's sessions, asks for work at once on a notification, otherwise at `NextReadyAt`, with a fallback poll every second, and hands each assignment to a session | Selecting and claiming tasks; readiness index |
 | Reaper loop: expired leases → retry or fail | Finding expired leases |
 | `WatchRuns`: events plus periodic stats snapshots | Ordered, gap-free run event log; aggregated stats |
-| Pushing `LeaseRevoked` for runs that were cancelled or expired | Run limits (`max_tasks`, `max_depth`, `deadline`), run termination |
+| Pushing `LeaseRevoked` for runs that were cancelled, expired or aborted | Run limits (`max_tasks`, `max_depth`, `deadline`), abort rules, run termination |
 | A per-replica budget of store calls: when exhausted, fail the call with `UNAVAILABLE` instead of queueing, so a slow store does not become a retry storm | The clock (`Now`) and background maintenance |
 | Metrics, logging, tracing | |
 
-The store never interprets an `Outcome`: it receives a decided transition. The core never
+The store never interprets an `Outcome`: it receives a decided transition. The abort rules of
+a run are the one place where it looks further: it applies them to the transition and the
+outcome code of the attempt it records, because the counters they need are the run's and the
+decision must be atomic with the outcome that trips it. The core never
 reads a timestamp from its own clock to schedule anything: it passes durations, and the
 store applies them with its own clock.
 
@@ -239,8 +248,8 @@ type Work interface {
 	// AddTasks adds seeds (req.Parent == nil; run must be OPEN) or discovered tasks
 	// (req.Parent set; the parent lease must be live). One result per task, in order.
 	AddTasks(ctx context.Context, req AddRequest) ([]AddResult, error)
-	// Dispatch claims up to req.Slots tasks of req.Pool, following the scheduling model.
-	// It never blocks waiting for work. It is atomic per queue, not per call: it can
+	// Dispatch claims up to req.Slots tasks of req.Pool that the session can run
+	// (req.Handlers), following the scheduling model. It never blocks waiting for work. It is atomic per queue, not per call: it can
 	// return assignments together with an error, and the caller must deliver every
 	// assignment it returns, because those claims are committed.
 	Dispatch(ctx context.Context, req DispatchRequest) (DispatchResult, error)
@@ -264,6 +273,7 @@ type Inspect interface {
 	GetQueue(ctx context.Context, key QueueKey) (Queue, error)
 	ListQueues(ctx context.Context, f QueueFilter, page Page) ([]Queue, PageToken, error)
 	// BlockQueue sets (or with a zero time, clears) an operator block for all runs.
+	// Clearing it also resets the queue's adaptive slowdown.
 	BlockQueue(ctx context.Context, key QueueKey, until time.Time, reason string) (Queue, error)
 	// PoolStats sums the work of every pool across all runs, for monitoring: tasks
 	// pending, delayed and in flight, and the queues whose work is ready, longest ready
@@ -277,6 +287,14 @@ type Background interface {
 	// last (a new set or a rollback) resets readiness, so no backlog stays parked by a
 	// limit that no longer applies.
 	Start(ctx context.Context, r Replica) error
+	// ServeHandlers records that this replica has sessions that can run these handlers
+	// ("" stands for a session that names none and can run any). It is called when the
+	// sessions change and, while they stay, as a heartbeat.
+	ServeHandlers(ctx context.Context, sets []PoolHandlers) error
+	// SweepUnserved fails the pending tasks whose handler no replica has reported for
+	// grace (code "no_handler", no attempt dispatched) and reports the handlers whose
+	// tasks wait. Nothing fails before grace has passed since the newest replica started.
+	SweepUnserved(ctx context.Context, grace time.Duration) (Unserved, error)
 	// Notifications delivers coalesced wake-ups: work became ready in a pool, or a
 	// run event was appended. A missed notification only delays work until the next
 	// DispatchResult.NextReadyAt or poll.
@@ -322,7 +340,7 @@ type RunSpec struct {
 	ID      RunID
 	Labels  map[string]string
 	Policy  *policyv1.RunPolicy // immutable after creation
-	Limits  RunLimits             // deadline, max_tasks, max_depth
+	Limits  RunLimits             // deadline, max_tasks, max_depth, abort rules
 	KeyRule KeyRule
 	Paused  bool
 	Hash    []byte                // canonical hash of the fields above
@@ -338,6 +356,7 @@ type NewTask struct {
 	Fingerprint Fingerprint   // 16 bytes: hash(queue key ‖ canonical request or dedup_key)
 	Queue       QueueKey
 	Pool        PoolName      // TaskSpec.pool, default "default"
+	Handler     string        // TaskSpec.handler; empty: unknown, any session may try it
 	Priority    int32
 	NotBefore   time.Time     // zero: immediately
 	TTL         time.Duration // resolved Behaviour.task_ttl; 0: none
@@ -348,7 +367,10 @@ type DispatchRequest struct {
 	Session SessionID  // chosen by the pool's dispatch loop before the call
 	Worker  WorkerInfo // id and version, recorded on the attempt
 	Pool    PoolName   // the session's pool
-	Slots   int        // the session's free credits
+	// Handlers the session can run. Only tasks of these handlers, and tasks of unknown
+	// handler, are claimed. Empty: every task of the pool is claimed.
+	Handlers []string
+	Slots    int        // the session's free credits
 }
 
 type DispatchResult struct {
@@ -370,6 +392,9 @@ type Finish struct {
 	Result  TaskResult    // Succeeded, Failed, Retry or Released
 	RetryIn time.Duration // Retry only: not before now+RetryIn
 	Block   time.Duration // > 0: block the task's queue for all runs, extending any block
+	Strain  bool          // the failure is a sign of strain on the site (adaptive pacing)
+	Answered bool         // the site answered, with no sign of strain: a step back to the policy's rate
+	Extended bool         // the retry is granted only by the strain budget; ended by an outage
 	Record  AttemptRecord // outcome code and message, fetch info, worker, policy set hash
 }
 ```
@@ -391,15 +416,19 @@ The rules every implementation follows. `sched` implements the arithmetic.
 ### Terms
 
 - **Queue**: a politeness domain, identified by its key. Holds the shared politeness state:
-  a GCRA timestamp `tat`, the number of tasks in flight, a block (`blocked_until`, reason)
-  and a fair-queueing clock `vclock`.
+  a GCRA timestamp `tat`, the number of tasks in flight, a block (`blocked_until`, reason),
+  a fair-queueing clock `vclock` and the adaptive state (see
+  [Adaptive pacing](#adaptive-pacing)): the interval the queue is slowed to, the start of the
+  current epoch, a count of strain steps and the time of the last strain.
 - **Pool**: a named set of workers that execute the same kind of task, e.g. `default` or
-  `browser`. A task names its pool; a worker session serves one pool. A worker that lacks
-  the task's handler hands it back for another worker of the pool (ADR 0003).
+  `browser`. A task names its pool and its handler; a worker session serves one pool and
+  names the handlers it can run (ADR 0003).
 - **Backlog**: the tasks of one run on one queue in one pool. Holds `pending`
   (not dispatched, including delayed), `in_flight`, a fair-queueing tag `vtime`, an own
-  GCRA timestamp `own_tat` (used only under a run override), counters for stats, and
-  `ready_at`.
+  GCRA timestamp `own_tat` (used only under a run override) and counters for stats.
+- **Lane**: the tasks of one handler in a backlog. Holds `ready_at`. Lanes exist so that a
+  session finds work it can run without reading past work it cannot; they carry no
+  fairness, politeness or counters, which stay per backlog.
 - **Bucket**: `hash(queue key) mod 256`. Every piece of hot state belongs to exactly one
   queue and therefore one bucket. Implementations may use buckets to spread or shard state;
   the model does not depend on them.
@@ -422,7 +451,8 @@ For limits with interval `T`, burst `b` and tolerance `τ = (b − 1)·T`, at ti
 - **On dispatch of `n`**: `tat = max(tat, now) + n·T`.
 - **Next eligible time**: `tat − τ`.
 
-A backlog's tasks are admitted when all of these hold:
+A backlog's tasks are admitted when all of these hold, with the limits in force (see
+[Adaptive pacing](#adaptive-pacing)):
 
 1. the queue is not blocked: `now ≥ blocked_until`. Blocks apply to every run, overridden
    or not, because a block is the site's state, not a policy;
@@ -440,6 +470,98 @@ The cap means traffic under a looser override can saturate the queue for other r
 it lasts, but once it stops they wait at most one interval `T_queue` for their next slot.
 Without the cap, an hour of override traffic at ten times the queue's rate would block the
 other runs for nine hours after it stopped.
+
+### Adaptive pacing
+
+A rate that policy fixes does not follow the site. A site that answers 503 or times out
+is asked at the full rate, and a task that meets such failures uses up its attempts on its
+own clock. The queue therefore adapts its rate, by AIMD, to what the spiders report.
+
+**Signal.** An outcome carries `strain` when its failure says the *site* is in trouble: a
+502, 503 or 504, a 429 without `Retry-After`, a request that timed out, a connection the
+site refused or reset or closed without an answer. The spider classifies, as for
+everything else. The HTTP adapter of the SDK sets it for those cases only. It does not
+for failures on the worker's side: a name that does not resolve, a proxy, a certificate
+that does not verify, no file descriptors left, a request cancelled by a shutdown, a
+handler that ran out of time. Such a failure would slow every queue a worker touches for
+every run, and a worker that fails fast takes more tasks than the others. A spider that
+fetches by itself sets it with `worker.Strain()`; it is a privilege that affects every
+run on the queue. `strain` means nothing on a `RELEASED` outcome and on a lease that
+expired. A 429 with `Retry-After` blocks the queue instead: the site said how long to
+wait.
+
+**State.** The queue keeps `interval`, the interval it is slowed to (zero: it runs at its
+policy's rate), `epoch`, the time of its last step in either direction, `ceiling_at`, since
+when the interval is at its ceiling, and the time of the last strain. They change in the
+same transaction as the outcome that causes the step, under the queue's lock, so every run
+and every replica sees one state.
+
+**Policy.** `QueueLimits.adaptive` holds `max_interval` (the slowest interval, default
+1 minute), `decrease_factor` (default ½), `recovery_step` (default 0.1), `max_outage`
+(default 10 minutes) and `enabled` (default on). It belongs to the queue: global policies
+set it, a run that sets it is rejected. A queue whose policy has no rate limit (`T = 0`)
+has nothing to slow, and a queue whose own interval is above `max_interval` is not slowed.
+Let `T₀` be the queue's interval under its policy.
+
+**Steps.** At most one step per epoch: an outcome counts only if its attempt was
+dispatched at or after `epoch`. Requests that fail together are one step, and a request
+sent before a step, whose answer says nothing about the pace the step set, takes none. A
+single worker's strained outcome is enough for a step: the narrow signal and the epoch rule
+are what bound a worker that is wrong.
+
+- *Strain:* the rate is multiplied by `decrease_factor`: `T ← min(T / decrease_factor,
+  max(max_interval, T₀))`. `epoch = now`, and `tat = max(tat, now + T)`, so the next
+  request waits a whole new interval, counted from the failure. The same holds for the
+  `own_tat` of runs with limits of their own.
+- *Answer without strain* while slowed: the rate grows by `recovery_step` of the policy's
+  rate: `1/T ← 1/T + recovery_step/T₀`. At `T ≤ T₀` the queue is back at its policy and the
+  state is cleared. `epoch = now`. Recovery is linear where the decrease is geometric. An
+  answer is an outcome with an HTTP answer that is no sign of strain and no queue block: a
+  success, a 404, a failure of the spider's parser. An outcome without an answer changes
+  nothing.
+- *Forgetting:* a slowdown that no step and no strain outcome has touched for
+  `max_outage` is cleared, so an idle queue does not start its next run at the pace of an
+  old outage. Switching adaptive pacing off clears it at the next outcome.
+
+**Limits in force.** While `T > T₀` the interval is `T`, and concurrency and burst are
+scaled by `T₀ / T` (rounded up for concurrency, down for burst, at least 1; no
+concurrency limit stays none). A cut in rate is then a cut of the same size for a queue
+that is bound by latency, and one request at a time is reached only near the ceiling. A run
+with limits of its own is held to the same: the interval in force is the longer of the
+run's and the queue's current one, and the run is admitted against the queue's state as
+well as its own, so runs with limits of their own do not add up to more than the queue
+allows. A run can be slower than the queue, not faster than the site allows. A queue block
+still stops every run.
+
+**Retries.** A task has two budgets. Failures with `strain` count against
+`max_strain_attempts` (default 10, never below `max_attempts`), the others against
+`max_attempts`, whatever came before: a 500 after four 503s is the first failure of its
+own. The task's strain attempts are kept with the task; the attempt history is kept
+whole. The task waits for the queue's pace like every other: it rejoins its backlog after
+its policy backoff and is picked like any other, so a task with an early place in its
+backlog can take several of the few attempts a long outage allows. A strain retry that
+`max_attempts` alone would not allow is *extended*. While the queue has sat at its ceiling
+for `max_outage` the site is down, not struggling: an extended retry then fails the task,
+and strain failures count against `max_attempts` again. With adaptive pacing off, `strain`
+is ignored and `max_attempts` applies.
+
+What a site that stays down costs: once at the ceiling `C` with one request in flight, the
+queue dispatches one task per `C`. A backlog of `N` tasks drains in about
+`N · max_attempts · C` after `max_outage`, `N · max_strain_attempts · C` before it. The
+levers are `max_interval`, `max_attempts`, `task_ttl` and the run's deadline; a queue
+block empties nothing. Failures that are not the site's (a name that does not resolve)
+carry no strain and drain at the policy's rate as before.
+
+**Reset.** Lifting the block of a queue (`BlockQueue` with no time) also resets the
+slowdown and cancels the wait it caused. The operator sees `interval`, the number of
+steps and the time of the last strain with the queue's limiter state.
+
+**Limitations.** A queue is slowed by the failures of any run and leaves the slowdown by
+the answers of any run. A strain signal on a success (slow answers) is not set by the SDK;
+the outcome may carry it, and it counts as a strain step. The reset is bound to the
+unblock: there is no way to hold a queue slow or to reset it without lifting a block.
+Epochs compare the store clock's transaction start times, so a failure that commits in the
+instant between a dispatch and its lock can cost one recovery round.
 
 Politeness is guaranteed at dispatch time, by the store clock. With no prefetch and one
 stream message per assignment, the time between dispatch and fetch varies by milliseconds;
@@ -486,19 +608,29 @@ allowances there.
 
 ### Selection order
 
-1. **Across queues:** the store keeps a readiness index of backlogs by `ready_at`, the
-   earliest time the backlog could have a task admitted (task `not_before`, politeness,
-   block, another pool's first refusal). A backlog that waits for an event, not a time (a
-   concurrency slot), is kept out of the index until that event makes it ready. Dispatch
-   takes queues in `ready_at` order. `ready_at` **may be early, never
+1. **Across queues:** the store keeps a readiness index of lanes by `ready_at`, the
+   earliest time a task of the lane could be admitted (task `not_before`, politeness,
+   block, another pool's first refusal). A lane that waits for an event, not a time (a
+   concurrency slot), is kept out of the index until that event makes it ready. A session
+   reads the index for the handlers it can run and for no others, so unrunnable work never
+   stands in its way. Dispatch takes queues in `ready_at` order. `ready_at` **may be early, never
    late**: an early value costs one refused check, a late one leaves work idle. Every
    change that can make work eligible sooner (new tasks, a freed concurrency slot, a
    retry, an unblock, a resume, a new policy set) lowers it in the same operation.
 2. **Within a queue:** fairness, as above.
-3. **Within a backlog:** higher `priority` first, then insertion order.
+3. **Within a backlog:** higher `priority` first, then insertion order, among the tasks of
+   the handlers the session can run. Priority therefore orders a run's tasks on a queue
+   across handlers, as it did before handlers were part of dispatch.
 
-Tasks are claimed only from the session's pool. A queue's politeness state and fairness
-clock are shared across pools.
+Tasks are claimed only from the session's pool, and only those of its handlers. A queue's
+politeness state and fairness clock are shared across pools. Work no session can run costs
+no politeness slot and no share: it is never dispatched, so it advances neither. In its own
+pool it is not offered to anyone. In another pool, a backlog gets first refusal on a shared
+queue only if a session of that pool, as the pool's replicas last reported, can run some of
+its work, so work nobody can run neither holds the queue nor wakes the pool. One residue: a
+session is reported some seconds after it connects, and a replica of a build that does not
+report leaves its pool without reports, and in both cases that pool's work of named
+handlers has no first refusal for a while.
 
 **Fairness comes before priority.** Temporal does the opposite: strict priority tiers are
 dispatched before fairness applies. For a crawler that would let a high-priority run take a
@@ -535,8 +667,47 @@ prevent. `TaskSpec.priority` orders tasks inside one run's backlog only.
   completing their parent (ADR 0003).
 - **A run completes exactly when it is sealed and none of its backlogs has pending or
   in-flight tasks.** The check is atomic with the change that empties the last backlog (or
-  with `SealRun`). No task is ever added to a completed, cancelled or expired run: a seed
+  with `SealRun`). No task is ever added to a completed, cancelled, expired or aborted run: a seed
   racing `SealRun` is either accepted before the seal or rejected with `RUN_CLOSED`.
+- **A run can end on an outcome: abort rules.** `RunLimits` carries three: `abort_on_codes`,
+  `max_failed` and `max_consecutive_failures`. They are checked by `Finish`, in the
+  transaction that applies the attempt, and when one trips the same transaction ends the run
+  as `ABORTED` and records why: the rule, the code of the attempt and its task. The rest is
+  as for `CancelRun`: the run is over at once, pending tasks and leases are drained in the
+  background, leases are revoked, and the tasks dropped count as `cancelled`. An abort is an
+  outcome of the run, not of an operator: the run's state and its reason tell the two apart.
+  - `abort_on_codes`: an attempt that is recorded with a listed code ends the run, whether
+    it is a final failure, a retry or a success. A task handed back unrun (`Released`)
+    records no attempt and never counts. The block that comes with the outcome is applied
+    first, so the queue stays blocked after the run is gone.
+  - `max_failed`: the run ends when that many of its tasks have failed for good. Retries,
+    expiries and drops do not count. Neither does a task whose last attempt ended because
+    its lease expired (a `Source = Reaper` outcome): that is the worker fleet failing, and
+    an outage of the fleet must not end the run. The same holds for the streak below,
+    which such an outcome neither adds to nor resets. The code `lease_expired` can still be
+    listed in `abort_on_codes`.
+  - `max_consecutive_failures`: the run ends when that many tasks have failed for good in a
+    row. "In a row" is the order in which the store applies the outcomes of the run, one at
+    a time: a task that fails for good adds one, a task that succeeds resets the count, and
+    nothing else changes it. With concurrent workers this is the order of application, not
+    the order in which pages were fetched.
+  - Several rules that trip on one outcome give the first of: the code, the streak, the
+    total. A run that is already over is not aborted, so a run has at most one reason, also
+    when workers on different queues trip a rule at the same moment. A sealed run whose
+    last task trips a rule ends `ABORTED`, not `COMPLETED`.
+  - A run without abort rules pays nothing for them. A run with them keeps its failure
+    counters on its own row, and the outcomes that change them are applied one at a time
+    through that row's lock; a success takes it only when there is a streak to reset.
+  - **Rollout.** A build that predates the rules takes an `ABORTED` run for a live one: it
+    dispatches it, extends its leases and does not drain it. So the rules are used only
+    after every Frontier replica runs a build that has them, then the schedulers that set
+    them. A store that registers its replicas enforces this: `CreateRun` with rules is
+    refused (`FAILED_PRECONDITION`) while a replica that does not know them has reported
+    within the last minute. The SDK checks that the answer to `CreateRun` carries the rules
+    that were sent, which catches a Frontier too old to know them. Going back to an
+    earlier build first turns aborted runs into cancelled ones (the Down step of the
+    migration). A state name a build does not know reads as cancelled, so a later state
+    added the same way is final in this build.
 - **Pause, resume and cancel change the run's state in one small step and take effect
   eventually.** They never touch the run's backlogs in the same operation, so their cost
   does not depend on the size of the run.
@@ -544,9 +715,9 @@ prevent. `TaskSpec.priority` orders tasks inside one run's backlog only.
     dispatch already under way may still hand out its tasks, and leases in flight continue.
   - `ResumeRun`: the run's backlogs are made ready again in background batches, so its
     queues come back over a short time, not at once.
-  - `CancelRun` and a passed `deadline` end the run immediately (`CANCELLED`, `EXPIRED`).
-    Pending tasks and leases are drained in the background: pending tasks are cancelled or
-    expired, leases end as revoked attempts, and their completions return `STALE`. A
+  - `CancelRun` and a passed `deadline` end the run immediately (`CANCELLED`, `EXPIRED`), as
+    does a tripped abort rule (`ABORTED`). Pending tasks and leases are drained in the
+    background: pending tasks are cancelled or expired (cancelled for an aborted run), leases end as revoked attempts, and their completions return `STALE`. A
     dispatch under way when the run ends may hand out tasks; they are drained the same way.
 - `max_tasks` is soft: a batch is rejected (`OVER_BUDGET`) once the run's task count has
   reached the limit, and the count may be stale by at most one second, so concurrent
@@ -594,16 +765,21 @@ bucket, so no implementation needs a cross-partition write to add a task.
 
 ### Events and stats
 
-- Run events (`CREATED`, `SEALED`, `PAUSED`, `RESUMED`, `COMPLETED`, `CANCELLED`, `EXPIRED`)
+- Run events (`CREATED`, `SEALED`, `PAUSED`, `RESUMED`, `COMPLETED`, `CANCELLED`, `EXPIRED`, `ABORTED`)
   have a cursor that is ordered by commit: a client that resumes from cursor `c` sees every
   event after `c`, exactly once per read. `STATS` events are not stored; `WatchRuns`
   produces them from `GetRun` reads at `stats_interval`.
 - Stats are exact counters kept on backlogs and summed on read. A read is not a snapshot
   across backlogs: during dispatch, `pending + in_flight` can be off by the tasks moving
   between them.
-- `RunStats.delayed` is the pending tasks of backlogs whose `ready_at` is in the future, and
-  `RunStats.pending` the rest. It is approximate: `ready_at` covers politeness and blocks as
-  well as `not_before`, and is per backlog, not per task.
+- `RunStats.blocked_queues` lists the blocked queues on which the run has pending or delayed
+  tasks: the queue, when the block ends, why, and how many of the run's tasks wait there. A
+  run can touch many queues, so the list holds at most 20, the ones with the most waiting
+  tasks first. It is empty for a run that has ended. It is what tells a run that its tasks
+  are delayed by a block, which `pending` and `delayed` alone do not.
+- `RunStats.delayed` is the pending tasks whose `not_before` is in the future, and
+  `RunStats.pending` the rest. Tasks that wait for a session with their handler count as
+  pending.
 
 ### Monitoring
 
@@ -673,7 +849,7 @@ tens of times a day. So:
   that dispatched it, and each replica exports its hash as a metric, so drift is visible.
 - On `Start`, a replica registers its policy hash. If it differs from the hash registered
   last (a new set, or a rollback to an earlier one), the replica resets `ready_at` of active
-  backlogs to now, so no backlog stays parked by another set's stricter limit (readiness
+  lanes to now, so no backlog stays parked by another set's stricter limit (readiness
   must never be late).
 
 ## Implementations
@@ -684,7 +860,7 @@ and the `Store` interface unchanged.
 | Concern | PostgreSQL, single primary (ADR 0002) | Sharded PostgreSQL | PostgreSQL + Redis | FoundationDB |
 |---|---|---|---|---|
 | Atomic dispatch | One transaction per queue; queue row locked with `SKIP LOCKED` | Same, on the queue's shard | Redis script admits and advances politeness and fairness; PostgreSQL claims the task; refund script if the claim comes back short | One transaction |
-| Readiness index | Partial index on backlogs by `ready_at` | Per shard; replicas own buckets and steal from others when idle | Sorted set per pool | Ordered keys `(pool, ready_at, queue)` |
+| Readiness index | Partial index on lanes by `(pool, handler, ready_at)` | Per shard; replicas own buckets and steal from others when idle | Sorted set per pool | Ordered keys `(pool, handler, ready_at, queue)` |
 | Dedup | Unique index on `(run, fingerprint)` | Same, single shard because the fingerprint includes the queue key | PostgreSQL unique index | Key `(run, fingerprint)` |
 | Run completion | Per-run lock taken only when a backlog empties | Empty the backlog on the shard, then the run lock in a control database and a read of the run's backlogs on every shard it touched; the sweeper re-checks sealed runs after a crash in between | As single PostgreSQL | Serializable read of the run's backlog range |
 | Seed vs seal race | Shared/exclusive per-run lock | The shared lock is taken in the control database and held while the shard commits | As single PostgreSQL | Conflict on the run key |
@@ -721,6 +897,8 @@ supports it. Each one names the rule it proves:
 | Two runs with different limits on one queue: the queue's rate stays within its limits, `tat` never goes backwards | Shared politeness |
 | A run with a looser override exceeds the queue limit for itself; other runs back off while it runs and resume within one interval after it stops | Override replaces, still counts, capped |
 | A block stops every run on the queue, including overridden ones | Blocks |
+| Strain halves the queue's rate up to the ceiling, answers without strain restore it, requests that fail together are one step, and the next request waits a whole new interval from the failure | Adaptive pacing |
+| Runs with limits of their own are held to the queue's slowed state, together; with adaptive pacing off, strain changes nothing; lifting the block resets the slowdown; an idle slowdown is forgotten; strain attempts are counted apart and end with an outage | Adaptive pacing |
 | Run A on 500 queues and run B on one shared queue, equal weights: B gets 50% ± 10% of the shared queue over a minute | Per-queue fairness |
 | A backlog idle, paused, or held back by a far `not_before` while another advances by 10,000 dispatches gets ≤ its fair share when it becomes eligible | No banked credit |
 | Two runs of equal weight in different pools on one queue, both pools with free slots: each gets 50% ± 10%. With no free slot in one pool, the other keeps the queue's rate less the refusal period per forfeited turn | Fairness across pools |
@@ -736,6 +914,11 @@ supports it. Each one names the rule it proves:
 | `RunEvents` resumed from any cursor under concurrent transitions never misses or repeats an event | Event order |
 | A backlog whose tasks have all expired stops being selected without waiting for `Maintain` | No spin on expired tasks |
 | No `ready_at` is ever later than the true eligible time (property test over random operations) | Readiness never late |
+| Each abort rule ends the run with its reason on the outcome that trips it, drops the rest as `cancelled`, fences the leases still out, and keeps the queue block that came with the outcome | Abort rules |
+| Workers on different queues that trip a rule at the same moment give one `ABORTED` event and one reason | Abort is atomic |
+| `blocked_queues` lists the blocked queues a run waits on, busiest first and bounded, and nothing once the block ends | Blocks on the run |
+| A session with handlers is given only tasks of those handlers, in priority order across them; tasks no session can run take no politeness slot and do not hide the tasks behind them | Dispatch by handler |
+| A task whose handler no session has had for the grace period fails with `no_handler`; a handler a session reports keeps its tasks | Unserved handlers |
 | Pause, resume and cancel racing dispatch and finish: a dispatch that starts after pause or cancel returns takes nothing from the run; a task handed out during the race is drained or completes normally; after resume every backlog with pending tasks becomes ready | Lifecycle (eventual) |
 | A policy set on `Start` that differs from the last one (new, or rolled back) makes every active backlog ready | Policy rollout |
 | Concurrent dispatch, finish and discover across queues of one run for a minute: no internal conflict is surfaced as an error | Atomicity |
@@ -783,7 +966,7 @@ These are the known limits of the current design. Each names what it is proporti
 | Cost | Grows with | Effect at large size | Way out |
 |---|---|---|---|
 | `ResumeRun` and the cancel drain work through the run's backlogs in background batches | Queues one run has work on | A resumed run spread over millions of hosts takes a while to be fully ready again | Accepted: the state change itself is one step |
-| `GetRun` stats and the `max_tasks` count sum the run's backlogs | Queues one run has work on | Stats reads become scans | Accepted. Rollups per run and bucket if it ever hurts |
+| `GetRun` stats, `blocked_queues` and the `max_tasks` count read the run's backlogs | Queues one run has work on | Stats reads become scans | Accepted. Rollups per run and bucket if it ever hurts |
 | Run completion on a sharded store reads the run's backlogs on every shard it touched | Shards one run has work on | A completion check fans out | Per-shard "run active here" markers |
 | Dispatch and finish lock every backlog with pending tasks on the queue | Runs with work on one queue | Thousands of concurrent runs on one host slow that host's dispatch | Pick from an index of the lowest start tags, lock only the winner |
 | A changed policy set resets the readiness of every active backlog | Active backlogs | A deploy that changes policies causes a write burst | Reset lazily, on the next check of each backlog |

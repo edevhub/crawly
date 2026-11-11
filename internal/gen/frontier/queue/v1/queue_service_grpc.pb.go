@@ -33,7 +33,8 @@ const (
 type QueueServiceClient interface {
 	ListQueues(ctx context.Context, in *ListQueuesRequest, opts ...grpc.CallOption) (*ListQueuesResponse, error)
 	GetQueue(ctx context.Context, in *GetQueueRequest, opts ...grpc.CallOption) (*GetQueueResponse, error)
-	// Applies to every run on the queue. An unset unblock_time unblocks.
+	// Applies to every run on the queue. An unset unblock_time unblocks, and also
+	// resets the slowdown of adaptive limits (LimiterState.current_interval).
 	BlockQueue(ctx context.Context, in *BlockQueueRequest, opts ...grpc.CallOption) (*BlockQueueResponse, error)
 }
 
@@ -81,7 +82,8 @@ func (c *queueServiceClient) BlockQueue(ctx context.Context, in *BlockQueueReque
 type QueueServiceServer interface {
 	ListQueues(context.Context, *ListQueuesRequest) (*ListQueuesResponse, error)
 	GetQueue(context.Context, *GetQueueRequest) (*GetQueueResponse, error)
-	// Applies to every run on the queue. An unset unblock_time unblocks.
+	// Applies to every run on the queue. An unset unblock_time unblocks, and also
+	// resets the slowdown of adaptive limits (LimiterState.current_interval).
 	BlockQueue(context.Context, *BlockQueueRequest) (*BlockQueueResponse, error)
 	mustEmbedUnimplementedQueueServiceServer()
 }

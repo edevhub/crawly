@@ -165,6 +165,9 @@ func (w *Worker) Register(name string, h Handler, opts ...RegisterOption) error 
 	if name == "" || h == nil {
 		return errors.New("worker: a handler needs a name and an implementation")
 	}
+	if !wire.ValidHandler(name) {
+		return fmt.Errorf("worker: handler name %.32q is longer than %d bytes or holds a NUL byte", name, wire.MaxHandlerBytes)
+	}
 	r := &registration{name: name, handler: h, pool: DefaultPool}
 	for _, o := range opts {
 		o(r)
@@ -180,8 +183,31 @@ func (w *Worker) Register(name string, h Handler, opts ...RegisterOption) error 
 	if _, dup := w.handlers[name]; dup {
 		return fmt.Errorf("worker: handler %q is already registered", name)
 	}
+	n := 0
+	for _, o := range w.handlers {
+		if o.pool == r.pool {
+			n++
+		}
+	}
+	if n >= wire.MaxSessionHandlers {
+		return fmt.Errorf("worker: a pool can have at most %d handlers", wire.MaxSessionHandlers)
+	}
 	w.handlers[name] = r
 	return nil
+}
+
+// handlersOf returns the names of the handlers registered for the pool, sorted.
+func (w *Worker) handlersOf(pool string) []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var names []string
+	for name, r := range w.handlers {
+		if r.pool == pool {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
 }
 
 // Pools returns the pools the registered handlers serve, sorted.
@@ -393,7 +419,7 @@ func (r *runner) session(ctx, hctx context.Context) error {
 		return err
 	}
 	if err := stream.Send(&workerv1.WorkRequest{Msg: &workerv1.WorkRequest_Hello{Hello: &workerv1.Hello{
-		WorkerId: r.w.id, BuildVersion: r.w.version, Pool: r.pool}}}); err != nil {
+		WorkerId: r.w.id, BuildVersion: r.w.version, Pool: r.pool, Handlers: r.w.handlersOf(r.pool)}}}); err != nil {
 		return err
 	}
 	// Switch to the new stream, then resend what the Frontier has not acknowledged, in
@@ -857,6 +883,7 @@ func buildReport(a *active, task *Task, res *Result, err error, release string, 
 		if e.BlockQueueFor > 0 {
 			out.BlockQueueFor = durationpb.New(e.BlockQueueFor)
 		}
+		out.Strain = e.Strain && release == ""
 	}
 	rep := &report{leaseID: a.leaseID, complete: &workerv1.Complete{LeaseId: a.leaseID, Attempt: a.attempt, Outcome: out,
 		Fetch: &taskv1.FetchInfo{ItemsEmitted: safeconv.Uint32(res.Items)}}}
