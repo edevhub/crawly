@@ -10,8 +10,9 @@ import (
 	"github.com/edevhub/crawly/internal/store/memstore"
 )
 
-// TestNoHandlerGrace: the grace of a task without a handler counts the time no worker
-// could run it. A worker that runs the task, whatever the result, ends it.
+// TestNoHandlerGrace: a session that names no handlers is offered every task and hands
+// back the ones it cannot run. The grace of such a task counts the time no worker could
+// run it, and a worker that runs it, whatever the result, ends it.
 func TestNoHandlerGrace(t *testing.T) {
 	pol, err := policy.New(nil)
 	if err != nil {

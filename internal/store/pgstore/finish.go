@@ -42,11 +42,12 @@ type leased struct {
 	parent       pgtype.UUID
 	parentBucket *int16
 	fingerprint  store.Fingerprint
+	handler      string
 }
 
 const leasedColumns = `run_created_on, task_id, run_no, queue_key, pool_id, state::text, attempt, coalesce(lease_nonce, 0),
 	lease_expires_at, lease_deadline, coalesce(worker_id, ''), coalesce(worker_version, ''), dispatched_at,
-	depth, parent_task_id, parent_bucket, fingerprint`
+	depth, parent_task_id, parent_bucket, fingerprint, handler`
 
 func scanLeased(row pgx.Row) (*leased, error) {
 	var (
@@ -58,7 +59,7 @@ func scanLeased(row pgx.Row) (*leased, error) {
 		fp                            []byte
 	)
 	if err := row.Scan(&day, &t.key.id, &t.run, &queue, &t.pool, &t.state, &attempt, &t.nonce, &expires, &deadline,
-		&t.worker.ID, &t.worker.Version, &dispatched, &depth, &t.parent, &t.parentBucket, &fp); err != nil {
+		&t.worker.ID, &t.worker.Version, &dispatched, &depth, &t.parent, &t.parentBucket, &fp, &t.handler); err != nil {
 		return nil, err
 	}
 	t.queue = store.QueueKey(queue)
@@ -281,7 +282,8 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 	}
 	if !due.IsZero() {
 		own.pending++
-		own.ready = earliest(own.ready, due)
+		l := own.laneOf(t.handler)
+		l.setReady(earliest(l.ready, due))
 	}
 	if result != 0 {
 		recordAttempt(batch, t, now, result, record)
@@ -321,20 +323,24 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 func refresh(q *qrow, bs []*brow, now time.Time) {
 	blocked := now.Before(q.blockedUntil)
 	for _, b := range bs {
-		switch {
-		case b.pending == 0:
+		if b.pending == 0 {
 			b.setReady(time.Time{})
-		case !b.live || b.ready.IsZero():
-			// A paused or ended run, or a backlog a resume sweep has yet to reach.
-		case blocked:
-			if b.ready.Equal(forever) || b.ready.Before(q.blockedUntil) {
-				b.setReady(q.blockedUntil)
-			}
-		case b.ready.Equal(forever):
-			if admit, at := admission(q, b, now); admit > 0 {
-				b.setReady(now)
-			} else if at.After(now) {
-				b.setReady(at)
+			continue
+		}
+		for _, l := range b.lanes {
+			switch {
+			case !b.live || l.ready.IsZero():
+				// A paused or ended run, or a lane a resume sweep has yet to reach.
+			case blocked:
+				if l.ready.Equal(forever) || l.ready.Before(q.blockedUntil) {
+					l.setReady(q.blockedUntil)
+				}
+			case l.ready.Equal(forever):
+				if admit, at := admission(q, b, now); admit > 0 {
+					l.setReady(now)
+				} else if at.After(now) {
+					l.setReady(at)
+				}
 			}
 		}
 	}

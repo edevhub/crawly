@@ -32,7 +32,12 @@ type backlogKey struct {
 // backlogDelta is what a batch adds to one backlog.
 type backlogDelta struct {
 	added, duplicates, overBudget int64
-	ready                         time.Time // when the earliest added task is due
+}
+
+// laneKey names a lane within one run.
+type laneKey struct {
+	backlogKey
+	handler string
 }
 
 // AddTasks adds seeds or discovered tasks to a run and reports the result of each, in order.
@@ -92,6 +97,11 @@ type newRow struct {
 	index int // its position in the request
 	id    [16]byte
 	key   backlogKey
+}
+
+// lane is the lane of a new task.
+func (r *newRow) lane(nt *store.NewTask) laneKey {
+	return laneKey{backlogKey: r.key, handler: nt.Handler}
 }
 
 func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta, req store.AddRequest,
@@ -203,6 +213,7 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 	}
 	var added uint64
 	var lost [][]byte
+	ready := map[laneKey]time.Time{} // when the earliest task added to each lane is due
 	for i := range rows {
 		r, nt := &rows[i], &req.Tasks[rows[i].index]
 		d := delta(r.key)
@@ -214,7 +225,8 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 		out[r.index] = store.AddResult{Status: store.AddAdded, TaskID: taskKey{bucket: bucketOf(nt.Queue), day: m.day, id: r.id}.ID()}
 		added++
 		d.added++
-		d.ready = earliest(d.ready, latest(now, nt.NotBefore))
+		lk := r.lane(nt)
+		ready[lk] = earliest(ready[lk], latest(now, nt.NotBefore))
 	}
 	if len(lost) > 0 {
 		if err := s.existing(ctx, tx, m, lost, known); err != nil {
@@ -245,16 +257,29 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 		if req.Parent != nil {
 			discovered = d.added
 		}
-		batch.Queue(`INSERT INTO backlogs (queue_key, run_no, pool_id, bucket, run_created_on, pending, tasks_total, discovered, duplicates, over_budget, ready_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10)
+		batch.Queue(`INSERT INTO backlogs (queue_key, run_no, pool_id, bucket, run_created_on, pending, tasks_total, discovered, duplicates, over_budget)
+			VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9)
 			ON CONFLICT (queue_key, run_no, pool_id) DO UPDATE SET
 				pending = backlogs.pending + EXCLUDED.pending, tasks_total = backlogs.tasks_total + EXCLUDED.tasks_total,
 				discovered = backlogs.discovered + EXCLUDED.discovered, duplicates = backlogs.duplicates + EXCLUDED.duplicates,
-				over_budget = backlogs.over_budget + EXCLUDED.over_budget, ready_at = least(backlogs.ready_at, EXCLUDED.ready_at)`,
-			string(k.queue), m.no, k.pool, int16(bucketOf(k.queue)), m.createdOn, d.added, discovered, d.duplicates, d.overBudget, tszNull(d.ready))
+				over_budget = backlogs.over_budget + EXCLUDED.over_budget`,
+			string(k.queue), m.no, k.pool, int16(bucketOf(k.queue)), m.createdOn, d.added, discovered, d.duplicates, d.overBudget)
 		if d.added > 0 {
 			woken[k.pool] = true
 		}
+	}
+	// The lanes, after their backlogs, in primary key order.
+	lanes := make([]laneKey, 0, len(ready))
+	for k := range ready {
+		lanes = append(lanes, k)
+	}
+	slices.SortFunc(lanes, func(a, b laneKey) int {
+		return cmp.Or(cmp.Compare(a.queue, b.queue), cmp.Compare(a.pool, b.pool), cmp.Compare(a.handler, b.handler))
+	})
+	for _, k := range lanes {
+		batch.Queue(`INSERT INTO lanes (queue_key, run_no, pool_id, handler, ready_at) VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (queue_key, run_no, pool_id, handler) DO UPDATE SET ready_at = least(lanes.ready_at, EXCLUDED.ready_at)`,
+			string(k.queue), m.no, k.pool, k.handler, tszNull(ready[k]))
 	}
 	if batch.Len() > 0 {
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
@@ -413,6 +438,7 @@ func (s *Store) insertTasks(ctx context.Context, tx pgx.Tx, now time.Time, m *ru
 		queues     = make([]string, n)
 		pools      = make([]int16, n)
 		fps        = make([][]byte, n)
+		handlers   = make([]string, n)
 		priorities = make([]int32, n)
 		notBefore  = make([]pgtype.Timestamptz, n)
 		expires    = make([]pgtype.Timestamptz, n)
@@ -421,7 +447,7 @@ func (s *Store) insertTasks(ctx context.Context, tx pgx.Tx, now time.Time, m *ru
 	for i := range rows {
 		nt := &tasks[rows[i].index]
 		ids[i], queues[i], pools[i], fps[i] = rows[i].id, string(nt.Queue), rows[i].key.pool, nt.Fingerprint[:]
-		priorities[i], notBefore[i], specs[i] = nt.Priority, tsz(nt.NotBefore), nt.Spec
+		handlers[i], priorities[i], notBefore[i], specs[i] = nt.Handler, nt.Priority, tsz(nt.NotBefore), nt.Spec
 		if specs[i] == nil {
 			specs[i] = []byte{}
 		}
@@ -429,16 +455,16 @@ func (s *Store) insertTasks(ctx context.Context, tx pgx.Tx, now time.Time, m *ru
 			expires[i] = tsz(now.Add(nt.TTL))
 		}
 	}
-	res, err := tx.Query(ctx, `INSERT INTO tasks (run_created_on, task_id, run_no, queue_key, pool_id, fingerprint, priority,
+	res, err := tx.Query(ctx, `INSERT INTO tasks (run_created_on, task_id, run_no, queue_key, pool_id, handler, fingerprint, priority,
 			not_before, expires_at, depth, parent_task_id, parent_bucket, spec, created_at)
-		SELECT $1, u.task_id, $2, u.queue_key, u.pool_id, u.fingerprint, u.priority, u.not_before, u.expires_at, $3, $4, $5, u.spec, $6
-		FROM unnest($7::uuid[], $8::text[], $9::smallint[], $10::bytea[], $11::int[], $12::timestamptz[], $13::timestamptz[], $14::bytea[])
-			AS u(task_id, queue_key, pool_id, fingerprint, priority, not_before, expires_at, spec)
+		SELECT $1, u.task_id, $2, u.queue_key, u.pool_id, u.handler, u.fingerprint, u.priority, u.not_before, u.expires_at, $3, $4, $5, u.spec, $6
+		FROM unnest($7::uuid[], $8::text[], $9::smallint[], $10::bytea[], $11::int[], $12::timestamptz[], $13::timestamptz[], $14::bytea[], $15::text[])
+			AS u(task_id, queue_key, pool_id, fingerprint, priority, not_before, expires_at, spec, handler)
 		ORDER BY u.fingerprint
 		ON CONFLICT (run_created_on, run_no, fingerprint) DO NOTHING
 		RETURNING fingerprint`,
 		m.createdOn, m.no, int32(min(depth, 1<<30)), parent, parentBucket, now,
-		ids, queues, pools, fps, priorities, notBefore, expires, specs)
+		ids, queues, pools, fps, priorities, notBefore, expires, specs, handlers)
 	if err != nil {
 		return nil, err
 	}

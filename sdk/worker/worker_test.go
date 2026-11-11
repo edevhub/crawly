@@ -598,17 +598,95 @@ func TestFrontierShutdown(t *testing.T) {
 	}
 }
 
-// TestRollingDeploy: a worker without a task's handler hands the task back, and a
-// worker of the same pool that has the handler runs it. No task fails and no attempt
-// is spent on the way.
+// stripHandlers makes a Frontier see a worker as one that predates Hello.handlers.
+type stripHandlers struct{ grpc.ServerStream }
+
+func (o stripHandlers) RecvMsg(m any) error {
+	err := o.ServerStream.RecvMsg(m)
+	if req, ok := m.(*workerv1.WorkRequest); ok && req.GetHello() != nil {
+		req.GetHello().Handlers = nil
+	}
+	return err
+}
+
+// countAssignments counts the assignments a Frontier sends: the dispatches.
+type countAssignments struct {
+	grpc.ServerStream
+	n *atomic.Int64
+}
+
+func (c countAssignments) SendMsg(m any) error {
+	if res, ok := m.(*workerv1.WorkResponse); ok && res.GetAssignment() != nil {
+		c.n.Add(1)
+	}
+	return c.ServerStream.SendMsg(m)
+}
+
+// serverStreams runs every stream of the Frontier through wrap.
+func serverStreams(wrap func(grpc.ServerStream) grpc.ServerStream) grpc.ServerOption {
+	return grpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, h grpc.StreamHandler) error {
+		return h(srv, wrap(ss))
+	})
+}
+
+// TestRollingDeploy: one worker of three is of the old build and lacks a handler. The
+// Frontier gives it only the tasks it can run, so no task is dispatched twice: the
+// deploy costs no extra dispatch, no hand-back and no wait.
 func TestRollingDeploy(t *testing.T) {
+	e := newEnv(t)
+	var dispatches atomic.Int64
+	e.f.Stop()
+	e.f.ServerOptions = []grpc.ServerOption{serverStreams(func(ss grpc.ServerStream) grpc.ServerStream {
+		return countAssignments{ServerStream: ss, n: &dispatches}
+	})}
+	e.f.Restart()
+
+	var products, listings atomic.Int64
+	count := func(c *atomic.Int64) worker.Handler {
+		return worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+			c.Add(1)
+			return nil, nil
+		})
+	}
+	old := newWorker(t, e.addr, worker.WithID("old"))
+	register(t, old, "listing", count(&listings))
+	e.start(old)
+	for _, id := range []string{"current-1", "current-2"} {
+		w := newWorker(t, e.addr, worker.WithID(id))
+		register(t, w, "listing", count(&listings))
+		register(t, w, "product", count(&products))
+		e.start(w)
+	}
+
+	const n = 60
+	seeds := make([]*task.Spec, 0, 2*n)
+	for i := range n {
+		seeds = append(seeds, spec("https://a.example/product/"+strconv.Itoa(i), "product"),
+			spec("https://a.example/listing/"+strconv.Itoa(i), "listing"))
+	}
+	st := e.crawl("rolling", nil, seeds...)
+	if st.GetSucceeded() != 2*n || st.GetFailed() != 0 || products.Load() != n || listings.Load() != n {
+		t.Fatalf("stats: %v, %d products and %d listings handled", st, products.Load(), listings.Load())
+	}
+	if d := dispatches.Load(); d != 2*n {
+		t.Fatalf("%d dispatches for %d tasks: a task was given to a worker that could not run it", d, 2*n)
+	}
+}
+
+// TestRollingDeployLegacyWorker: a worker that names no handlers (an SDK that predates
+// Hello.handlers) is offered every task of its pool and hands back what it cannot run;
+// the Frontier gives it to another worker. No task fails and no attempt is spent.
+func TestRollingDeployLegacyWorker(t *testing.T) {
 	e := newEnv(t)
 	e.f.Stop()
 	e.f.NoHandlerGrace = time.Minute
+	e.f.ServerOptions = []grpc.ServerOption{serverStreams(func(ss grpc.ServerStream) grpc.ServerStream { return stripHandlers{ss} })}
 	e.f.Restart()
 	old := newWorker(t, e.addr, worker.WithID("old"))
 	register(t, old, "listing", noop)
 	e.start(old)
+	// The current worker is of the new SDK as well, but this Frontier does not read
+	// what it names, so both are offered every task.
 	current := newWorker(t, e.addr, worker.WithID("current"))
 	var products atomic.Int64
 	register(t, current, "listing", noop)
@@ -618,26 +696,37 @@ func TestRollingDeploy(t *testing.T) {
 	}))
 	e.start(current)
 
-	const n = 40
+	const n = 20
 	seeds := make([]*task.Spec, n)
 	for i := range seeds {
 		seeds[i] = spec("https://a.example/product/"+strconv.Itoa(i), "product")
 	}
-	st := e.crawl("rolling", nil, seeds...)
+	st := e.crawl("legacy", nil, seeds...)
 	if st.GetSucceeded() != n || st.GetFailed() != 0 || st.GetAttempts() != n || products.Load() != n {
 		t.Fatalf("stats: %v, %d products handled", st, products.Load())
 	}
 }
 
-// TestNoHandler: a task whose handler no worker has fails once it waited long enough.
+// TestNoHandler: a task whose handler no worker has waits, and fails once it waited
+// the grace period. It is never given to a worker that cannot run it.
 func TestNoHandler(t *testing.T) {
 	e := newEnv(t)
+	e.f.Stop()
+	e.f.NoHandlerGrace = 500 * time.Millisecond
+	e.f.Restart()
 	w := newWorker(t, e.addr)
 	register(t, w, "page", noop)
 	e.start(w)
-	st := e.crawl("unknown", nil, spec("https://a.example/", "nobody"))
-	if st.GetFailed() != 1 || st.GetByCode()["no_handler"] != 1 || st.GetAttempts() != 1 {
+	st := e.crawl("unknown", nil, spec("https://a.example/", "nobody"), spec("https://a.example/page", "page"))
+	if st.GetSucceeded() != 1 || st.GetFailed() != 1 || st.GetByCode()["no_handler"] != 1 || st.GetAttempts() != 1 {
 		t.Fatalf("stats: %v", st)
+	}
+	res, err := e.c.Runs.ListTasks(context.Background(), &run.ListTasksRequest{RunId: "unknown", Code: "no_handler"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.GetTasks(); len(got) != 1 || got[0].GetState() != run.TaskFailed || got[0].GetTask().GetHandler() != "nobody" {
+		t.Fatalf("the tasks found by the code no_handler: %v", got)
 	}
 }
 
@@ -712,10 +801,12 @@ func (o olderFrontier) SendMsg(m any) error {
 func TestOlderFrontier(t *testing.T) {
 	e := newEnv(t)
 	e.f.Stop()
-	e.f.ServerOptions = []grpc.ServerOption{grpc.StreamInterceptor(
-		func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, h grpc.StreamHandler) error {
-			return h(srv, olderFrontier{ss})
-		})}
+	e.f.NoHandlerGrace = time.Minute
+	// An older Frontier neither says it takes tasks back nor reads the handlers a
+	// worker names, so the worker is offered every task of its pool.
+	e.f.ServerOptions = []grpc.ServerOption{serverStreams(func(ss grpc.ServerStream) grpc.ServerStream {
+		return olderFrontier{stripHandlers{ss}}
+	})}
 	e.f.Restart()
 
 	started := make(chan struct{})

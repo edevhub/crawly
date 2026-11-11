@@ -31,8 +31,8 @@ type Frontier struct {
 	Addr string
 	// ServerOptions are added to the gRPC server of the next Restart.
 	ServerOptions []grpc.ServerOption
-	// NoHandlerGrace is how long the next Restart lets a task wait for a worker that
-	// has its handler. Zero: a fraction of a second.
+	// NoHandlerGrace is how long the next Restart lets a task wait for a session that
+	// has its handler. Zero: five seconds, longer than a worker takes to reconnect.
 	NoHandlerGrace time.Duration
 
 	tb    testing.TB
@@ -97,7 +97,7 @@ func (f *Frontier) Restart() {
 	f.tb.Helper()
 	grace := f.NoHandlerGrace
 	if grace <= 0 {
-		grace = 200 * time.Millisecond
+		grace = 5 * time.Second
 	}
 	srv, err := frontier.New(frontier.Config{Store: f.store, Policies: f.pol, NoHandlerGrace: grace, NoHandlerDelay: 50 * time.Millisecond,
 		ReaperInterval: 50 * time.Millisecond, MaintainInterval: 50 * time.Millisecond, PollInterval: 100 * time.Millisecond})

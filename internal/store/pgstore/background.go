@@ -48,35 +48,35 @@ func (s *Store) Start(ctx context.Context, r store.Replica) error {
 	return s.resetReadiness(ctx)
 }
 
-// resetReadiness makes every backlog that waits for a time or a slot ready now, in
-// batches in primary key order. Backlogs of paused and ended runs keep NULL.
+// resetReadiness makes every lane that waits for a time or a slot ready now, in
+// batches in primary key order. Lanes of paused and ended runs keep NULL.
 func (s *Store) resetReadiness(ctx context.Context) error {
-	var queue string
+	var queue, handler string
 	var run int64
 	var pool int16
 	for {
 		n := 0
-		nextQueue, nextRun, nextPool := queue, run, pool
+		nextQueue, nextRun, nextPool, nextHandler := queue, run, pool, handler
 		err := s.tx(ctx, func(tx pgx.Tx, now time.Time) error {
-			nextQueue, nextRun, nextPool = queue, run, pool
+			nextQueue, nextRun, nextPool, nextHandler = queue, run, pool, handler
 			rows, err := tx.Query(ctx, `WITH c AS (
-					SELECT queue_key, run_no, pool_id FROM backlogs
-					WHERE pending > 0 AND ready_at IS NOT NULL AND (queue_key, run_no, pool_id) > ($1, $2, $3)
-					ORDER BY queue_key, run_no, pool_id LIMIT $5 FOR UPDATE)
-				UPDATE backlogs b SET ready_at = $4 FROM c
-				WHERE b.queue_key = c.queue_key AND b.run_no = c.run_no AND b.pool_id = c.pool_id
-				RETURNING b.queue_key, b.run_no, b.pool_id`, queue, run, pool, now, sweepBatch)
+					SELECT queue_key, run_no, pool_id, handler FROM lanes
+					WHERE ready_at IS NOT NULL AND (queue_key, run_no, pool_id, handler) > ($1, $2, $3, $6)
+					ORDER BY queue_key, run_no, pool_id, handler LIMIT $5 FOR UPDATE)
+				UPDATE lanes l SET ready_at = $4 FROM c
+				WHERE l.queue_key = c.queue_key AND l.run_no = c.run_no AND l.pool_id = c.pool_id AND l.handler = c.handler
+				RETURNING l.queue_key, l.run_no, l.pool_id, l.handler`, queue, run, pool, now, sweepBatch, handler)
 			if err != nil {
 				return err
 			}
 			n = 0
-			var k string
+			var k, h string
 			var r int64
 			var p int16
-			_, err = pgx.ForEachRow(rows, []any{&k, &r, &p}, func() error {
+			_, err = pgx.ForEachRow(rows, []any{&k, &r, &p, &h}, func() error {
 				n++
-				if k > nextQueue || (k == nextQueue && (r > nextRun || (r == nextRun && p > nextPool))) {
-					nextQueue, nextRun, nextPool = k, r, p
+				if k > nextQueue || (k == nextQueue && (r > nextRun || (r == nextRun && (p > nextPool || (p == nextPool && h > nextHandler))))) {
+					nextQueue, nextRun, nextPool, nextHandler = k, r, p, h
 				}
 				return nil
 			})
@@ -88,7 +88,7 @@ func (s *Store) resetReadiness(ctx context.Context) error {
 		if n == 0 {
 			break
 		}
-		queue, run, pool = nextQueue, nextRun, nextPool // only now: a transaction that is tried again starts where it did
+		queue, run, pool, handler = nextQueue, nextRun, nextPool, nextHandler // only now: a transaction that is tried again starts where it did
 	}
 	rows, err := s.db.Query(ctx, "SELECT pg_notify($1 || name, '') FROM pools", channelWork)
 	if err != nil {
@@ -567,6 +567,7 @@ func (s *Store) retain(ctx context.Context, now time.Time) error {
 				AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.run_no = r.run_no AND (b.pending > 0 OR b.in_flight > 0))
 			ORDER BY run_no LIMIT $2 FOR UPDATE SKIP LOCKED),
 		codes AS (DELETE FROM backlog_codes WHERE run_no IN (SELECT run_no FROM old)),
+		lns AS (DELETE FROM lanes WHERE run_no IN (SELECT run_no FROM old)),
 		logs AS (DELETE FROM backlogs WHERE run_no IN (SELECT run_no FROM old))
 		DELETE FROM runs WHERE run_no IN (SELECT run_no FROM old) RETURNING run_no`, now.Add(-s.keepRuns), maintainRuns)
 	if err != nil {

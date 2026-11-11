@@ -183,21 +183,22 @@ func (s *Store) ResumeRun(ctx context.Context, id store.RunID) (store.Run, error
 // sweepBatch is how many backlogs one transaction of a sweep changes.
 const sweepBatch = 500
 
-// resumeSweep makes the backlogs of a resumed run ready again, in batches. It stops
+// resumeSweep makes the lanes of a resumed run ready again, in batches. It stops
 // when the run is paused again, and clears the run's resuming mark when it is done.
 //
-// Every backlog with pending tasks is reset, not only the ones dispatch took out of
-// the readiness index: while the run was paused nothing kept the others up to date, so
-// one may still wait for a slot that was freed or for a block that was lifted.
+// Every lane is reset, not only the ones dispatch took out of the readiness index:
+// while the run was paused nothing kept the others up to date, so one may still wait
+// for a slot that was freed or for a block that was lifted.
 func (s *Store) resumeSweep(ctx context.Context, no int64) error {
-	var queue string // the sweep's position: the last backlog it reset
+	var queue string // the sweep's position: the last lane it reset
 	var pool int16
+	var handler string
 	for {
 		done := false
-		nextQueue, nextPool := queue, pool
+		nextQueue, nextPool, nextHandler := queue, pool, handler
 		err := s.tx(ctx, func(tx pgx.Tx, now time.Time) error {
 			done = false
-			nextQueue, nextPool = queue, pool
+			nextQueue, nextPool, nextHandler = queue, pool, handler
 			var name string
 			var paused, resuming bool
 			err := tx.QueryRow(ctx, "SELECT state::text, paused, resuming FROM runs WHERE run_no = $1", no).Scan(&name, &paused, &resuming)
@@ -209,22 +210,22 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 				return err
 			}
 			rows, err := tx.Query(ctx, `WITH c AS (
-					SELECT queue_key, pool_id FROM backlogs
-					WHERE run_no = $1 AND pending > 0 AND (queue_key, pool_id) > ($4, $5)
-					ORDER BY queue_key, pool_id LIMIT $3 FOR UPDATE)
-				UPDATE backlogs b SET ready_at = $2 FROM c
-				WHERE b.queue_key = c.queue_key AND b.run_no = $1 AND b.pool_id = c.pool_id
-				RETURNING b.queue_key, b.pool_id`, no, now, sweepBatch, queue, pool)
+					SELECT queue_key, pool_id, handler FROM lanes
+					WHERE run_no = $1 AND (queue_key, pool_id, handler) > ($4, $5, $6)
+					ORDER BY queue_key, pool_id, handler LIMIT $3 FOR UPDATE)
+				UPDATE lanes l SET ready_at = $2 FROM c
+				WHERE l.queue_key = c.queue_key AND l.run_no = $1 AND l.pool_id = c.pool_id AND l.handler = c.handler
+				RETURNING l.queue_key, l.pool_id, l.handler`, no, now, sweepBatch, queue, pool, handler)
 			if err != nil {
 				return err
 			}
 			pools := map[int16]bool{}
-			var k string
+			var k, h string
 			var p int16
-			if _, err := pgx.ForEachRow(rows, []any{&k, &p}, func() error {
+			if _, err := pgx.ForEachRow(rows, []any{&k, &p, &h}, func() error {
 				pools[p] = true
-				if k > nextQueue || (k == nextQueue && p > nextPool) {
-					nextQueue, nextPool = k, p
+				if k > nextQueue || (k == nextQueue && (p > nextPool || (p == nextPool && h > nextHandler))) {
+					nextQueue, nextPool, nextHandler = k, p, h
 				}
 				return nil
 			}); err != nil {
@@ -232,11 +233,11 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 			}
 			if len(pools) == 0 {
 				done = true
-				// The mark is cleared only if no backlog is left out of the readiness
+				// The mark is cleared only if no lane is left out of the readiness
 				// index: a pause and a second resume may have come in since this
 				// sweep began, and that resume's sweep still has work to do then.
 				_, err := tx.Exec(ctx, `UPDATE runs r SET resuming = false WHERE run_no = $1 AND NOT paused
-					AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.run_no = r.run_no AND b.pending > 0 AND b.ready_at IS NULL)`, no)
+					AND NOT EXISTS (SELECT 1 FROM lanes l WHERE l.run_no = r.run_no AND l.ready_at IS NULL)`, no)
 				return err
 			}
 			return s.wake(ctx, tx, pools)
@@ -244,7 +245,7 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 		if err != nil || done {
 			return err
 		}
-		queue, pool = nextQueue, nextPool // only now: a transaction that is tried again starts where it did
+		queue, pool, handler = nextQueue, nextPool, nextHandler // only now: a transaction that is tried again starts where it did
 	}
 }
 

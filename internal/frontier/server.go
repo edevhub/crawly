@@ -46,12 +46,13 @@ type Config struct {
 	ReaperInterval   time.Duration
 	MaintainInterval time.Duration
 	PollInterval     time.Duration
-	// NoHandlerGrace is how long a task is handed from worker to worker while none of
-	// them has its handler, before it fails with code "no_handler". Zero: one hour.
+	// NoHandlerGrace is how long a task waits while no session can run its handler,
+	// before it fails with code "no_handler". Zero: one hour.
 	NoHandlerGrace time.Duration
-	// NoHandlerDelay is how long such a task waits before it is given out again. Each
-	// round takes a politeness slot of its queue, so the delay bounds what a pool
-	// without the handler costs the queue's other tasks. Zero: five seconds.
+	// NoHandlerDelay is how long a task that a session without declared handlers handed
+	// back for want of its handler waits before it is given out again. Each such round
+	// takes a politeness slot of the task's queue, so the delay bounds what a session
+	// that lacks the handler costs the queue's other tasks. Zero: five seconds.
 	NoHandlerDelay time.Duration
 }
 
@@ -71,8 +72,10 @@ type Server struct {
 	loops     context.Context // set by Run: the lifetime of the dispatch loops
 	draining  chan struct{}   // closed by Drain
 	health    *health.Server
-	unserved  sync.Map  // store.TaskID -> time.Time: since when no worker that got the task had its handler
-	forgotten time.Time // guarded by mu: when forgetUnserved last looked at unserved
+	unserved  sync.Map                  // store.TaskID -> time.Time: since when no worker that got the task had its handler
+	forgotten time.Time                 // guarded by mu: when forgetUnserved last looked at unserved
+	swept     time.Time                 // guarded by mu: when the sweep for tasks without a handler last ran
+	waiting   map[store.HandlerRef]bool // guarded by mu: handlers whose waiting tasks were logged
 }
 
 // New builds a replica. Call Register to expose it and Run to start its loops.
@@ -98,7 +101,8 @@ func New(cfg Config) (*Server, error) {
 		cfg.NoHandlerDelay = 5 * time.Second
 	}
 	s := &Server{store: cfg.Store, pol: cfg.Policies, log: cfg.Logger, cfg: cfg,
-		pools: map[store.PoolName]*pool{}, draining: make(chan struct{}), health: health.NewServer()}
+		pools: map[store.PoolName]*pool{}, draining: make(chan struct{}), health: health.NewServer(),
+		waiting: map[store.HandlerRef]bool{}}
 	s.health.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING) // until Run
 	return s, nil
 }
@@ -219,6 +223,7 @@ func (s *Server) maintain(ctx context.Context) {
 		case <-tick.C:
 			err := s.store.Maintain(ctx)
 			s.forgetUnserved()
+			s.sweepUnserved(ctx)
 			if err != nil {
 				s.log.Warn("maintain", "err", err)
 			}
@@ -369,10 +374,75 @@ func ServerOptions() []grpc.ServerOption {
 }
 
 // CodeNoHandler is the code of a task no worker has a handler for.
-const CodeNoHandler = "no_handler"
+const CodeNoHandler = store.CodeNoHandler
 
 // CodeShutdown is the code of a task a worker handed back because it shut down.
 const CodeShutdown = "shutdown"
+
+// reportHandlers tells the store which handlers have a session on this replica.
+func (s *Server) reportHandlers(ctx context.Context) error {
+	s.mu.Lock()
+	pools := slices.Collect(maps.Values(s.pools))
+	s.mu.Unlock()
+	var sets []store.PoolHandlers
+	for _, p := range pools {
+		p.mu.Lock()
+		seen := map[string]bool{}
+		for ss := range p.sessions {
+			if ss.goodbye {
+				continue
+			}
+			for _, h := range ss.handlers {
+				seen[h] = true
+			}
+		}
+		p.mu.Unlock()
+		if len(seen) > 0 {
+			sets = append(sets, store.PoolHandlers{Pool: p.name, Handlers: slices.Sorted(maps.Keys(seen))})
+		}
+	}
+	return s.store.ServeHandlers(ctx, sets)
+}
+
+// sweepUnserved reports the handlers this replica serves, and from time to time asks
+// the store to fail the tasks that waited the grace period for a session that has
+// their handler. It logs each handler whose tasks wait once, and each failure.
+func (s *Server) sweepUnserved(ctx context.Context) {
+	if err := s.reportHandlers(ctx); err != nil {
+		s.log.Warn("reporting handlers", "err", err)
+		return
+	}
+	every := min(s.cfg.NoHandlerGrace/4, time.Minute)
+	s.mu.Lock()
+	due := time.Since(s.swept) >= every
+	if due {
+		s.swept = time.Now()
+	}
+	s.mu.Unlock()
+	if !due {
+		return
+	}
+	res, err := s.store.SweepUnserved(ctx, s.cfg.NoHandlerGrace)
+	if err != nil {
+		s.log.Warn("sweeping tasks without a handler", "err", err)
+		return
+	}
+	for _, f := range res.Failed {
+		s.log.Warn("no session had the handler for the grace period: the tasks failed",
+			"pool", f.Pool, "handler", f.Handler, "tasks", f.Tasks, "grace", s.cfg.NoHandlerGrace)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := make(map[store.HandlerRef]bool, len(res.Waiting))
+	for _, w := range res.Waiting {
+		now[w] = true
+		if !s.waiting[w] {
+			s.log.Warn("tasks wait for a handler that no session has",
+				"pool", w.Pool, "handler", w.Handler, "grace", s.cfg.NoHandlerGrace)
+		}
+	}
+	s.waiting = now
+}
 
 // forgetUnserved drops the tasks that were handed back long ago and not since: they
 // ended with their run, or their record was left behind by a store error. It looks at
@@ -504,7 +574,7 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 	out := make([]store.NewTask, len(specs))
 	for i, ts := range specs {
 		pool, queue, fp, err := identify(spec.KeyRule, ts)
-		if err != nil || proto.Size(ts) > wire.MaxTaskBytes {
+		if err != nil || proto.Size(ts) > wire.MaxTaskBytes || !wire.ValidHandler(ts.GetHandler()) {
 			out[i].Invalid = true
 			continue
 		}
@@ -520,7 +590,7 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 			out[i].Invalid = true
 			continue
 		}
-		out[i] = store.NewTask{Fingerprint: fp, Queue: store.QueueKey(queue), Pool: pool, Priority: ts.GetPriority(), Spec: raw,
+		out[i] = store.NewTask{Fingerprint: fp, Queue: store.QueueKey(queue), Pool: pool, Handler: ts.GetHandler(), Priority: ts.GetPriority(), Spec: raw,
 			TTL: s.pol.Resolve(spec.Policy, queue).Behaviour.GetTaskTtl().AsDuration()}
 		if ts.GetNotBeforeTime() != nil {
 			out[i].NotBefore = ts.GetNotBeforeTime().AsTime()

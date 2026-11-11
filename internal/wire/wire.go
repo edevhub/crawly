@@ -4,6 +4,8 @@
 package wire
 
 import (
+	"strings"
+
 	"google.golang.org/protobuf/proto"
 
 	taskv1 "github.com/edevhub/crawly/internal/gen/frontier/task/v1"
@@ -16,6 +18,10 @@ const (
 	// MaxBatchBytes is how much the tasks of one batch weigh at most. What the message
 	// adds around them, ids and framing, is a few KiB: far from gRPC's limit.
 	MaxBatchBytes = 2 << 20
+	// MaxHandlerBytes is the longest handler name. The Frontier indexes tasks by it.
+	MaxHandlerBytes = 256
+	// MaxSessionHandlers is how many handlers one session can name.
+	MaxSessionHandlers = 1024
 )
 
 // Batches splits tasks into consecutive batches of at most maxTasks tasks and
@@ -34,4 +40,10 @@ func Batches(tasks []*taskv1.TaskSpec, maxTasks int, yield func(from, to int)) {
 	if from < len(tasks) {
 		yield(from, len(tasks))
 	}
+}
+
+// ValidHandler reports whether the name can be stored as a task's handler: at most
+// MaxHandlerBytes long and without a NUL byte, which the database cannot keep.
+func ValidHandler(name string) bool {
+	return len(name) <= MaxHandlerBytes && !strings.ContainsRune(name, 0)
 }
