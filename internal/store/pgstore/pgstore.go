@@ -577,8 +577,9 @@ type brow struct {
 	inFlight int
 	vtime    float64
 	ownTat   time.Time
-	ready    time.Time // zero: NULL (not dispatchable); forever: waits for an event
-	dirty    bool
+	// The readiness of the backlog's tasks, one lane per handler that has tasks here.
+	lanes []*lane
+	dirty bool
 	// Counter increments.
 	attempts, succeeded, failed, expired, cancelled, blocks int64
 	// Run state, read after the lock was taken.
@@ -587,14 +588,63 @@ type brow struct {
 	live  bool // the run is open or sealed, and not paused
 	eff   store.Effective
 	// Dispatch only.
-	short bool      // a claim returned fewer tasks than asked: nothing more is due
-	due   time.Time // then: when its next task is due; zero if none can be claimed
+	short bool // a claim returned fewer tasks than asked: nothing more is due for this session
 }
 
-func (b *brow) setReady(t time.Time) {
-	if !b.ready.Equal(t) {
-		b.ready, b.dirty = t, true
+// lane is the readiness of the tasks of one handler in a backlog. Politeness belongs
+// to the backlog, so every lane waits for the same admission; what differs is when the
+// handler's own tasks are due.
+type lane struct {
+	handler string
+	ready   time.Time // zero: NULL (not dispatchable); forever: waits for an event
+	dirty   bool
+	// Dispatch only.
+	mine  bool      // the dispatching session can run the handler's tasks
+	short bool      // a claim for the session returned fewer tasks than asked
+	due   time.Time // then: when the lane's next task is due; zero if none can be claimed
+	gone  bool      // the lane has no task that can be claimed: its row is deleted
+}
+
+func (l *lane) setReady(t time.Time) {
+	if !l.ready.Equal(t) {
+		l.ready, l.dirty = t, true
 	}
+}
+
+// waiting reports whether the lane could have a task admitted at now, or waits for an
+// event that has not happened.
+func (l *lane) waiting(now time.Time) bool {
+	return !l.ready.IsZero() && (!l.ready.After(now) || l.ready.Equal(forever))
+}
+
+// setReady sets the readiness of every lane: the sites that change what all of a
+// backlog's tasks wait for.
+func (b *brow) setReady(t time.Time) {
+	for _, l := range b.lanes {
+		l.setReady(t)
+	}
+}
+
+// laneOf returns the lane of the handler, adding it when the backlog has none yet.
+func (b *brow) laneOf(handler string) *lane {
+	for _, l := range b.lanes {
+		if l.handler == handler {
+			return l
+		}
+	}
+	l := &lane{handler: handler, dirty: true}
+	b.lanes = append(b.lanes, l)
+	return l
+}
+
+// readyLanes reports whether some lane that match accepts is waiting at now.
+func (b *brow) readyLanes(now time.Time, match func(*lane) bool) bool {
+	for _, l := range b.lanes {
+		if l.waiting(now) && match(l) {
+			return true
+		}
+	}
+	return false
 }
 
 // lockQueue locks a queue row for the politeness update. With skipLocked it returns
@@ -622,7 +672,7 @@ func lockQueue(ctx context.Context, tx pgx.Tx, key store.QueueKey, skipLocked bo
 // state of their runs: after the locks, so a pause or a cancel that committed while
 // this transaction waited is seen.
 func (s *Store) lockBacklogs(ctx context.Context, tx pgx.Tx, key store.QueueKey, run int64, pool int16) ([]*brow, error) {
-	rows, err := tx.Query(ctx, `SELECT run_no, pool_id, pending, in_flight, vtime, own_tat, ready_at FROM backlogs
+	rows, err := tx.Query(ctx, `SELECT run_no, pool_id, pending, in_flight, vtime, own_tat FROM backlogs
 		WHERE queue_key = $1 AND (pending > 0 OR (run_no = $2 AND pool_id = $3))
 		ORDER BY run_no, pool_id FOR UPDATE`, string(key), run, pool)
 	if err != nil {
@@ -630,14 +680,38 @@ func (s *Store) lockBacklogs(ctx context.Context, tx pgx.Tx, key store.QueueKey,
 	}
 	bs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*brow, error) {
 		b := &brow{}
-		var own, ready pgtype.Timestamptz
-		if err := row.Scan(&b.run, &b.pool, &b.pending, &b.inFlight, &b.vtime, &own, &ready); err != nil {
+		var own pgtype.Timestamptz
+		if err := row.Scan(&b.run, &b.pool, &b.pending, &b.inFlight, &b.vtime, &own); err != nil {
 			return nil, err
 		}
-		b.ownTat, b.ready = timeOf(own), timeOf(ready)
+		b.ownTat = timeOf(own)
 		return b, nil
 	})
 	if err != nil {
+		return nil, err
+	}
+	// The lanes are read under the backlogs' locks: every writer of a lane holds its
+	// backlog.
+	lrows, err := tx.Query(ctx, "SELECT run_no, pool_id, handler, ready_at FROM lanes WHERE queue_key = $1 ORDER BY run_no, pool_id, handler", string(key))
+	if err != nil {
+		return nil, err
+	}
+	byKey := make(map[[2]int64]*brow, len(bs))
+	for _, b := range bs {
+		byKey[[2]int64{b.run, int64(b.pool)}] = b
+	}
+	var (
+		lrun    int64
+		lpool   int16
+		lhandle string
+		lready  pgtype.Timestamptz
+	)
+	if _, err := pgx.ForEachRow(lrows, []any{&lrun, &lpool, &lhandle, &lready}, func() error {
+		if b := byKey[[2]int64{lrun, int64(lpool)}]; b != nil {
+			b.lanes = append(b.lanes, &lane{handler: lhandle, ready: timeOf(lready)})
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	return bs, s.loadRuns(ctx, tx, key, bs, false)
@@ -711,15 +785,30 @@ func flush(ctx context.Context, tx pgx.Tx, now time.Time, q *qrow, bs []*brow) e
 			WHERE key = $1`, string(q.key), tsz(q.tat), q.inFlight, q.vclock, tszNull(q.blockedUntil), nullString(q.blockReason), now)
 	}
 	for _, b := range bs {
-		if !b.dirty {
+		if b.dirty {
+			batch.Queue(`UPDATE backlogs SET pending = $4, in_flight = $5, vtime = $6, own_tat = $7,
+				attempts = attempts + $8, succeeded = succeeded + $9, failed = failed + $10, expired = expired + $11,
+				cancelled = cancelled + $12, queue_blocks = queue_blocks + $13
+				WHERE queue_key = $1 AND run_no = $2 AND pool_id = $3`,
+				string(q.key), b.run, b.pool, b.pending, b.inFlight, b.vtime, tsz(b.ownTat),
+				b.attempts, b.succeeded, b.failed, b.expired, b.cancelled, b.blocks)
+		}
+		// A backlog with no tasks has no lanes: they come back with its next task.
+		if b.pending == 0 && (b.dirty || len(b.lanes) > 0) {
+			batch.Queue("DELETE FROM lanes WHERE queue_key = $1 AND run_no = $2 AND pool_id = $3", string(q.key), b.run, b.pool)
 			continue
 		}
-		batch.Queue(`UPDATE backlogs SET pending = $4, in_flight = $5, vtime = $6, own_tat = $7, ready_at = $8,
-			attempts = attempts + $9, succeeded = succeeded + $10, failed = failed + $11, expired = expired + $12,
-			cancelled = cancelled + $13, queue_blocks = queue_blocks + $14
-			WHERE queue_key = $1 AND run_no = $2 AND pool_id = $3`,
-			string(q.key), b.run, b.pool, b.pending, b.inFlight, b.vtime, tsz(b.ownTat), tszNull(b.ready),
-			b.attempts, b.succeeded, b.failed, b.expired, b.cancelled, b.blocks)
+		for _, l := range b.lanes {
+			switch {
+			case l.gone:
+				batch.Queue("DELETE FROM lanes WHERE queue_key = $1 AND run_no = $2 AND pool_id = $3 AND handler = $4",
+					string(q.key), b.run, b.pool, l.handler)
+			case l.dirty:
+				batch.Queue(`INSERT INTO lanes (queue_key, run_no, pool_id, handler, ready_at) VALUES ($1, $2, $3, $4, $5)
+					ON CONFLICT (queue_key, run_no, pool_id, handler) DO UPDATE SET ready_at = EXCLUDED.ready_at`,
+					string(q.key), b.run, b.pool, l.handler, tszNull(l.ready))
+			}
+		}
 	}
 	if batch.Len() == 0 {
 		return nil

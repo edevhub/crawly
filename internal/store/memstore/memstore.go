@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	taskv1 "github.com/edevhub/crawly/internal/gen/frontier/task/v1"
 	"github.com/edevhub/crawly/internal/safeconv"
 	"github.com/edevhub/crawly/internal/sched"
 	"github.com/edevhub/crawly/internal/store"
@@ -39,6 +40,11 @@ type Store struct {
 	seq    uint64
 	served uint64
 	keep   time.Duration // how long ended runs are kept; 0: for ever
+	// Handlers that have a session (ServeHandlers), when each was last reported, and
+	// when this store started (SweepUnserved).
+	handlers map[store.HandlerRef]time.Time
+	started  time.Time
+	reported time.Time // when SweepUnserved last asked its caller to log
 }
 
 // Option configures a Store.
@@ -62,10 +68,13 @@ func New(pol store.Policies, opts ...Option) *Store {
 		ttl:    map[*task]struct{}{},
 		leased: map[*task]struct{}{},
 		subs:   map[chan store.Notification]struct{}{},
+
+		handlers: map[store.HandlerRef]time.Time{},
 	}
 	for _, o := range opts {
 		o(s)
 	}
+	s.started = s.now()
 	return s
 }
 
@@ -122,6 +131,8 @@ type task struct {
 	depth     uint32
 	parent    store.TaskID
 	spec      []byte
+	handler   string
+	created   time.Time
 	priority  int32
 	seq       uint64
 	notBefore time.Time
@@ -379,7 +390,8 @@ func (s *Store) AddTasks(_ context.Context, req store.AddRequest) ([]store.AddRe
 	out := make([]store.AddResult, len(req.Tasks))
 	open := r.state == store.RunOpen || (req.Parent != nil && r.state == store.RunSealed)
 	woken := map[store.PoolName]bool{}
-	for i, nt := range req.Tasks {
+	for i := range req.Tasks {
+		nt := &req.Tasks[i]
 		switch {
 		case nt.Invalid:
 			out[i].Status = store.AddInvalid
@@ -399,7 +411,7 @@ func (s *Store) AddTasks(_ context.Context, req store.AddRequest) ([]store.AddRe
 			}
 			s.seq++
 			t := &task{id: store.TaskID("t" + strconv.FormatUint(s.seq, 36)), r: r, fp: nt.Fingerprint,
-				depth: depth, parent: parent, spec: nt.Spec, priority: nt.Priority, seq: s.seq,
+				depth: depth, parent: parent, spec: nt.Spec, handler: nt.Handler, created: now, priority: nt.Priority, seq: s.seq,
 				notBefore: nt.NotBefore, state: store.TaskPending}
 			if nt.TTL > 0 {
 				t.expiresAt = now.Add(nt.TTL)
@@ -452,10 +464,57 @@ func (b *backlog) insert(t *task) {
 	b.pending = slices.Insert(b.pending, i, t)
 }
 
-// eligible counts the tasks that can be claimed now and reports the earliest time a
-// delayed one becomes claimable.
-func (b *backlog) eligible(now time.Time) (n int, next time.Time) {
+// handlerSet says which tasks a session can run: those of its handlers, and those
+// with no handler. A nil set runs everything.
+type handlerSet map[string]struct{}
+
+func newHandlerSet(handlers []string) handlerSet {
+	if len(handlers) == 0 {
+		return nil
+	}
+	h := make(handlerSet, len(handlers))
+	for _, n := range handlers {
+		h[n] = struct{}{}
+	}
+	return h
+}
+
+func (h handlerSet) runs(t *task) bool {
+	if h == nil || t.handler == "" {
+		return true
+	}
+	_, ok := h[t.handler]
+	return ok
+}
+
+// servedWindow is how recently a handler must have been reported to count as served
+// when another pool's first refusal is decided.
+const servedWindow = 5 * time.Minute
+
+// servedSet is what the pool's sessions can run, as they reported it lately: a session
+// that names no handlers can run anything (nil); with none, only tasks of unknown
+// handler can be run.
+func (s *Store) servedSet(pool store.PoolName, now time.Time) handlerSet {
+	set := handlerSet{}
+	for ref, seen := range s.handlers {
+		if ref.Pool != pool || now.Sub(seen) > servedWindow {
+			continue
+		}
+		if ref.Handler == "" {
+			return nil
+		}
+		set[ref.Handler] = struct{}{}
+	}
+	return set
+}
+
+// eligible counts the tasks that the set can run and that can be claimed now, and
+// reports the earliest time a delayed one becomes claimable.
+func (b *backlog) eligible(now time.Time, h handlerSet) (n int, next time.Time) {
 	for _, t := range b.pending {
+		if !h.runs(t) {
+			continue
+		}
 		if t.notBefore.After(now) {
 			if next.IsZero() || t.notBefore.Before(next) {
 				next = t.notBefore
@@ -479,10 +538,11 @@ func (s *Store) Dispatch(_ context.Context, req store.DispatchRequest) (store.Di
 			res.NextReadyAt = t
 		}
 	}
+	h := newHandlerSet(req.Handlers)
 	var qs []*queue
 	for _, q := range s.queues {
 		for _, b := range q.backlogs {
-			if b.pool == req.Pool && len(b.pending) > 0 && b.r.dispatchable() {
+			if b.pool == req.Pool && b.r.dispatchable() && slices.ContainsFunc(b.pending, h.runs) {
 				qs = append(qs, q)
 				break
 			}
@@ -498,13 +558,13 @@ func (s *Store) Dispatch(_ context.Context, req store.DispatchRequest) (store.Di
 			note(now) // more may be ready: the caller asks again when it has slots
 			break
 		}
-		slots -= s.dispatchQueue(q, req, slots, now, &res, note)
+		slots -= s.dispatchQueue(q, req, h, slots, now, &res, note)
 	}
 	return res, nil
 }
 
 // dispatchQueue claims up to slots tasks of req.Pool from one queue and returns how many.
-func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, slots int, now time.Time,
+func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, h handlerSet, slots int, now time.Time,
 	res *store.DispatchResult, note func(time.Time)) int {
 	taken := 0
 	for taken < slots {
@@ -521,7 +581,13 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, slots int, no
 			if !b.r.dispatchable() {
 				continue
 			}
-			elig, next := b.eligible(now)
+			// Another pool's tasks are judged by their pool's sessions, not this one's:
+			// the ones that have had a session lately.
+			bh := h
+			if b.pool != req.Pool {
+				bh = s.servedSet(b.pool, now)
+			}
+			elig, next := b.eligible(now, bh)
 			if elig == 0 {
 				if b.pool == req.Pool {
 					note(next)
@@ -568,7 +634,7 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, slots int, no
 			continue
 		}
 		n := min(slots-taken, bestAdmit)
-		claimed := best.claim(n, now)
+		claimed := best.claim(n, now, h)
 		n = len(claimed)
 		if bestEff.Own {
 			best.ownTat = sched.Advance(bestEff.Limits, best.ownTat, now, n)
@@ -614,12 +680,12 @@ func before(a, b *backlog) bool {
 	return a.pool < b.pool
 }
 
-// claim removes up to n claimable tasks, highest priority first.
-func (b *backlog) claim(n int, now time.Time) []*task {
+// claim removes up to n claimable tasks the set can run, highest priority first.
+func (b *backlog) claim(n int, now time.Time, h handlerSet) []*task {
 	var out []*task
 	keep := b.pending[:0]
 	for _, t := range b.pending {
-		if len(out) < n && !t.notBefore.After(now) {
+		if len(out) < n && !t.notBefore.After(now) && h.runs(t) {
 			out = append(out, t)
 			continue
 		}
@@ -929,8 +995,97 @@ func (s *Store) BlockQueue(_ context.Context, key store.QueueKey, until time.Tim
 
 // ---- background
 
-// Start does nothing: the in-memory store has no replica state.
-func (s *Store) Start(context.Context, store.Replica) error { return nil }
+// Start records the start of a replica: no task fails for want of a handler until a
+// grace period has passed since the newest start.
+func (s *Store) Start(context.Context, store.Replica) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.started = s.now()
+	return nil
+}
+
+// ServeHandlers records that the handlers have sessions now.
+func (s *Store) ServeHandlers(_ context.Context, sets []store.PoolHandlers) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	for _, set := range sets {
+		for _, h := range set.Handlers {
+			s.handlers[store.HandlerRef{Pool: set.Pool, Handler: h}] = now
+		}
+	}
+	return nil
+}
+
+// SweepUnserved fails the pending tasks that waited longer than grace for a session
+// that can run their handler, and reports the handlers whose tasks wait.
+func (s *Store) SweepUnserved(_ context.Context, grace time.Duration) (store.Unserved, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	var out store.Unserved
+	mayFail := now.Sub(s.started) >= grace
+	served := func(pool store.PoolName, handler string) bool {
+		for _, h := range []string{handler, ""} { // "": a session that can run any
+			if seen, ok := s.handlers[store.HandlerRef{Pool: pool, Handler: h}]; ok && now.Sub(seen) <= grace {
+				return true
+			}
+		}
+		return false
+	}
+	waiting := map[store.HandlerRef]map[*backlog]bool{}
+	failed := map[store.HandlerRef]int{}
+	for _, r := range s.order {
+		if !r.dispatchable() {
+			continue
+		}
+		for _, b := range r.backlogs {
+			for _, t := range slices.Clone(b.pending) {
+				ref := store.HandlerRef{Pool: b.pool, Handler: t.handler}
+				if t.handler == "" || served(b.pool, t.handler) {
+					continue // served, or no handler named: any session may try it
+				}
+				if now.Sub(t.created) < grace || !mayFail {
+					if waiting[ref] == nil {
+						waiting[ref] = map[*backlog]bool{}
+					}
+					waiting[ref][b] = true
+					continue
+				}
+				if i := slices.Index(b.pending, t); i >= 0 {
+					b.pending = slices.Delete(b.pending, i, i+1)
+				}
+				delete(s.ttl, t)
+				t.attempt++
+				t.attempts = append(t.attempts, store.Attempt{Attempt: t.attempt, DispatchedAt: now, FinishedAt: now, Record: store.AttemptRecord{
+					Kind: int32(taskv1.Outcome_KIND_FAILED), Code: store.CodeNoHandler, Message: "no worker had the handler " + t.handler + " for " + grace.String()}})
+				t.state = store.TaskFailed
+				r.stats.Failed++
+				r.stats.ByCode[store.CodeNoHandler]++
+				r.active--
+				failed[ref]++
+				s.complete(r)
+			}
+		}
+	}
+	for ref, bs := range waiting {
+		out.Waiting = append(out.Waiting, store.WaitingHandler{HandlerRef: ref, Lanes: len(bs)})
+	}
+	for ref, n := range failed {
+		out.Failed = append(out.Failed, store.FailedTasks{HandlerRef: ref, Tasks: n})
+	}
+	slices.SortFunc(out.Waiting, func(a, b store.WaitingHandler) int { return cmpRef(a.HandlerRef, b.HandlerRef) })
+	slices.SortFunc(out.Failed, func(a, b store.FailedTasks) int { return cmpRef(a.HandlerRef, b.HandlerRef) })
+	out.Held = !mayFail && len(out.Waiting) > 0
+	if now.Sub(s.reported) >= min(grace, 10*time.Minute) {
+		s.reported, out.Report = now, true
+	}
+	return out, nil
+}
+
+func cmpRef(a, b store.HandlerRef) int {
+	return cmp.Or(cmp.Compare(a.Pool, b.Pool), cmp.Compare(a.Handler, b.Handler))
+}
 
 // Notifications delivers wake-ups until ctx is done. A full channel drops wake-ups, which only delays work.
 func (s *Store) Notifications(ctx context.Context) (<-chan store.Notification, error) {

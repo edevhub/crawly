@@ -89,7 +89,7 @@ func main() {
 	flag.DurationVar(&cfg.retainTasks, "retain-tasks", 0,
 		"PostgreSQL only: how long tasks and attempts are kept, counted from the creation of their run; 0 keeps them for ever")
 	flag.DurationVar(&cfg.noHandlerGrace, "no-handler-grace", time.Hour,
-		`how long a task waits for a worker that has its handler, e.g. during a rolling deploy, before it fails with code "no_handler"`)
+		`how long a task waits while no worker session has its handler, e.g. during a rolling deploy, before it fails with code "no_handler"`)
 	flag.Parse()
 	if err := run(cfg, log); err != nil {
 		log.Error("frontier stopped", "err", err)

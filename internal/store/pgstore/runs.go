@@ -183,12 +183,12 @@ func (s *Store) ResumeRun(ctx context.Context, id store.RunID) (store.Run, error
 // sweepBatch is how many backlogs one transaction of a sweep changes.
 const sweepBatch = 500
 
-// resumeSweep makes the backlogs of a resumed run ready again, in batches. It stops
+// resumeSweep makes the lanes of a resumed run ready again, in batches. It stops
 // when the run is paused again, and clears the run's resuming mark when it is done.
 //
-// Every backlog with pending tasks is reset, not only the ones dispatch took out of
-// the readiness index: while the run was paused nothing kept the others up to date, so
-// one may still wait for a slot that was freed or for a block that was lifted.
+// Every lane is reset, not only the ones dispatch took out of the readiness index:
+// while the run was paused nothing kept the others up to date, so one may still wait
+// for a slot that was freed or for a block that was lifted.
 func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 	var queue string // the sweep's position: the last backlog it reset
 	var pool int16
@@ -208,13 +208,15 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 			if err != nil {
 				return err
 			}
+			// The backlogs are locked first, in key order, as every other writer of
+			// lanes does: a trigger writes the backlog's readiness after its lanes.
 			rows, err := tx.Query(ctx, `WITH c AS (
 					SELECT queue_key, pool_id FROM backlogs
-					WHERE run_no = $1 AND pending > 0 AND (queue_key, pool_id) > ($4, $5)
-					ORDER BY queue_key, pool_id LIMIT $3 FOR UPDATE)
-				UPDATE backlogs b SET ready_at = $2 FROM c
-				WHERE b.queue_key = c.queue_key AND b.run_no = $1 AND b.pool_id = c.pool_id
-				RETURNING b.queue_key, b.pool_id`, no, now, sweepBatch, queue, pool)
+					WHERE run_no = $1 AND (queue_key, pool_id) > ($4, $5)
+					ORDER BY queue_key, pool_id LIMIT $3 FOR NO KEY UPDATE),
+				u AS (UPDATE lanes l SET ready_at = $2 FROM c
+					WHERE l.run_no = $1 AND l.queue_key = c.queue_key AND l.pool_id = c.pool_id)
+				SELECT queue_key, pool_id FROM c`, no, now, sweepBatch, queue, pool)
 			if err != nil {
 				return err
 			}
@@ -232,11 +234,11 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 			}
 			if len(pools) == 0 {
 				done = true
-				// The mark is cleared only if no backlog is left out of the readiness
+				// The mark is cleared only if no lane is left out of the readiness
 				// index: a pause and a second resume may have come in since this
 				// sweep began, and that resume's sweep still has work to do then.
 				_, err := tx.Exec(ctx, `UPDATE runs r SET resuming = false WHERE run_no = $1 AND NOT paused
-					AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.run_no = r.run_no AND b.pending > 0 AND b.ready_at IS NULL)`, no)
+					AND NOT EXISTS (SELECT 1 FROM lanes l WHERE l.run_no = r.run_no AND l.ready_at IS NULL)`, no)
 				return err
 			}
 			return s.wake(ctx, tx, pools)

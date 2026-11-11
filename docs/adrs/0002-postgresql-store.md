@@ -32,7 +32,8 @@ dispatches from (ADR 0001). No transaction stays open while a worker fetches.
 The schema follows ADR 0001's locality rule: everything a hot transaction writes is keyed by
 one queue. Hot state lives on two tables per queue: `queues` (shared politeness and the
 fair-queueing clock) and `backlogs` (one row per run, queue and pool: ledger, fairness
-tag, own politeness state, stats counters, readiness). There is no run-level counter table.
+tag, own politeness state, stats counters), with `lanes` (one row per handler that has tasks
+in a backlog: readiness). There is no run-level counter table.
 
 ## Schema
 
@@ -42,7 +43,8 @@ tag, own politeness state, stats counters, readiness). There is no run-level cou
 runs ── run_events                     pools
   │                                      │
   └──────── backlogs (queue × run × pool) ── queues (per key)
-                 │        └── backlog_codes
+                 │        ├── backlog_codes
+                 │        └── lanes (× handler)
               tasks (partitioned by run_created_on) ── attempts (partitioned)
 ```
 
@@ -53,7 +55,10 @@ runs ── run_events                     pools
 | `replicas`, `policy_sets` | Replica registry, policy set hashes seen | `Start` |
 | `pools` | Pool names to small integer keys | First task of a pool |
 | `queues` | Shared politeness state and fairness clock per queue key | Dispatch, finish, block |
-| `backlogs` | Ledger, fairness, own politeness, stats, readiness per (queue, run, pool) | Dispatch, finish, add |
+| `backlogs` | Ledger, fairness, own politeness, stats per (queue, run, pool) | Dispatch, finish, add |
+| `lanes` | Readiness per (queue, run, pool, handler) | Dispatch, finish, add, sweeps |
+| `pool_handlers` | Handlers the replicas have sessions for, and when each was last reported | `ServeHandlers` |
+| `unserved_sweep` | One row: when the sweep of tasks without a handler last ran, where it stopped, when it last reported | `SweepUnserved` |
 | `backlog_codes` | Outcome code counts per backlog (`RunStats.by_code`) | Finish |
 | `tasks` | Every task; holds the current lease | ~3 updates per task |
 | `attempts` | One row per finished attempt | Insert only |
@@ -180,7 +185,7 @@ CREATE TABLE backlogs (
   -- scheduling
   vtime          double precision NOT NULL DEFAULT 0,
   own_tat        timestamptz      NOT NULL DEFAULT '-infinity',  -- GCRA under a run override
-  ready_at       timestamptz,                                    -- NULL / 'infinity': see below
+  ready_at       timestamptz,                                    -- the earliest of the backlog's lanes; see Lanes
   -- stats (RunStats is the sum over the run's backlogs)
   tasks_total    bigint           NOT NULL DEFAULT 0,
   succeeded      bigint           NOT NULL DEFAULT 0,
@@ -194,14 +199,31 @@ CREATE TABLE backlogs (
   queue_blocks   bigint           NOT NULL DEFAULT 0,
   PRIMARY KEY (queue_key, run_no, pool_id)
 );
--- Readiness index: earliest-ready backlogs per pool.
-CREATE INDEX backlogs_ready  ON backlogs (pool_id, ready_at) WHERE ready_at IS NOT NULL;
 -- A queue's backlogs with work, for dispatch and finish.
 CREATE INDEX backlogs_queue  ON backlogs (queue_key, run_no, pool_id) WHERE pending > 0;
 -- Completion check and lifecycle fan-out.
 CREATE INDEX backlogs_active ON backlogs (run_no) WHERE pending > 0 OR in_flight > 0;
 -- Stats and ListQueues by run.
 CREATE INDEX backlogs_run    ON backlogs (run_no, queue_key);
+-- For the build before lanes, which reads readiness here; dropped with ready_at in a later
+-- migration (see Migrations). This build does not read it.
+CREATE INDEX backlogs_ready  ON backlogs (pool_id, ready_at) WHERE ready_at IS NOT NULL;
+
+-- One row per handler that has pending tasks in a backlog: what the backlog's readiness
+-- was before handlers existed, kept per handler.
+CREATE TABLE lanes (
+  queue_key text        NOT NULL,
+  run_no    bigint      NOT NULL,
+  pool_id   smallint    NOT NULL,
+  handler   text        NOT NULL,                  -- '': handler unknown, any session may try
+  ready_at  timestamptz,                           -- NULL / 'infinity': see below
+  PRIMARY KEY (queue_key, run_no, pool_id, handler)
+);
+-- Readiness index: earliest-ready lanes per pool and handler. The last two columns let a
+-- scan of one handler's lanes resume from a position.
+CREATE INDEX lanes_ready      ON lanes (pool_id, handler, ready_at, queue_key, run_no) WHERE ready_at IS NOT NULL;
+CREATE INDEX lanes_ready_pool ON lanes (pool_id, ready_at) WHERE ready_at IS NOT NULL;
+CREATE INDEX lanes_run        ON lanes (run_no, queue_key, pool_id, handler);
 
 CREATE TABLE backlog_codes (
   queue_key text   NOT NULL,
@@ -219,12 +241,42 @@ queue's backlogs with `pending > 0` (`backlogs_queue`), in primary key order, pl
 finished task's own backlog. Stats live on the backlog row the hot path already updates, so
 counting costs no extra row.
 
-`ready_at` has three kinds of value:
+**Lanes.** A task names its handler (`TaskSpec.handler`), and a session names the handlers
+it can run (ADR 0003). Politeness, fairness, the ledger and the statistics stay per
+backlog: they are about the queue's load and the run's share, not about which worker runs a
+task. What a session needs is to find work it can run without reading past work it cannot,
+so readiness is kept per lane: one row for each handler that has pending tasks in the
+backlog. A backlog with no pending tasks has no lanes. The lanes of a backlog are written
+only by a transaction that holds the backlog's row, so they need no lock order of their own.
 
-- a time: the backlog may have a task admitted then (early is allowed, late is not);
-- `'infinity'`: it has pending tasks but waits for an event, a concurrency slot freed by a
-  `Finish`, which lowers it;
-- `NULL`: not dispatchable: no pending tasks, or the run is paused or ended.
+`lanes.ready_at` has three kinds of value:
+
+- a time: a task of the lane may be admitted then (early is allowed, late is not);
+- `'infinity'`: the lane has pending tasks but waits for an event, a concurrency slot freed
+  by a `Finish`, which lowers it;
+- `NULL`: not dispatchable: the run is paused or ended. A lane whose tasks are all gone is
+  deleted, not set to `NULL`: a lane is kept only while its backlog has pending tasks, and
+  is deleted when a dispatch finds nothing claimable and nothing due in it.
+
+Every lane of a backlog waits for the same admission (block, rate, concurrency, another
+pool's first refusal). What differs is when the lane's own tasks are due, which only a
+dispatch for a session that can run the handler learns, so only it writes that time. A
+dispatch that cannot run a lane lowers or raises it only for the reasons that hold for all
+handlers.
+
+Tasks that exist when the lanes are introduced have no known handler: they get handler `''`,
+and every session may try them. So do tasks that a build without handlers adds while the two
+builds run side by side, and tasks whose handler name is longer than a worker could register
+or holds a NUL byte, which `AddTasks` accepts as before and stores as unknown.
+
+`backlogs.ready_at` stays, for the build before lanes: it claims by it. Two triggers keep
+both views in step, so that the two builds can run at once. A write to `lanes` sets the
+backlog's `ready_at` to the earliest `ready_at` among its lanes (`NULL` when it has none or
+all are paused). A write to `backlogs.ready_at` that does not come from that trigger, so
+from the build before, makes the backlog's lanes ready no later than the new value, creates
+the lane of unknown handler if the backlog has none, and sets them all to `NULL` when the
+value is `NULL`. Both only ever make readiness earlier. This build never writes
+`backlogs.ready_at` itself, and reads only `lanes`.
 
 `GetRun` sums the run's backlogs (`backlogs_run`) and its `backlog_codes`, so its cost grows
 with the number of queues the run has work on (ADR 0001, Scaling model and limits).
@@ -243,6 +295,7 @@ CREATE TABLE tasks (
   pool_id         smallint    NOT NULL,
   fingerprint      bytea       NOT NULL CHECK (length(fingerprint) = 16),
   state            task_state  NOT NULL DEFAULT 'pending',
+  handler          text        NOT NULL DEFAULT '',  -- TaskSpec.handler; '': unknown
   priority         int         NOT NULL DEFAULT 0,
   not_before       timestamptz NOT NULL DEFAULT '-infinity',
   expires_at       timestamptz,
@@ -266,10 +319,16 @@ CREATE TABLE tasks (
 ALTER TABLE tasks ALTER COLUMN spec SET STORAGE EXTERNAL;
 -- On each partition: WITH (toast_tuple_target = 256)
 
-CREATE INDEX tasks_claim  ON tasks (run_no, queue_key, pool_id, priority DESC, task_id)
+-- This build claims by handler:
+CREATE INDEX tasks_claim_h ON tasks (run_no, queue_key, pool_id, handler, priority DESC, task_id)
   INCLUDE (not_before, expires_at) WHERE state = 'pending';
-CREATE INDEX tasks_next   ON tasks (run_no, queue_key, pool_id, not_before)
+CREATE INDEX tasks_next_h  ON tasks (run_no, queue_key, pool_id, handler, not_before)
   WHERE state = 'pending';
+-- The build before claims by these, and the migration keeps them. They are dropped in the
+-- later migration that drops backlogs.ready_at.
+CREATE INDEX tasks_claim   ON tasks (run_no, queue_key, pool_id, priority DESC, task_id)
+  INCLUDE (not_before, expires_at) WHERE state = 'pending';
+CREATE INDEX tasks_next    ON tasks (run_no, queue_key, pool_id, not_before) WHERE state = 'pending';
 CREATE INDEX tasks_leases ON tasks (lease_expires_at) WHERE state = 'in_flight';
 CREATE INDEX tasks_ttl    ON tasks (expires_at) WHERE state = 'pending' AND expires_at IS NOT NULL;
 -- Inspect API: ListTasks by run, including finished tasks.
@@ -280,15 +339,19 @@ Partitions are monthly, created ahead of time by `Maintain`. All tasks of a run 
 run's `created_on`, so the dedup constraint is valid on the partitioned table and every
 run-scoped query names one partition.
 
-`tasks_claim` includes `not_before` and `expires_at`. A claim locks rows, so it still
+`tasks_claim_h` and `tasks_next_h` are keyed by handler after the pool, so the pending tasks of
+one handler in one backlog are one index range, in priority order (or in `not_before`
+order). A claim for several handlers reads one range per handler.
+
+`tasks_claim_h` includes `not_before` and `expires_at`. A claim locks rows, so it still
 fetches the heap tuple of a task that waits for a retry backoff before it passes over it.
 
 `spec` is stored out of line from a few hundred bytes up, so state transitions copy a small
 heap tuple and only dispatch reads the spec (one TOAST fetch).
 
 No fillfactor tuning: every task transition changes `state` (in partial index predicates)
-or `lease_expires_at` (indexed), and every backlog update changes `ready_at` or the
-`pending`/`in_flight` predicate, so none of these updates is HOT. Autovacuum settings below
+or `lease_expires_at` (indexed), and every backlog update changes `pending` or
+`in_flight` (in index predicates) and every lane update changes `ready_at`, so none of these updates is HOT. Autovacuum settings below
 account for that.
 
 ### Attempts
@@ -359,6 +422,11 @@ Why it is deadlock-free:
   the backlog upsert.
 - Inside `backlogs`, a dispatch locks the backlogs of its queue (one key range) and an
   add locks the backlogs of its batch, both in primary key order, so they cannot cross.
+- `lanes` rows are written by transactions that hold their backlog (dispatch, finish, add,
+  drain, expiry, the unserved-handler sweep), after it and in primary key order. The resume
+  sweep and the readiness reset at start lock the backlogs of a batch first, in key order,
+  and then update their lanes, so they take the two in the same order. The trigger that
+  writes `backlogs.ready_at` after a lane write finds the backlog already locked.
 
 ## Operations
 
@@ -368,20 +436,25 @@ arithmetic is `sched`'s, run in Go inside the transaction.
 
 ### Dispatch
 
-**Candidates** (no locks, served by `backlogs_ready`):
+**Candidates** (no locks, served by `lanes_ready`). A session that names handlers probes the
+index once per handler, so it never reads past a lane it cannot run; the probes are merged:
 
 ```sql
 SELECT queue_key, min(ready_at) AS ready_at
-FROM (SELECT queue_key, ready_at FROM backlogs
-      WHERE pool_id = $pool AND ready_at <= now()
-      ORDER BY ready_at LIMIT 256) c
+FROM (SELECT l.queue_key, l.ready_at
+      FROM unnest($handlers) AS h(handler)           -- the session's handlers, and ''
+      CROSS JOIN LATERAL (SELECT queue_key, ready_at FROM lanes
+                          WHERE pool_id = $pool AND handler = h.handler AND ready_at <= now()
+                          ORDER BY ready_at LIMIT 256) l
+      ORDER BY l.ready_at LIMIT 256) c
 GROUP BY queue_key
 ORDER BY ready_at
 LIMIT 64;
 ```
 
-The inner limit bounds backlogs, the outer one queues, so a queue with many runs cannot
-crowd the others out of the candidate list, and queues come back in `ready_at` order.
+A session that names no handler reads `lanes_ready_pool` instead, with no handler condition.
+The inner limit bounds lanes, the outer one queues, so a queue with many runs cannot crowd
+the others out of the candidate list, and queues come back in `ready_at` order.
 
 The replica tries candidate queues in `ready_at` order, one transaction per queue, until the
 session's slots are used or the candidates run out:
@@ -391,11 +464,13 @@ session's slots are used or the candidates run out:
 SELECT tat, in_flight, vclock, blocked_until FROM queues
 WHERE key = $k FOR NO KEY UPDATE SKIP LOCKED;
 
--- 2. All its backlogs with pending tasks, every pool, locked in key order.
+-- 2. All its backlogs with pending tasks, every pool, locked in key order, and their
+--    lanes (read under those locks).
 SELECT * FROM backlogs
 WHERE queue_key = $k AND pending > 0
 ORDER BY run_no, pool_id
 FOR UPDATE;
+SELECT run_no, pool_id, handler, ready_at FROM lanes WHERE queue_key = $k;
 
 -- 3. Run state, read after the locks are held.
 SELECT run_no, state, paused FROM runs WHERE run_no = ANY($run_nos);
@@ -411,37 +486,50 @@ that wait. Pause and cancel do not lock backlogs (see Lifecycle), so a dispatch 
 the state just before they committed still hands out its tasks; ADR 0001 accepts that.
 
 4. **Admit and pick, in Go** (`sched`). Backlogs of paused or ended runs are set to
-   `ready_at = NULL` (this heals an add that raced a pause). Before it does that, the
+   `ready_at = NULL` on every lane (this heals an add that raced a pause). Before it does that, the
    dispatch locks those `runs` rows `FOR SHARE` and reads them again: a resume either
    committed before, and the backlog stays, or waits for this transaction, and its sweep
    then finds the backlog. Without the lock a resume sweep could pass a backlog just
    before a dispatch that still saw the pause takes it out. For each remaining backlog,
    compute admission (ADR 0001: block, shared or own GCRA, concurrency) and the number
-   admitted. Take the admitted backlog with the lowest start tag `greatest(vtime, vclock)`
-   across every pool:
+   admitted. A backlog of the session's pool is a candidate only if it has a ready lane for
+   a handler the session can run; a backlog of another pool, if it has a ready lane for a
+   handler of unknown name `''`, or one that `pool_handlers` says a session of that pool had
+   within the last five minutes (a session that names no handlers counts as having all):
+   that pool's own sessions judge the rest, and work none of them can run neither holds the
+   queue nor wakes the pool. The reports of a replica that predates `pool_handlers` are
+   missing, so while such a replica runs, its pool's lanes of named handlers have no first
+   refusal on queues it shares. Take the admitted backlog with the lowest start tag
+   `greatest(vtime, vclock)` across every pool:
 
    - **in the session's pool:** dispatch from it, `n` = min(slots, admitted);
    - **in another pool, inside its first-refusal period** (ADR 0001; counted from
      `greatest(ready_at, the limiter's eligible time)`): set this pool's backlogs on the
-     queue to `ready_at` = the end of the period, `NOTIFY` the other pool's channel, commit
+     queue to `ready_at` = the end of the period (every lane of them), `NOTIFY` the other pool's channel, commit
      and go to the next candidate queue;
    - **in another pool, period over:** charge it one task
      (`vtime = greatest(vtime, vclock) + 1 / weight`, `vclock = greatest(vclock, start)`)
      and pick again.
 
-   If concurrency, not time, is what refuses a backlog, its `ready_at` becomes `'infinity'`.
+   If concurrency, not time, is what refuses a backlog, the `ready_at` of its lanes becomes
+   `'infinity'`.
 
 5. **Claim:**
 
    ```sql
    WITH picked AS MATERIALIZED (
-     SELECT task_id FROM tasks
-     WHERE run_created_on = $d AND run_no = $r AND queue_key = $k AND pool_id = $c
-       AND state = 'pending' AND not_before <= now()
-       AND (expires_at IS NULL OR expires_at > now())
-     ORDER BY priority DESC, task_id
-     LIMIT $n
-     FOR UPDATE SKIP LOCKED)
+     SELECT p.task_id
+     FROM unnest($handlers) AS h(handler)      -- the backlog's lanes the session can run
+     CROSS JOIN LATERAL (
+       SELECT task_id, priority FROM tasks
+       WHERE run_created_on = $d AND run_no = $r AND queue_key = $k AND pool_id = $c
+         AND handler = h.handler AND state = 'pending' AND not_before <= now()
+         AND (expires_at IS NULL OR expires_at > now())
+       ORDER BY priority DESC, task_id
+       LIMIT $n
+       FOR UPDATE SKIP LOCKED) p
+     ORDER BY p.priority DESC, p.task_id
+     LIMIT $n)
    UPDATE tasks t SET state = 'in_flight', attempt = t.attempt + 1, lease_nonce = $nonce,
           worker_id = $w, worker_version = $v, dispatched_at = now(),
           lease_expires_at = now() + $lease, lease_deadline = now() + $max_lease
@@ -449,15 +537,20 @@ the state just before they committed still hands out its tasks; ADR 0001 accepts
    RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.spec;
    ```
 
-   The picked rows are materialised on purpose. Written as `WHERE (…) IN (SELECT … LIMIT $n
+   Each lane is read through `tasks_claim` on its own, and the best `n` of them are kept, so
+   the order is the one a single backlog would give (priority across the handlers the session
+   can run) and no task is read except the ones taken, and the ones of the other lanes that
+   were not. The picked rows are materialised on purpose. Written as `WHERE (…) IN (SELECT … LIMIT $n
    FOR UPDATE SKIP LOCKED)`, the planner may run the sub-select again for every outer row,
    and the statement then claims more than `n` tasks. The same form is used wherever
    `Maintain` changes a bounded batch of tasks.
 
-   If it returns fewer than `n` rows, recompute this backlog's `ready_at` from `tasks_next`
-   (the earliest `not_before` among non-expired pending tasks, or `NULL`) and, if slots
-   remain, try the next admitted backlog on the queue. This stops a backlog of expired tasks
-   from being selected again before `Maintain` expires them.
+   If it returns fewer than `n` rows, nothing more of the session's lanes is due. Recompute
+   the `ready_at` of each of those lanes from `tasks_next` (the earliest `not_before` among
+   its non-expired pending tasks; the lane is deleted if there is none) and, if slots
+   remain, try the next admitted backlog on the queue. Other lanes of the backlog keep their
+   value. This stops a lane of expired tasks from being selected again before `Maintain`
+   expires them.
 
 6. **Write back**, all rows already locked:
 
@@ -472,13 +565,14 @@ the state just before they committed still hands out its tasks; ADR 0001 accepts
    UPDATE backlogs SET
      pending = pending - $n, in_flight = in_flight + $n, attempts = attempts + $n,
      vtime   = greatest(vtime, $vclock_before) + $n / $weight,
-     own_tat = CASE WHEN $own THEN greatest(own_tat, now()) + $n * $T_own ELSE own_tat END,
-     ready_at = $ready                                  -- computed in Go
+     own_tat = CASE WHEN $own THEN greatest(own_tat, now()) + $n * $T_own ELSE own_tat END
    WHERE queue_key = $k AND run_no = $r AND pool_id = $c;
    ```
 
-   and, for the other locked backlogs on the queue, `ready_at = greatest(ready_at,
-   <their next admission time>)`. That value stays early (never late) because it combines a
+   and `lanes.ready_at`, computed in Go, for the lanes of every locked backlog that waits
+   (the lanes of a backlog that has no pending task are deleted). A lane the session could
+   not run is given only the admission time and the other pool's first refusal, which hold
+   for every handler: `greatest(ready_at, <their next admission time>)`. That value stays early (never late) because it combines a
    stored early value with the exact politeness time.
 
 7. Commit, then send the assignments.
@@ -489,8 +583,9 @@ first of:
 - a notification on `frontier_work_<pool name>`. A notification for a pool whose sessions
   have free credits runs the candidate query at once, not on the next loop tick (Temporal's
   sync match); notifications are coalesced to one run per loop iteration;
-- `NextReadyAt`, the earliest future `ready_at` in the pool below `'infinity'` (one index
-  probe on `backlogs_ready`);
+- `NextReadyAt`, the earliest future `ready_at` below `'infinity'` among the lanes the
+  session can run (one index probe on `lanes_ready` per handler). A loop with sessions that
+  have different handlers asks the store for each set in turn and waits for the earliest;
 - **20 ms, if the round passed over a locked queue row or claimed fewer tasks than admitted
   because rows were locked.** The holder (a finish, or a dispatch for another pool) may
   commit without changing readiness and so without a `NOTIFY`, and the queue's `ready_at`
@@ -520,9 +615,11 @@ pools and TTLs come from the core.
    Rows not returned are `DUPLICATE`.
 5. **Backlogs**, one upsert per (queue, run, pool) in primary key order:
    - `pending += added`, `tasks_total += added`, `discovered += added` (discovered only),
-     `duplicates += dup`, `over_budget += rejected`;
-   - `ready_at = least(ready_at, greatest(now(), min_not_before))`. This is done for a
-     paused run too: dispatch takes the backlog out again the first time it meets it.
+     `duplicates += dup`, `over_budget += rejected`.
+
+   **Lanes**, after the backlogs, one upsert per (queue, run, pool, handler) in primary key
+   order: `ready_at = least(ready_at, greatest(now(), min_not_before))`. This is done for a
+   paused run too: dispatch takes the lane out again the first time it meets it.
 6. **Run state:** `SELECT pg_advisory_xact_lock_shared(1, $run_no)`, then read `runs.state`.
    For seeds, anything but `open` rolls back the batch as `RUN_CLOSED`; for discoveries,
    anything but `open` or `sealed` does. Because the lock comes last, `SealRun` and
@@ -560,9 +657,10 @@ Used for worker completions (`Source = Worker`) and the reaper (`Source = Reaper
    `blocked_until = greatest(blocked_until, now() + $block)`, `block_reason = $code`.
 7. **Backlog** of the task: `in_flight -= 1`, result counter `+= 1`, `queue_blocks += 1` if
    blocked; for a retry `pending += 1` and
-   `ready_at = least(ready_at, now() + $retry_in)`. **Other locked backlogs on the queue:**
-   lower `ready_at` to their next admission time if the freed slot changes it (this is what
-   brings a backlog back from `'infinity'`), or raise it to the end of a new block.
+   `ready_at = least(ready_at, now() + $retry_in)` on the task's lane (it is added if the
+   backlog had deleted it). **The lanes of the other locked backlogs on the queue:** lower
+   `ready_at` to their next admission time if the freed slot changes it (this is what brings
+   a lane back from `'infinity'`), or raise it to the end of a new block.
 8. **`backlog_codes`:** `count += 1` for the outcome code.
 9. **Completion** if the backlog now has `pending = 0 AND in_flight = 0` (see below).
 10. Commit; `NOTIFY` if a backlog became ready.
@@ -584,8 +682,8 @@ of a run that was cancelled or has expired is not extended: it is reported as `S
 
 The operator call follows the lock order of Finish: create the queue row if it is missing,
 lock it `FOR NO KEY UPDATE`, lock its backlogs with pending tasks, set or clear
-`blocked_until`. A block raises the `ready_at` of those backlogs to its end. Lifting or
-shortening a block lowers every `ready_at` that lies in the future to `now()`: a value
+`blocked_until`. A block raises the `ready_at` of those backlogs' lanes to its end. Lifting
+or shortening a block lowers every `ready_at` that lies in the future to `now()`: a value
 that an earlier block raised would otherwise be late.
 
 ### Expired leases (reaper)
@@ -638,17 +736,17 @@ number of rows, whatever the size of the run, and the effect on backlogs is even
   is pinned to UTC as well.
 - **SealRun:** `state = 'sealed'`, then the completion check in the same transaction.
 - **PauseRun:** set `paused`, clear `resuming`. Backlogs are not touched: a dispatch that
-  meets a backlog of a paused run sets its `ready_at = NULL` (dispatch step 4), which takes
-  it out of the readiness index the first time it comes up.
+  meets a backlog of a paused run sets the `ready_at` of its lanes to `NULL` (dispatch
+  step 4), which takes them out of the readiness index the first time they come up.
 - **ResumeRun:** clear `paused`, set `resuming`. The replica that served the call then runs
   the resume sweep, and `Maintain` finishes it if that replica dies: in batches, each its
   own transaction in primary key order,
-  `UPDATE backlogs SET ready_at = now() WHERE run_no = $r AND pending > 0`,
-  with a `NOTIFY` per pool. Each batch re-reads the run and stops if it was paused again.
-  The last batch clears `resuming`. The sweep resets every backlog with pending tasks and
-  not only the ones with `NULL`: nothing keeps the readiness of a paused run up to date,
-  so a backlog may still wait (`'infinity'`) for a slot that was freed during the pause,
-  or for a block that was lifted. Dispatch works out the readiness again.
+  `UPDATE lanes SET ready_at = now() WHERE run_no = $r`, with a `NOTIFY` per pool. Each
+  batch re-reads the run and stops if it was paused again. The last batch clears `resuming`
+  if no lane of the run has `NULL`. The sweep resets every lane and not only the ones with
+  `NULL`: nothing keeps the readiness of a paused run up to date, so a lane may still wait
+  (`'infinity'`) for a slot that was freed during the pause, or for a block that was lifted.
+  Dispatch works out the readiness again.
 - **CancelRun:** `state = 'cancelled'`, `finished_at = now()`. Returns at once; dispatch
   skips the run's backlogs as for a paused run, and `Maintain` drains them.
 - **Deadline:** `Maintain` finds runs past `deadline` (`runs_active`) and ends them like
@@ -664,12 +762,13 @@ with `SKIP LOCKED`, or `pg_try_advisory_xact_lock` per job):
 
 | Job | Work |
 |---|---|
-| Task TTL | Per backlog with expired pending tasks (`tasks_ttl`): lock queue, backlog, expire tasks `SKIP LOCKED`, adjust `pending` / `expired`, recompute `ready_at`, completion check |
+| Task TTL | Per backlog with expired pending tasks (`tasks_ttl`): lock queue, backlog, expire tasks `SKIP LOCKED`, adjust `pending` / `expired`, recompute the lanes' `ready_at`, completion check |
 | Resume sweep | For runs with `resuming` (`runs_resuming`): the batches described under ResumeRun |
 | Cancel and deadline drain | Per backlog of a `cancelled` / `expired` run (`runs_draining`, `backlogs_active`): pending tasks to `cancelled` / `expired`; in-flight tasks to the same state with a `revoked` attempt; release `queues.in_flight`; adjust the ledger |
 | Partitions | Create next month's `tasks` and `attempts` partitions; drop partitions past retention, except in months where a run is still `open` / `sealed` or has tasks to drain |
 | Queues | Delete `queues` rows with no backlog rows and `last_used_at` older than a day: lock the candidates `FOR UPDATE SKIP LOCKED` (an add holding `KEY SHARE` makes the row skipped), re-check that no backlog exists, then delete |
 | Replicas | Delete replicas not seen for an hour |
+| Unserved handlers | Every minute at most, see Handlers below: lanes whose handler no replica has reported for the grace period are dropped if they are stale, and their old tasks are failed with code `no_handler` |
 | Ledger audit | Compare a sample of backlogs' `pending` / `in_flight` with counts from `tasks`, and count backlogs without a `queues` row; report both (they should be zero). One statement, so it sees one snapshot and can run under load |
 
 ### Start
@@ -679,9 +778,54 @@ the hash with the latest `activated_at`; if it is not this replica's, upsert thi
 `activated_at = now()`. That covers a new set and a rollback to an earlier one, and only the
 first replica of a rollout does it.
 
-If the set changed, `UPDATE backlogs SET ready_at = now() WHERE pending > 0 AND ready_at IS NOT NULL`
+If the set changed, `UPDATE lanes SET ready_at = now() WHERE ready_at IS NOT NULL`
 (in primary key order, in batches, each its own transaction; `'infinity'` is reset too,
-backlogs of paused and ended runs keep `NULL` on purpose) and `NOTIFY` every pool channel.
+lanes of paused and ended runs keep `NULL` on purpose) and `NOTIFY` every pool channel.
+
+### Handlers
+
+A replica reports the handlers its sessions can run (`ServeHandlers`) when they change and
+otherwise as a heartbeat, every `min(grace / 10, 1 minute)` (`-no-handler-grace` is at least
+four `Maintain` intervals): `INSERT INTO pool_handlers (pool, handler, seen_at) … ON CONFLICT
+DO UPDATE SET seen_at`, in key order. A session that names no handlers is the handler `''`:
+it can run any task of its pool, so while its row is newer than the grace period no handler
+of the pool is unserved.
+
+`SweepUnserved` is one bounded round. The replica asks every `min(grace / 4, 1 minute)`,
+and the store lets one round through per that time, whichever replica asks:
+
+```sql
+UPDATE unserved_sweep SET swept_at = now() WHERE swept_at <= now() - $every RETURNING <cursor>;
+```
+
+A replica that gets no row does nothing. The round finds the handlers that have lanes with
+a skip scan over `lanes_ready`, which reads one entry per (pool, handler) and not one per
+lane, and keeps the pairs with no `pool_handlers` row newer than the grace period, for the
+handler or for `''`. Then it walks the lanes of those pairs from the cursor, in the order of
+`lanes_ready` (`ready_at, queue_key, run_no`, a keyset page of at most 50), and looks at at
+most `maintainBacklogs` lanes, with a transaction of its own for each: the queue (`SKIP
+LOCKED`), then the backlogs as dispatch does. It checks whether the lane has a pending task
+through `tasks_claim_h`; if not, the lane is stale and is deleted. If it has, and the grace
+period has passed since the newest `replicas.started_at` (a restart of every replica must not
+fail tasks whose workers have not reconnected yet), it fails the pending tasks of the lane
+created at least a grace period ago, and keeps going on a lane while a transaction fails a
+full page of them (`maintainTasks`, `SKIP LOCKED`): `state = 'failed'`, one `attempts` row
+with code `no_handler` so that `GetTask` and `ListTasks` explain the failure,
+`backlogs.failed` and `backlog_codes` up by the count. The attempt was never dispatched, so
+`backlogs.attempts` does not change. A run that this empties completes. The round stores
+where it stopped in `unserved_sweep` and the next one, on any replica, goes on from there, so
+every lane is reached however many wait, and a round costs the same whatever their number.
+
+What waits is counted after the round, per (pool, handler), as the queues and runs that have
+lanes (up to 10,000), and returned with a flag that says whether this call is the one to log
+it: `unserved_sweep.reported_at` lets one call through per `min(grace, 10 minutes)`, so the
+replicas do not each log the same lines. The core logs it at `WARN`, and, while the
+restart guard holds back failures, a line that says so. This is what an operator sees of
+tasks that wait for a handler: `RunStats` counts them as pending.
+
+The registry is the only state about sessions that the store keeps. It says that some
+replica had a session with the handler lately, not which one, and not that the session has
+a free credit.
 
 ## Migrations
 
@@ -706,8 +850,28 @@ crawly-frontier migrate -postgres "$URL" status   # lists the migrations
 - **Concurrent runs:** the command holds a session advisory lock while it works, so
   several runs at once are safe: one applies the migrations and the others find nothing
   to do. The lock needs a direct connection, not one through a transaction pooler.
-- **Forward only:** the command applies migrations and reports their state. There is no
-  command to roll a migration back.
+- **Expand, then contract:** a migration only adds what the build before does not know, and
+  keeps what it reads and writes working. What the new build replaces is dropped by a later
+  migration, once no replica of the build before runs. Migration 2 (handler lanes) is an
+  expand step: it adds `tasks.handler`, `lanes`, `pool_handlers`, `unserved_sweep` and two
+  indexes on `tasks`, and keeps `backlogs.ready_at`, `backlogs_ready`, `tasks_claim` and
+  `tasks_next`, which the build before claims by. The two triggers of Lanes keep the old
+  and the new readiness in step while both builds run. The contract migration drops the
+  column, its index, the triggers, and the old two indexes, and the store refuses a
+  database below the version that added what it needs.
+- **No lock that stops the tasks:** migration 2 sets `lock_timeout` to 5 s for its own
+  transaction, so that it fails, and can be run again, instead of queueing behind a long
+  query with every operation queued behind it. Its indexes on `tasks` are declared on the
+  parent only (`CREATE INDEX … ON ONLY`), and the command builds them on each existing
+  partition after the migration with `CREATE INDEX CONCURRENTLY`, which waits for running
+  transactions but blocks no write, and attaches them. It checks them at every run and
+  finishes an interrupted build; a partition made later gets them from the parent. The
+  store works without them, slower, until they exist.
+- **Rolling back:** the migrations are forward only in normal use: no command rolls one back.
+  Because migration 2 only adds, the build before runs on the migrated schema, so going back
+  is stopping the new replicas. Removing its objects is a decision of its own: stop every
+  replica of the new build, then run goose `down` for version 2 by hand. It drops the
+  objects and leaves `backlogs.ready_at` current; tasks keep no memory of their handler.
 - **Partitions:** the monthly partitions of `tasks` and `attempts` are not migrations.
   The store creates and drops them as time passes.
 
@@ -717,7 +881,7 @@ crawly-frontier migrate -postgres "$URL" status   # lists the migrations
   after the retention period. No bulk `DELETE`. A month is kept while one of its runs is
   not ended or still has pending or in-flight tasks, because their tasks live in that
   partition and a lease of a dropped task could never be finished.
-- `runs`, `run_events`, `backlogs`, `backlog_codes`: deleted with the run after a longer
+- `runs`, `run_events`, `backlogs`, `lanes`, `backlog_codes`: deleted with the run after a longer
   retention, kept for run comparisons. The delete locks the run before its backlogs, which
   is the reverse of the lock order. It is allowed because it only takes ended runs whose
   backlogs have no pending or in-flight tasks, so nothing else locks those backlogs. The
@@ -731,7 +895,7 @@ crawly-frontier migrate -postgres "$URL" status   # lists the migrations
   lost dispatch (the lease nonce), but a lost dispatch also loses the queue's politeness
   update, which allows a burst after a crash. Group commit keeps the fsync cost low under
   concurrent sessions.
-- **Autovacuum:** per table on `tasks` partitions, `backlogs` and `queues`:
+- **Autovacuum:** per table on `tasks` partitions, `backlogs`, `lanes` and `queues`:
   `autovacuum_vacuum_scale_factor = 0.01`, `autovacuum_vacuum_cost_limit` raised. All
   updates on these tables are non-HOT by design. `queues` has one row per host;
   `backlogs` grows with retained runs, but only rows with pending tasks are in its hot
@@ -768,6 +932,14 @@ of one core at peak and leaves the second core for autovacuum, WAL and the candi
 queries. It is an example, not a design target: a larger instance scales the per-vCPU
 figures above until one of the limits below binds, and past that the scaling path applies.
 
+Handlers add to this. A backlog writes one lane row for each handler it has that waits, where
+it wrote one backlog row before, and a lane update is non-HOT across four indexes
+(`lanes_ready_pool` serves only sessions that name no handlers); a session that names
+handlers reads one index range per handler, which is why a session names at most 64. Until
+the contract migration, `tasks` also carries the two partial indexes of the build before,
+so a pending task is in four partial indexes. Dispatch does one candidate query per distinct
+set of handlers among a pool's sessions that found nothing in the round.
+
 What binds first on a single primary, in order: CPU (seven indexes on `tasks`,
 non-HOT updates), fsync rate (two to three commits per task; group commit hides it with ten
 or more sessions), memory for the dedup index of open runs.
@@ -786,7 +958,7 @@ and the ledger audit metric.
 
 - share of dispatches served on a notification without waiting for a loop tick (Temporal's
   sync-match rate);
-- backlog age per pool: the oldest `ready_at` in the past among `backlogs_ready`;
+- backlog age per pool: the oldest `ready_at` in the past among `lanes_ready_pool`;
 - ready-to-dispatched latency per pool (Temporal's schedule-to-start): dispatch time minus
   the backlog's `ready_at` at claim, as a histogram.
 
@@ -810,7 +982,7 @@ Not built now; the schema is ready for it.
    work (a bucket the replica does not own) is dispatched without in-memory state, through
    the ordinary transactions above. The `bucket_leases` row lock comes before `queues` in
    the lock order.
-3. **Sharded primaries.** Each shard holds `queues`, `backlogs`, `backlog_codes`, `tasks`
+3. **Sharded primaries.** Each shard holds `queues`, `backlogs`, `lanes`, `backlog_codes`, `tasks`
    and `attempts` for a range of buckets; a small control database holds `runs`,
    `run_events`, `replicas`, `policy_sets` and `pools`. Every hot transaction stays on one
    shard because everything it writes is keyed by one queue (dedup included, since the
@@ -830,6 +1002,13 @@ On top of `storetest` (ADR 0001):
 - Kill the primary connection between claim and commit: the task is pending again and no
   lease with the lost nonce is accepted.
 - Ledger audit reports zero difference after a randomized workload.
+- `EXPLAIN` of the candidate, claim, sweep and sweep-page queries reads indexes only: one
+  `lanes_ready` or `tasks_claim_h` range per handler, no sort of the page, no scan of the
+  table (`TestQueryPlans`).
+- The migration that introduces lanes gives every waiting backlog one lane for handler `''`
+  with the readiness it had, and the build before keeps working on the migrated schema: its
+  statements find the work that this build adds, and its writes reach the lanes
+  (`TestMigrationKeepsPreviousBuildWorking`). Rolling it back leaves that schema.
 - A pause or cancel committing while a dispatch waits for a backlog lock on the queue: the
   dispatch claims nothing from that run.
 - Pause, resume and cancel on a run with 100,000 backlogs each commit in constant time; the
@@ -843,7 +1022,7 @@ On top of `storetest` (ADR 0001):
 - No run-level row is written on the hot path; the hottest rows are one queue's `queues` and
   `backlogs` rows, written at that queue's dispatch rate.
 - The readiness index is small and churny by design. It depends on invariant "early, never
-  late", enforced by every operation above and checked by `storetest`'s property test.
+  late", enforced by every operation above and checked by `storetest`'s property test (`RoutingProperty`: random adds, dispatches by sessions with random handlers, finishes and time under a concurrency limit; nothing is dispatched to a session without its handler and every task runs) and by tests that fail when a lane is not woken or a later task delays a ready one.
 - `GetRun` and `WatchRuns` stats cost a scan of the run's backlogs instead of one row, which
   grows with the queues a run has work on (ADR 0001, Scaling model and limits).
 - Run IDs and fingerprints are compact in indexes (`run_no`, 16 bytes); the API keeps the

@@ -178,7 +178,8 @@ belong to an implementation and its deployment (ADR 0002 has them for the first 
    [Locality rule](#locality-rule)). This is what keeps a single database contention-free
    and what makes every implementation shardable by queue.
 8. **Workers subscribe to named pools**, as Temporal workers poll a task queue. A task names
-   its pool; a worker session serves exactly one pool. There is no capability matching
+   its pool; a worker session serves exactly one pool and names the handlers it can run, and
+   is given only tasks of those handlers. There is no label or capability matching
    (ADR 0003).
 
 ## Responsibilities
@@ -239,8 +240,8 @@ type Work interface {
 	// AddTasks adds seeds (req.Parent == nil; run must be OPEN) or discovered tasks
 	// (req.Parent set; the parent lease must be live). One result per task, in order.
 	AddTasks(ctx context.Context, req AddRequest) ([]AddResult, error)
-	// Dispatch claims up to req.Slots tasks of req.Pool, following the scheduling model.
-	// It never blocks waiting for work. It is atomic per queue, not per call: it can
+	// Dispatch claims up to req.Slots tasks of req.Pool that the session can run
+	// (req.Handlers), following the scheduling model. It never blocks waiting for work. It is atomic per queue, not per call: it can
 	// return assignments together with an error, and the caller must deliver every
 	// assignment it returns, because those claims are committed.
 	Dispatch(ctx context.Context, req DispatchRequest) (DispatchResult, error)
@@ -273,6 +274,14 @@ type Background interface {
 	// last (a new set or a rollback) resets readiness, so no backlog stays parked by a
 	// limit that no longer applies.
 	Start(ctx context.Context, r Replica) error
+	// ServeHandlers records that this replica has sessions that can run these handlers
+	// ("" stands for a session that names none and can run any). It is called when the
+	// sessions change and, while they stay, as a heartbeat.
+	ServeHandlers(ctx context.Context, sets []PoolHandlers) error
+	// SweepUnserved fails the pending tasks whose handler no replica has reported for
+	// grace (code "no_handler", no attempt dispatched) and reports the handlers whose
+	// tasks wait. Nothing fails before grace has passed since the newest replica started.
+	SweepUnserved(ctx context.Context, grace time.Duration) (Unserved, error)
 	// Notifications delivers coalesced wake-ups: work became ready in a pool, or a
 	// run event was appended. A missed notification only delays work until the next
 	// DispatchResult.NextReadyAt or poll.
@@ -334,6 +343,7 @@ type NewTask struct {
 	Fingerprint Fingerprint   // 16 bytes: hash(queue key ‖ canonical request or dedup_key)
 	Queue       QueueKey
 	Pool        PoolName      // TaskSpec.pool, default "default"
+	Handler     string        // TaskSpec.handler; empty: unknown, any session may try it
 	Priority    int32
 	NotBefore   time.Time     // zero: immediately
 	TTL         time.Duration // resolved Behaviour.task_ttl; 0: none
@@ -344,7 +354,10 @@ type DispatchRequest struct {
 	Session SessionID  // chosen by the pool's dispatch loop before the call
 	Worker  WorkerInfo // id and version, recorded on the attempt
 	Pool    PoolName   // the session's pool
-	Slots   int        // the session's free credits
+	// Handlers the session can run. Only tasks of these handlers, and tasks of unknown
+	// handler, are claimed. Empty: every task of the pool is claimed.
+	Handlers []string
+	Slots    int        // the session's free credits
 }
 
 type DispatchResult struct {
@@ -390,12 +403,14 @@ The rules every implementation follows. `sched` implements the arithmetic.
   a GCRA timestamp `tat`, the number of tasks in flight, a block (`blocked_until`, reason)
   and a fair-queueing clock `vclock`.
 - **Pool**: a named set of workers that execute the same kind of task, e.g. `default` or
-  `browser`. A task names its pool; a worker session serves one pool. A worker that lacks
-  the task's handler hands it back for another worker of the pool (ADR 0003).
+  `browser`. A task names its pool and its handler; a worker session serves one pool and
+  names the handlers it can run (ADR 0003).
 - **Backlog**: the tasks of one run on one queue in one pool. Holds `pending`
   (not dispatched, including delayed), `in_flight`, a fair-queueing tag `vtime`, an own
-  GCRA timestamp `own_tat` (used only under a run override), counters for stats, and
-  `ready_at`.
+  GCRA timestamp `own_tat` (used only under a run override) and counters for stats.
+- **Lane**: the tasks of one handler in a backlog. Holds `ready_at`. Lanes exist so that a
+  session finds work it can run without reading past work it cannot; they carry no
+  fairness, politeness or counters, which stay per backlog.
 - **Bucket**: `hash(queue key) mod 256`. Every piece of hot state belongs to exactly one
   queue and therefore one bucket. Implementations may use buckets to spread or shard state;
   the model does not depend on them.
@@ -482,19 +497,29 @@ allowances there.
 
 ### Selection order
 
-1. **Across queues:** the store keeps a readiness index of backlogs by `ready_at`, the
-   earliest time the backlog could have a task admitted (task `not_before`, politeness,
-   block, another pool's first refusal). A backlog that waits for an event, not a time (a
-   concurrency slot), is kept out of the index until that event makes it ready. Dispatch
-   takes queues in `ready_at` order. `ready_at` **may be early, never
+1. **Across queues:** the store keeps a readiness index of lanes by `ready_at`, the
+   earliest time a task of the lane could be admitted (task `not_before`, politeness,
+   block, another pool's first refusal). A lane that waits for an event, not a time (a
+   concurrency slot), is kept out of the index until that event makes it ready. A session
+   reads the index for the handlers it can run and for no others, so unrunnable work never
+   stands in its way. Dispatch takes queues in `ready_at` order. `ready_at` **may be early, never
    late**: an early value costs one refused check, a late one leaves work idle. Every
    change that can make work eligible sooner (new tasks, a freed concurrency slot, a
    retry, an unblock, a resume, a new policy set) lowers it in the same operation.
 2. **Within a queue:** fairness, as above.
-3. **Within a backlog:** higher `priority` first, then insertion order.
+3. **Within a backlog:** higher `priority` first, then insertion order, among the tasks of
+   the handlers the session can run. Priority therefore orders a run's tasks on a queue
+   across handlers, as it did before handlers were part of dispatch.
 
-Tasks are claimed only from the session's pool. A queue's politeness state and fairness
-clock are shared across pools.
+Tasks are claimed only from the session's pool, and only those of its handlers. A queue's
+politeness state and fairness clock are shared across pools. Work no session can run costs
+no politeness slot and no share: it is never dispatched, so it advances neither. In its own
+pool it is not offered to anyone. In another pool, a backlog gets first refusal on a shared
+queue only if a session of that pool, as the pool's replicas last reported, can run some of
+its work, so work nobody can run neither holds the queue nor wakes the pool. One residue: a
+session is reported some seconds after it connects, and a replica of a build that does not
+report leaves its pool without reports, and in both cases that pool's work of named
+handlers has no first refusal for a while.
 
 **Fairness comes before priority.** Temporal does the opposite: strict priority tiers are
 dispatched before fairness applies. For a crawler that would let a high-priority run take a
@@ -597,9 +622,9 @@ bucket, so no implementation needs a cross-partition write to add a task.
 - Stats are exact counters kept on backlogs and summed on read. A read is not a snapshot
   across backlogs: during dispatch, `pending + in_flight` can be off by the tasks moving
   between them.
-- `RunStats.delayed` is the pending tasks of backlogs whose `ready_at` is in the future, and
-  `RunStats.pending` the rest. It is approximate: `ready_at` covers politeness and blocks as
-  well as `not_before`, and is per backlog, not per task.
+- `RunStats.delayed` is the pending tasks whose `not_before` is in the future, and
+  `RunStats.pending` the rest. Tasks that wait for a session with their handler count as
+  pending.
 
 ### Locality rule
 
@@ -635,7 +660,7 @@ tens of times a day. So:
   that dispatched it, and each replica exports its hash as a metric, so drift is visible.
 - On `Start`, a replica registers its policy hash. If it differs from the hash registered
   last (a new set, or a rollback to an earlier one), the replica resets `ready_at` of active
-  backlogs to now, so no backlog stays parked by another set's stricter limit (readiness
+  lanes to now, so no backlog stays parked by another set's stricter limit (readiness
   must never be late).
 
 ## Implementations
@@ -646,7 +671,7 @@ and the `Store` interface unchanged.
 | Concern | PostgreSQL, single primary (ADR 0002) | Sharded PostgreSQL | PostgreSQL + Redis | FoundationDB |
 |---|---|---|---|---|
 | Atomic dispatch | One transaction per queue; queue row locked with `SKIP LOCKED` | Same, on the queue's shard | Redis script admits and advances politeness and fairness; PostgreSQL claims the task; refund script if the claim comes back short | One transaction |
-| Readiness index | Partial index on backlogs by `ready_at` | Per shard; replicas own buckets and steal from others when idle | Sorted set per pool | Ordered keys `(pool, ready_at, queue)` |
+| Readiness index | Partial index on lanes by `(pool, handler, ready_at)` | Per shard; replicas own buckets and steal from others when idle | Sorted set per pool | Ordered keys `(pool, handler, ready_at, queue)` |
 | Dedup | Unique index on `(run, fingerprint)` | Same, single shard because the fingerprint includes the queue key | PostgreSQL unique index | Key `(run, fingerprint)` |
 | Run completion | Per-run lock taken only when a backlog empties | Empty the backlog on the shard, then the run lock in a control database and a read of the run's backlogs on every shard it touched; the sweeper re-checks sealed runs after a crash in between | As single PostgreSQL | Serializable read of the run's backlog range |
 | Seed vs seal race | Shared/exclusive per-run lock | The shared lock is taken in the control database and held while the shard commits | As single PostgreSQL | Conflict on the run key |
@@ -698,6 +723,8 @@ supports it. Each one names the rule it proves:
 | `RunEvents` resumed from any cursor under concurrent transitions never misses or repeats an event | Event order |
 | A backlog whose tasks have all expired stops being selected without waiting for `Maintain` | No spin on expired tasks |
 | No `ready_at` is ever later than the true eligible time (property test over random operations) | Readiness never late |
+| A session with handlers is given only tasks of those handlers, in priority order across them; tasks no session can run take no politeness slot and do not hide the tasks behind them | Dispatch by handler |
+| A task whose handler no session has had for the grace period fails with `no_handler`; a handler a session reports keeps its tasks | Unserved handlers |
 | Pause, resume and cancel racing dispatch and finish: a dispatch that starts after pause or cancel returns takes nothing from the run; a task handed out during the race is drained or completes normally; after resume every backlog with pending tasks becomes ready | Lifecycle (eventual) |
 | A policy set on `Start` that differs from the last one (new, or rolled back) makes every active backlog ready | Policy rollout |
 | Concurrent dispatch, finish and discover across queues of one run for a minute: no internal conflict is surfaced as an error | Atomicity |
