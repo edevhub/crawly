@@ -56,7 +56,9 @@ func (s *Store) resetReadiness(ctx context.Context) error {
 	var pool int16
 	for {
 		n := 0
+		nextQueue, nextRun, nextPool := queue, run, pool
 		err := s.tx(ctx, func(tx pgx.Tx, now time.Time) error {
+			nextQueue, nextRun, nextPool = queue, run, pool
 			rows, err := tx.Query(ctx, `WITH c AS (
 					SELECT queue_key, run_no, pool_id FROM backlogs
 					WHERE pending > 0 AND ready_at IS NOT NULL AND (queue_key, run_no, pool_id) > ($1, $2, $3)
@@ -73,8 +75,8 @@ func (s *Store) resetReadiness(ctx context.Context) error {
 			var p int16
 			_, err = pgx.ForEachRow(rows, []any{&k, &r, &p}, func() error {
 				n++
-				if k > queue || (k == queue && (r > run || (r == run && p > pool))) {
-					queue, run, pool = k, r, p
+				if k > nextQueue || (k == nextQueue && (r > nextRun || (r == nextRun && p > nextPool))) {
+					nextQueue, nextRun, nextPool = k, r, p
 				}
 				return nil
 			})
@@ -86,6 +88,7 @@ func (s *Store) resetReadiness(ctx context.Context) error {
 		if n == 0 {
 			break
 		}
+		queue, run, pool = nextQueue, nextRun, nextPool // only now: a transaction that is tried again starts where it did
 	}
 	rows, err := s.db.Query(ctx, "SELECT pg_notify($1 || name, '') FROM pools", channelWork)
 	if err != nil {
@@ -117,9 +120,12 @@ func (s *Store) Notifications(ctx context.Context) (<-chan store.Notification, e
 		drop()
 		return nil, ctx.Err()
 	}
-	if s.lerr != nil {
+	s.mu.Lock()
+	err := s.lerr
+	s.mu.Unlock()
+	if err != nil {
 		drop()
-		return nil, wrap(s.lerr)
+		return nil, wrap(err)
 	}
 	go func() {
 		<-ctx.Done()
@@ -148,10 +154,16 @@ func (s *Store) listener() {
 	first := true
 	for s.ctx.Err() == nil {
 		err := s.listenOnce(s.ctx, func(err error) {
+			s.mu.Lock()
+			s.lerr = err
+			s.mu.Unlock()
 			if first {
 				first = false
-				s.lerr = err
 				close(s.ready)
+			}
+			if err == nil {
+				// Runs deleted while the connection was down were not announced.
+				s.forgetAll()
 			}
 		})
 		if s.ctx.Err() != nil {
@@ -218,6 +230,10 @@ func (s *Store) listenOnce(ctx context.Context, connected func(error)) error {
 		}
 		switch n.Channel {
 		case channelRuns:
+			if n.Payload == runsDeleted {
+				s.forgetAll()
+				continue
+			}
 			s.send(store.Notification{Runs: true})
 		case channelPools:
 			if err := subscribe(); err != nil {
@@ -544,6 +560,8 @@ func (s *Store) retain(ctx context.Context, now time.Time) error {
 	if s.keepRuns <= 0 {
 		return nil
 	}
+	// The run is locked before its backlogs, against the lock order: these backlogs
+	// have no work left, so nothing else locks them.
 	rows, err := s.db.Query(ctx, `WITH old AS (
 			SELECT run_no FROM runs r WHERE state IN ('completed', 'cancelled', 'expired') AND finished_at < $1
 				AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.run_no = r.run_no AND (b.pending > 0 OR b.in_flight > 0))
@@ -558,17 +576,18 @@ func (s *Store) retain(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return wrap(err)
 	}
-	s.mu.Lock()
-	for _, no := range nos {
-		if m, ok := s.runsByNo[no]; ok {
-			delete(s.runsByNo, no)
-			delete(s.runsByID, m.spec.ID)
-			delete(s.totals, no)
-		}
+	if len(nos) == 0 {
+		return nil
 	}
-	s.mu.Unlock()
-	return nil
+	s.forgetAll()
+	// The other replicas cache the deleted runs too, and a run ID is free again.
+	_, err = s.db.Exec(ctx, "SELECT pg_notify($1, $2)", channelRuns, runsDeleted)
+	return wrap(err)
 }
+
+// runsDeleted is the payload on the runs channel that tells replicas to drop their
+// run cache.
+const runsDeleted = "deleted"
 
 // AuditReport is the result of a ledger audit. Every figure but Checked should be zero.
 type AuditReport struct {

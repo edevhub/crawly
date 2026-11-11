@@ -43,7 +43,7 @@ type Store struct {
 	ctx    context.Context    //nolint:containedctx // the lifetime of the listener, ended by Close
 	listen sync.Once
 	ready  chan struct{} // closed once the listener has connected, or failed to
-	lerr   error         // why the listener failed to connect the first time
+	lerr   error         // why the listener is not connected; nil while it is
 
 	mu       sync.Mutex
 	runsByID map[store.RunID]*runMeta
@@ -191,7 +191,8 @@ func wrap(err error) error {
 		errors.Is(err, store.ErrLeaseStale), errors.Is(err, store.ErrLeaseUnknown), errors.Is(err, store.ErrUnavailable),
 		errors.Is(err, errRunClosed):
 		return err
-	case pgCode(err) != "":
+	case pgCode(err) != "", errors.Is(err, pgx.ErrNoRows):
+		// An answer from the server, though not the expected one.
 		return fmt.Errorf("pgstore: %w", err)
 	}
 	// Not an answer from the server: the connection failed.
@@ -371,6 +372,16 @@ func (s *Store) forget(m *runMeta) {
 	delete(s.runsByNo, m.no)
 	delete(s.runsByID, m.spec.ID)
 	delete(s.totals, m.no)
+	s.mu.Unlock()
+}
+
+// forgetAll empties the run cache. Another replica deleted runs: a run ID may be in
+// use again for a new run.
+func (s *Store) forgetAll() {
+	s.mu.Lock()
+	clear(s.runsByNo)
+	clear(s.runsByID)
+	clear(s.totals)
 	s.mu.Unlock()
 }
 

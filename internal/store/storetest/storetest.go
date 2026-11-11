@@ -404,8 +404,8 @@ func Run(t *testing.T, f Factory) {
 		if st := e.finish(first, store.ResultReleased); st != store.FinishAccepted {
 			t.Fatalf("release: %v", st)
 		}
-		if st := e.state(r).Stats; st.Pending != 1 || st.InFlight != 0 {
-			t.Fatalf("a released task must be pending again: %+v", st)
+		if st := e.state(r).Stats; st.Pending != 1 || st.InFlight != 0 || st.Attempts != 0 {
+			t.Fatalf("a released task must be pending again, without an attempt: %+v", st)
 		}
 		// The old lease is dead.
 		if st := e.finish(first, store.ResultSucceeded); st == store.FinishAccepted {
@@ -422,6 +422,9 @@ func Run(t *testing.T, f Factory) {
 		task, err := e.s.GetTask(ctx, r, first.Info.Task, nil)
 		if err != nil || len(task.Attempts) != 1 {
 			t.Fatalf("one attempt must be recorded, got %+v %v", task.Attempts, err)
+		}
+		if st := e.state(r).Stats; st.Attempts != 1 {
+			t.Fatalf("the run must count one attempt: %+v", st)
 		}
 	})
 

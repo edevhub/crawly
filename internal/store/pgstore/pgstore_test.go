@@ -465,3 +465,38 @@ func TestResumeAfterBlockLiftedDuringPause(t *testing.T) {
 		t.Fatalf("dispatched %d after the block was lifted and the run resumed", len(got))
 	}
 }
+
+// A replica that cached a run forgets it when another replica deletes it after its
+// retention, so it sees the run that takes the ID next.
+func TestRunCacheAfterRetention(t *testing.T) {
+	dsn := pgtest.Schema(t)
+	clock := storetest.NewClock()
+	cleaner := open(t, dsn, limits(store.Limits{}), pgstore.WithClock(clock.Now), pgstore.WithRetention(0, time.Hour))
+	other := open(t, dsn, limits(store.Limits{}), pgstore.WithClock(clock.Now))
+	must(other.Notifications(ctx))(t) // starts the listener
+
+	r := createRun(t, cleaner, "r")
+	first := must(other.GetRun(ctx, r))(t) // cached by the other replica
+	must(cleaner.CancelRun(ctx, r))(t)
+	clock.Advance(2 * time.Hour)
+	if err := cleaner.Maintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	createRun(t, cleaner, "r")
+	must(cleaner.AddTasks(ctx, store.AddRequest{Run: r, Tasks: tasks("q", 2)}))(t)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		run, err := other.GetRun(ctx, r)
+		if err == nil && run.Stats.Pending == 2 && run.State == store.RunOpen {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the other replica still sees the deleted run: %+v %v (first %+v)", run, err, first.State)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got, _, err := other.ListTasks(ctx, store.TaskFilter{Run: r}, store.Page{}); err != nil || len(got) != 2 {
+		t.Fatalf("listed %d tasks of the new run: %v", len(got), err)
+	}
+}

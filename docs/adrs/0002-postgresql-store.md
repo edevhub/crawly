@@ -280,8 +280,8 @@ Partitions are monthly, created ahead of time by `Maintain`. All tasks of a run 
 run's `created_on`, so the dedup constraint is valid on the partitioned table and every
 run-scoped query names one partition.
 
-`tasks_claim` includes `not_before` and `expires_at`, so a claim passes over tasks that wait
-for a retry backoff without visiting the heap.
+`tasks_claim` includes `not_before` and `expires_at`. A claim locks rows, so it still
+fetches the heap tuple of a task that waits for a retry backoff before it passes over it.
 
 `spec` is stored out of line from a few hundred bytes up, so state transitions copy a small
 heap tuple and only dispatch reads the spec (one TOAST fetch).
@@ -690,7 +690,11 @@ backlogs of paused and ended runs keep `NULL` on purpose) and `NOTIFY` every poo
   not ended or still has pending or in-flight tasks, because their tasks live in that
   partition and a lease of a dropped task could never be finished.
 - `runs`, `run_events`, `backlogs`, `backlog_codes`: deleted with the run after a longer
-  retention, kept for run comparisons.
+  retention, kept for run comparisons. The delete locks the run before its backlogs, which
+  is the reverse of the lock order. It is allowed because it only takes ended runs whose
+  backlogs have no pending or in-flight tasks, so nothing else locks those backlogs. The
+  replica then sends `deleted` on `frontier_runs`, and every replica drops its run cache,
+  because a run ID is free again after the delete.
 - Raw responses live in object storage (`response_ref`) under their own retention.
 
 ## Operational settings

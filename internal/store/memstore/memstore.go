@@ -701,6 +701,7 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 	if f.Result == store.ResultReleased {
 		// The assignment never reached a worker: the attempt did not happen.
 		t.attempt--
+		r.stats.Attempts--
 		t.state, t.notBefore = store.TaskPending, now
 		if !t.expiresAt.IsZero() {
 			s.ttl[t] = struct{}{}

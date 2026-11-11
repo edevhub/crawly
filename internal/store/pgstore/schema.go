@@ -272,6 +272,24 @@ func (s *Store) ensureMonth(ctx context.Context, t time.Time) error {
 	return nil
 }
 
+// dropPartition drops one partition under the schema lock. The drop needs an
+// exclusive lock on the parent table for a moment; the pool's lock timeout keeps it
+// from queueing behind a long transaction with everything else behind it.
+func (s *Store) dropPartition(ctx context.Context, name string) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int, 0)", lockSchema); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "DROP TABLE IF EXISTS "+pgx.Identifier{name}.Sanitize()); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // dropOldPartitions drops the tasks and attempts partitions whose every run was
 // created before the cut-off. A month is kept while one of its runs is open or
 // sealed, or still has tasks to drain: their tasks live in the partition.
@@ -307,7 +325,10 @@ func (s *Store) dropOldPartitions(ctx context.Context, cutoff time.Time) error {
 		if busy {
 			continue
 		}
-		if _, err := s.db.Exec(ctx, "DROP TABLE IF EXISTS "+pgx.Identifier{name}.Sanitize()); err != nil {
+		if err := s.dropPartition(ctx, name); err != nil {
+			if pgCode(err) == codeLockTimeout {
+				continue // the table is busy: the next Maintain tries again
+			}
 			return fmt.Errorf("pgstore: dropping partition %s: %w", name, err)
 		}
 		s.mu.Lock()

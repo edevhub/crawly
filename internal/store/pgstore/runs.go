@@ -194,8 +194,10 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 	var pool int16
 	for {
 		done := false
+		nextQueue, nextPool := queue, pool
 		err := s.tx(ctx, func(tx pgx.Tx, now time.Time) error {
 			done = false
+			nextQueue, nextPool = queue, pool
 			var name string
 			var paused, resuming bool
 			err := tx.QueryRow(ctx, "SELECT state::text, paused, resuming FROM runs WHERE run_no = $1", no).Scan(&name, &paused, &resuming)
@@ -217,7 +219,6 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 				return err
 			}
 			pools := map[int16]bool{}
-			nextQueue, nextPool := queue, pool
 			var k string
 			var p int16
 			if _, err := pgx.ForEachRow(rows, []any{&k, &p}, func() error {
@@ -231,18 +232,19 @@ func (s *Store) resumeSweep(ctx context.Context, no int64) error {
 			}
 			if len(pools) == 0 {
 				done = true
-				_, err := tx.Exec(ctx, "UPDATE runs SET resuming = false WHERE run_no = $1 AND NOT paused", no)
+				// The mark is cleared only if no backlog is left out of the readiness
+				// index: a pause and a second resume may have come in since this
+				// sweep began, and that resume's sweep still has work to do then.
+				_, err := tx.Exec(ctx, `UPDATE runs r SET resuming = false WHERE run_no = $1 AND NOT paused
+					AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.run_no = r.run_no AND b.pending > 0 AND b.ready_at IS NULL)`, no)
 				return err
 			}
-			if err := s.wake(ctx, tx, pools); err != nil {
-				return err
-			}
-			queue, pool = nextQueue, nextPool
-			return nil
+			return s.wake(ctx, tx, pools)
 		})
 		if err != nil || done {
 			return err
 		}
+		queue, pool = nextQueue, nextPool // only now: a transaction that is tried again starts where it did
 	}
 }
 
