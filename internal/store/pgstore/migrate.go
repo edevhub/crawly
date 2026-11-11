@@ -181,9 +181,14 @@ func buildTaskIndexes(ctx context.Context, db *sql.DB) error {
 			if attached {
 				continue
 			}
+			// A concurrent build or drop waits for the transactions that were open when
+			// it began and stops nobody while it waits, so the lock timeout is lifted
+			// for it: one long transaction would otherwise fail the build.
 			for _, stmt := range []string{
+				"SET lock_timeout = 0",
 				"DROP INDEX CONCURRENTLY IF EXISTS " + name,
 				"CREATE INDEX CONCURRENTLY " + name + " ON " + pgx.Identifier{part}.Sanitize() + " " + ix.columns,
+				"RESET lock_timeout",
 				"ALTER INDEX " + ix.parent + " ATTACH PARTITION " + name,
 			} {
 				if _, err := conn.ExecContext(ctx, stmt); err != nil {
