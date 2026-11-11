@@ -14,8 +14,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -23,6 +26,7 @@ import (
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/poolname"
 	"github.com/edevhub/crawly/internal/safeconv"
+	"github.com/edevhub/crawly/internal/wire"
 )
 
 // DefaultPool is the pool a handler serves unless registered with InPool.
@@ -179,11 +183,27 @@ func (w *Worker) Register(name string, h Handler, opts ...RegisterOption) error 
 	return nil
 }
 
+// Pools returns the pools the registered handlers serve, sorted.
+func (w *Worker) Pools() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var pools []string
+	for _, r := range w.handlers {
+		if !slices.Contains(pools, r.pool) {
+			pools = append(pools, r.pool)
+		}
+	}
+	slices.Sort(pools)
+	return pools
+}
+
 // Run connects to the Frontier and processes tasks until ctx is cancelled. It then
 // stops taking work, lets running handlers finish (up to the shutdown grace), reports
-// them and returns. Handlers still running when the grace passes are cancelled, and
-// Run waits a few more seconds for them to return; a handler that ignores its context
-// beyond that is abandoned, and logged.
+// them and returns. Handlers still running when the grace passes are cancelled and
+// their tasks handed back to the Frontier, which gives them to another worker without
+// counting an attempt. Run waits a few more seconds for the cancelled handlers to
+// return; a handler that ignores its context beyond that is abandoned, and logged, and
+// its task waits for its lease to expire.
 func (w *Worker) Run(ctx context.Context) error {
 	w.mu.Lock()
 	if w.started {
@@ -202,7 +222,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	// Keepalive pings notice a Frontier that vanished without closing the connection.
 	// The caller's options come last, so they can override it.
 	dial := append([]grpc.DialOption{grpc.WithKeepaliveParams(keepalive.ClientParameters{
-		Time: 30 * time.Second, Timeout: 10 * time.Second})}, w.dial...)
+		Time: 30 * time.Second, Timeout: 10 * time.Second}),
+		// An assignment is a task with what the Frontier adds to it. The room above the
+		// task limit takes a task that was stored before there was one.
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxAssignmentBytes))}, w.dial...)
 	conn, err := grpc.NewClient(w.target, dial...)
 	if err != nil {
 		return err
@@ -237,6 +260,8 @@ type runner struct {
 	credits  int                // granted on the current stream and not used by an assignment yet
 	unacked  []*report          // in the order the handlers finished
 	draining bool
+	cut      bool          // the shutdown grace passed: handlers were cancelled
+	releases bool          // the Frontier of the current session takes a task back
 	idle     chan struct{} // signalled when nothing runs and nothing is unacknowledged
 	handlers sync.WaitGroup
 }
@@ -266,16 +291,26 @@ type report struct {
 }
 
 func (r *runner) run(ctx context.Context) {
-	// Handlers and sessions outlive ctx by the shutdown grace.
+	// Handlers and sessions outlive ctx by the shutdown grace. The session outlives
+	// the handlers: what was cut is handed back before it closes.
 	base, stop := context.WithCancel(context.WithoutCancel(ctx))
 	defer stop()
+	hctx, cut := context.WithCancel(base)
 	go func() {
 		<-ctx.Done()
 		r.drain()
 		select {
 		case <-r.idle:
 		case <-time.After(r.w.grace):
-			r.w.log.Warn("shutdown grace passed with tasks still running", "pool", r.pool)
+			r.w.log.Warn("shutdown grace passed with tasks still running: handing them back", "pool", r.pool)
+			r.mu.Lock()
+			r.cut = true
+			r.mu.Unlock()
+			cut()
+			select {
+			case <-r.idle:
+			case <-time.After(abandonAfter):
+			}
 		}
 		stop()
 	}()
@@ -284,11 +319,16 @@ func (r *runner) run(ctx context.Context) {
 	wait := 200 * time.Millisecond
 	for base.Err() == nil {
 		started := time.Now()
-		err := r.session(base)
+		err := r.session(base, hctx)
 		if base.Err() != nil {
 			return
 		}
 		if time.Since(started) > 10*time.Second {
+			wait = 200 * time.Millisecond
+		}
+		if status.Code(err) == codes.ResourceExhausted {
+			// The next session can do better at once: nothing is gained by waiting.
+			r.failRefused()
 			wait = 200 * time.Millisecond
 		}
 		r.w.log.Warn("session ended, reconnecting", "pool", r.pool, "err", err, "in", wait)
@@ -341,8 +381,9 @@ func (r *runner) checkIdle() {
 	}
 }
 
-// session runs one stream until it breaks or the Frontier asks to reconnect.
-func (r *runner) session(ctx context.Context) error {
+// session runs one stream until it breaks or the Frontier asks to reconnect. Handlers
+// run under hctx, which ends before ctx at a shutdown.
+func (r *runner) session(ctx, hctx context.Context) error {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := r.client.Work(sctx)
@@ -382,9 +423,12 @@ func (r *runner) session(ctx context.Context) error {
 		}
 		switch msg := m.GetMsg().(type) {
 		case *workerv1.WorkResponse_Welcome:
+			r.mu.Lock()
+			r.releases = msg.Welcome.GetReleases()
+			r.mu.Unlock()
 			r.w.log.Info("session opened", "pool", r.pool, "session", msg.Welcome.GetSessionId())
 		case *workerv1.WorkResponse_Assignment:
-			r.start(ctx, msg.Assignment)
+			r.start(hctx, msg.Assignment)
 		case *workerv1.WorkResponse_Revoked:
 			r.revoke(msg.Revoked.GetLeaseId(), msg.Revoked.GetReason().String())
 		case *workerv1.WorkResponse_Extended:
@@ -463,6 +507,55 @@ func (r *runner) sendReportLocked(rep *report) {
 	_ = r.stream.Send(&workerv1.WorkRequest{Msg: &workerv1.WorkRequest_Complete{Complete: rep.complete}})
 }
 
+// CodeReportTooLarge is the code of a task that failed because the Frontier refused
+// its report as too large.
+const CodeReportTooLarge = "report_too_large"
+
+// refusable is the size from which a message can be what a Frontier refused as too
+// large. A session can also end with that status for a message of the Frontier's, and
+// then no report of the worker's is at fault.
+const refusable = 4 << 10
+
+// failRefused ends the task whose report the Frontier refused as too large. The
+// session that just ended was closed for a message over the Frontier's limit, and a
+// report is resent first on every new session: kept as it is, it would end each of
+// them the same way, and left to its lease, the handler would build the same report
+// on every attempt. The report is replaced by a permanent failure without discovered
+// tasks. The batches the Frontier took before the refusal stay added.
+//
+// The report at fault is the one with the largest message among those sent on that
+// session: whatever was refused, that one would be refused as well.
+func (r *runner) failRefused() {
+	r.sendMu.Lock()
+	defer r.sendMu.Unlock()
+	r.mu.Lock()
+	var worst *report
+	largest := refusable
+	for _, rep := range r.unacked {
+		if rep.sentGen != r.gen {
+			continue
+		}
+		for _, b := range rep.batches {
+			if n := proto.Size(b); n > largest {
+				worst, largest = rep, n
+			}
+		}
+		if n := proto.Size(rep.complete); n > largest {
+			worst, largest = rep, n
+		}
+	}
+	if worst != nil {
+		worst.batches = nil
+		worst.complete = &workerv1.Complete{LeaseId: worst.leaseID, Attempt: worst.complete.GetAttempt(), Fetch: worst.complete.GetFetch(),
+			Outcome: &taskv1.Outcome{Kind: taskv1.Outcome_KIND_FAILED, Code: CodeReportTooLarge,
+				Message: fmt.Sprintf("the frontier refused a message of %d bytes of the task's report", largest)}}
+	}
+	r.mu.Unlock()
+	if worst != nil {
+		r.w.log.Error("the frontier refused a report as too large; its task is failed", "pool", r.pool, "lease", worst.leaseID, "bytes", largest)
+	}
+}
+
 func (r *runner) ackBatch(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -525,9 +618,12 @@ func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 		defer cancel()
 		var res *Result
 		var err error
+		release := "" // the code of a hand-back, if the task goes back to the Frontier
 		switch {
 		case reg == nil || reg.pool != r.pool:
-			err = Fail("no_handler", fmt.Errorf("no handler %q registered for pool %q", task.Handler, r.pool))
+			// Another worker of the pool may have the handler, as during a rolling
+			// deploy: the task goes back, at no cost to its attempts.
+			release, err = codeNoHandler, fmt.Errorf("no handler %q registered for pool %q", task.Handler, r.pool)
 		default:
 			stopBeat := r.heartbeat(hctx, act, lease.GetDuration().AsDuration())
 			res, err = r.call(hctx, reg, task)
@@ -539,9 +635,25 @@ func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 		r.sendMu.Lock()
 		r.mu.Lock()
 		delete(r.running, act.leaseID)
+		if r.cut && ctx.Err() != nil && cutShort(err) {
+			// The shutdown cut the handler short: the task was not at fault.
+			release = codeShutdown
+		}
+		reported := !act.revoked
+		if release != "" && !r.releases {
+			// A Frontier that does not know the hand-back would fail the task for
+			// good. It gets what it got before: a failure for a missing handler,
+			// and nothing for a cut, so that the lease expires and the task is retried.
+			if release == codeShutdown {
+				reported = false
+			} else {
+				err = Fail(release, err)
+			}
+			release = ""
+		}
 		var rep *report
-		if !act.revoked {
-			rep = buildReport(act, task, res, err, r.poolFor)
+		if reported {
+			rep = buildReport(act, task, res, err, release, r.poolFor)
 			r.unacked = append(r.unacked, rep)
 		}
 		r.mu.Unlock()
@@ -619,10 +731,36 @@ func (r *runner) heartbeat(ctx context.Context, a *active, d time.Duration) (sto
 	return func() { close(done) }
 }
 
-// batchSize is how many discovered tasks go into one DiscoverBatch.
+// batchSize is how many discovered tasks go into one DiscoverBatch at most. A batch
+// is also bounded by its size in bytes.
 const batchSize = 200
 
-func buildReport(a *active, task *Task, res *Result, err error, poolFor func(handler string) string) *report {
+// maxAssignmentBytes is the largest message the worker takes from the Frontier.
+const maxAssignmentBytes = 8 << 20
+
+// CodeTaskTooLarge is the code of a task that failed because one of the tasks it
+// discovered exceeds MaxTaskBytes.
+const CodeTaskTooLarge = "task_too_large"
+
+// MaxTaskBytes is the largest task the Frontier accepts: URL, headers, body and
+// Context together, as encoded on the wire. A handler that returns a larger one fails
+// its own task for good with CodeTaskTooLarge, and none of its tasks is added.
+const MaxTaskBytes = wire.MaxTaskBytes
+
+// cutShort reports whether a handler's error says only that it was cancelled. An
+// outcome the handler classified itself, such as a 404, stands even when it arrives
+// at the moment of a shutdown.
+func cutShort(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, classified := errors.AsType[*Error](err)
+	return !classified || errors.Is(err, context.Canceled)
+}
+
+// buildReport is what the worker owes the Frontier for a finished task. A release
+// code hands the task back instead of reporting err as its outcome.
+func buildReport(a *active, task *Task, res *Result, err error, release string, poolFor func(handler string) string) *report {
 	if res == nil {
 		res = &Result{}
 	}
@@ -630,11 +768,25 @@ func buildReport(a *active, task *Task, res *Result, err error, poolFor func(han
 	if res.BlockQueueFor > 0 {
 		out.BlockQueueFor = durationpb.New(res.BlockQueueFor)
 	}
+	var specs []*taskv1.TaskSpec
+	if err == nil {
+		specs = make([]*taskv1.TaskSpec, len(res.Tasks))
+		for i := range res.Tasks {
+			specs[i] = taskSpec(task, res.Tasks[i], poolFor)
+			if n := proto.Size(specs[i]); n > MaxTaskBytes && err == nil {
+				err = Fail(CodeTaskTooLarge, fmt.Errorf("discovered task %d (%s) is %d bytes, the limit is %d",
+					i, truncate(res.Tasks[i].URL, 200), n, MaxTaskBytes))
+			}
+		}
+	}
 	if err != nil {
 		e := classify(err)
 		out.Kind, out.Code, out.Message = taskv1.Outcome_KIND_RETRY, e.Code, truncate(e.Error(), 500)
 		if e.Kind == KindFail {
 			out.Kind = taskv1.Outcome_KIND_FAILED
+		}
+		if release != "" {
+			out.Kind, out.Code = taskv1.Outcome_KIND_RELEASED, release
 		}
 		if e.RetryAfter > 0 {
 			out.RetryAfter = durationpb.New(e.RetryAfter)
@@ -653,14 +805,10 @@ func buildReport(a *active, task *Task, res *Result, err error, poolFor func(han
 	if err != nil {
 		return rep // discovered tasks are reported only for a task that succeeded
 	}
-	for i := 0; i < len(res.Tasks); i += batchSize {
-		b := &workerv1.DiscoverBatch{LeaseId: a.leaseID, Attempt: a.attempt, BatchId: fmt.Sprintf("%s/%d", a.leaseID, i/batchSize)}
-		chunk := res.Tasks[i:min(i+batchSize, len(res.Tasks))]
-		for j := range chunk {
-			b.Tasks = append(b.Tasks, taskSpec(task, chunk[j], poolFor))
-		}
-		rep.batches = append(rep.batches, b)
-	}
+	wire.Batches(specs, batchSize, func(from, to int) {
+		rep.batches = append(rep.batches, &workerv1.DiscoverBatch{LeaseId: a.leaseID, Attempt: a.attempt,
+			BatchId: fmt.Sprintf("%s/%d", a.leaseID, len(rep.batches)), Tasks: specs[from:to]})
+	})
 	return rep
 }
 

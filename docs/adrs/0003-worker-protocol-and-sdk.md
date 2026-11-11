@@ -34,10 +34,24 @@ This ADR borrows it.
   `build_version`. A worker process that serves several pools opens one session per pool.
 - A session for a pool that has no tasks yet is valid: it receives work as soon as the first
   task of that pool is added.
-- A worker that receives a task whose handler it does not have reports `FAILED` with code
-  `no_handler`, as Temporal fails an unregistered activity type. It is a permanent failure,
-  counted in the run's stats like any other code. Spiders agree on pool names the same way
-  they agree on handler names.
+- A worker that receives a task whose handler it does not have **hands it back**: outcome
+  `RELEASED`, code `no_handler`. A handler name is a contract between builds, and in a
+  rolling deploy the workers of the old build share a pool with the build that added a
+  handler. The Frontier returns the task to its backlog without counting an attempt, holds
+  it for a short delay and gives it out again, to whichever session is next. It fails the
+  task with code `no_handler` only when no worker could run it for a configured time (one
+  hour by default). The time starts with the first worker that lacks the handler and ends
+  with the first worker that runs the task, whatever the result, so a long deploy does not
+  fail a task that is being served.
+  - Dispatch does not select by handler. The store claims work by pool and queue, and a
+    handler filter under that would leave a backlog whose head no session can run. The
+    price of the simpler rule is that every round of a handed-back task takes a politeness
+    slot of its queue; the delay bounds that.
+  - The time is kept per replica, in memory, one entry per task that is going round. A
+    restart starts it again. Replicas that restart more often than the configured time
+    therefore never fail such a task: it keeps going round until a worker has its handler
+    or its run ends. The Frontier logs the first hand-back of a task and its failure; the
+    run's stats show the code only once the task failed.
 
 ### Credits
 
@@ -70,6 +84,23 @@ This ADR borrows it.
 - When the store is unavailable for a message (after the store's own retries, or the
   replica's call budget is exhausted), the Frontier closes the stream with `UNAVAILABLE`.
   The SDK reconnects and resends what was not acknowledged, in order. Leases are unaffected.
+- Messages are bounded in bytes, so that no task a spider builds can exceed what a gRPC
+  message carries. A task is limited to 1 MiB as encoded (request, headers, body and
+  context together); the Frontier answers a larger one with `INVALID`. The SDK starts a
+  new `DiscoverBatch` by count and by size, and a handler that returns a task over the
+  limit fails its own task for good with code `task_too_large`, with none of its tasks
+  added. The same bounds apply to seeds.
+- A report the Frontier refuses with `RESOURCE_EXHAUSTED` is final for that report. The
+  bounds above keep the SDK's messages under gRPC's default limit, so this happens only
+  against a Frontier with a lower one. Resent as it is, the report would end every new
+  session; left to its lease, the handler would build the same report on every attempt.
+  The SDK therefore replaces it with `FAILED`, code `report_too_large`, without discovered
+  tasks. The batches the Frontier took before the refusal stay added.
+- The bounds are enforced by each side from its own version on. A worker of an older SDK
+  still sends batches bounded by count only, and does not look at the result of each
+  discovered task, so a task over 1 MiB that a new Frontier answers with `INVALID` is
+  dropped without a sign on that worker. Workers are upgraded with the Frontier, or
+  before it.
 
 ### Leases and heartbeats
 
@@ -99,8 +130,32 @@ Unchanged: `SUCCESS`, `RETRY` (with optional `retry_after`), `FAILED`, any of th
 `block_queue_for`. The spider classifies; the Frontier applies `max_attempts` and backoff,
 as Temporal's retry policy does, with `FAILED` in the place of a non-retryable error type.
 
-Codes the SDK reports itself: `no_handler` (`FAILED`), `panic` (a handler panicked:
-`RETRY`) and `redirect` (`SUCCESS`: the target of the redirect was added as a task).
+`RELEASED` is the fourth outcome, and the SDK's own: the worker did not run the task to an
+end and hands it back. The Frontier undoes the dispatch as it does for an assignment that
+never reached a worker: the task is pending again, no attempt is recorded and the attempt
+number is used again. The SDK sends it in two cases:
+
+- the worker lacks the task's handler (code `no_handler`, see Pools);
+- the worker shut down and its grace passed while the handler ran (code `shutdown`). The
+  handler's context is cancelled, the task is handed back and the session stays open until
+  that is acknowledged. A deploy during a slow page therefore never uses up `max_attempts`
+  of a task that was not at fault.
+
+A handler cannot return it: a spider that could hand back any task at will could keep a
+task alive for ever. For the same reason the Frontier accepts `RELEASED` with these two
+codes only, and treats any other code as `FAILED`.
+
+An outcome the handler classified itself stands, also when it arrives at the moment of the
+cut: only a handler that returns its cancellation is handed back.
+
+A Frontier says in `Welcome.releases` that it understands `RELEASED`. To a Frontier that
+does not, the SDK sends what it sent before: `FAILED` for a missing handler, and nothing
+for a cut handler, whose lease then expires. Workers and Frontier can therefore be
+upgraded in any order.
+
+Codes the SDK reports itself: `no_handler` and `shutdown` (`RELEASED`), `panic` (a handler
+panicked: `RETRY`) and `redirect` (`SUCCESS`: the target of the redirect was added as a
+task).
 
 ### Redirects and dedup keys
 
@@ -120,10 +175,17 @@ Both are the spider's side of the contract; the Frontier cannot see either.
 
   A spider can make the fetcher follow redirects on the same host, or all of them, for the
   sites that need it, and accepts the extra requests with it.
-- **Dedup keys.** The Frontier's default dedup key is a simple normalisation of the URL
+
+  A 307 or 308 repeats the request, so its task keeps method and body. The headers of a
+  task are the spider's, and credentials sit in headers of its own naming as often as in
+  `Authorization` or `Cookie`. The task for the target therefore keeps them only on the same
+  host and without a step down from https to http; otherwise only the headers that
+  describe the content go along. The spider can adjust the task before it is added, which
+  is also where it sets its own dedup key.
+- **Dedup keys.** The Frontier's default dedup key is a simple normalisation of the request
   (ADR 0001, Dedup). A spider sets `TaskSpec.dedup_key` whenever its site needs special
   rules: case-insensitive paths, tracking or session parameters, requests told apart by
-  method or body.
+  a header.
 
 ### Spider strategies and registration
 
@@ -136,7 +198,9 @@ else on this page.
 - **`Parser`** is the simpler strategy: `Parse(ctx, *Task, *Response) (*Result, error)`. The
   adapter `HTTP(parser, options...)` turns it into a `Handler`: it fetches, classifies the
   response (2xx parsed, 429 retried with a queue block, 408 and 5xx retried, other statuses
-  failed) and applies the redirect rule above.
+  failed) and applies the redirect rule above. The classification is a default: a spider
+  hands any status to a parser of its own, whose return value is then the outcome. That is
+  how a 404 becomes a result ("the product is gone") and a 403 a block of the queue.
 - **Registration:** `Worker.Register(name, handler, options...)`, where `name` is the task's
   `handler` field. Options are functional: `InPool(name)` (the worker opens one session per
   pool its handlers serve) and `WithTimeout(d)`. Functional options were chosen over an
@@ -222,7 +286,7 @@ choice in the caller's code.
 | Schedule-to-close timeout | `task_ttl`, measured from add, across retries, enforced while pending |
 | Retry policy, non-retryable errors | `Behaviour` (`max_attempts`, backoff), `FAILED` |
 | Activity heartbeat, context cancellation | SDK lease timer, cancellation on `LeaseRevoked` |
-| Unregistered activity type | `FAILED`, code `no_handler` |
+| Unregistered activity type | Handed back (`RELEASED`, code `no_handler`); `FAILED` when no worker has the handler for long enough |
 | Fairness keys and weights | Per-queue fair queueing by run weight (ADR 0001) |
 | Priority tiers above fairness | Priority **below** fairness, inside a run's backlog (ADR 0001) |
 | `TaskQueueActivitiesPerSecond` | Not built (ADR 0001, Alternatives) |
@@ -243,7 +307,7 @@ choice in the caller's code.
 - Routing is by name only. A new kind of worker is a new pool name in the scheduler's or
   spider's task specs, and sessions for it.
 - A misrouted task (wrong pool, missing handler) fails visibly with `no_handler` instead of
-  waiting forever for a worker that matches.
+  waiting forever for a worker that matches, after the time a rolling deploy is given.
 - Spiders never think about leases, heartbeats or ordering; the SDK does.
 - The Frontier keeps one inbound goroutine per session and one dispatch loop per pool.
 

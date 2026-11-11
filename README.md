@@ -154,6 +154,8 @@ One worker can register any number of handlers. A task is routed by its handler 
 | | `WithHTTPClient(c)` | Your own client: proxies, cookies, TLS |
 | | `WithMaxBodyBytes(n)` | Largest body accepted; a larger one fails with `body_too_large`. Default 10 MiB |
 | | `WithContentTypes(types...)` | Parse only these media types; another one fails with `unsupported_content_type`. Default: all |
+| | `WithStatus(parser, statuses...)` | Hand these statuses to a parser instead of the default classification: a 404 that is a result, a 403 that is a block |
+| | `WithRedirect(func)` | Adjust the task added for a redirect before it is added, e.g. set its `DedupKey`. The function sees the redirect response |
 | | `WithSameHostRedirects()` | Follow redirects on the task's host inside the task. Each hop is a request on top of the site's rate limit, and it is not deduplicated |
 | | `WithCrossHostRedirects()` | Follow every redirect, also to other hosts, which are then fetched outside their own limits |
 
@@ -170,6 +172,7 @@ Outcomes are plain Go errors:
 | `worker.Fail(code, err)` | Permanent failure; never retried |
 | any other error | Transient failure, code `error` (`timeout` for a deadline) |
 | a panic | Transient failure, code `panic` |
+| the worker shuts down before the handler returns | The task is handed back to the Frontier: another worker runs it, and no attempt is counted |
 
 The codes end up in the run's stats (`Stats.ByCode`), so they are what you alert on.
 
@@ -178,6 +181,30 @@ site for the `Retry-After` delay, 408 and 5xx retry, other statuses fail, and a 
 not followed: its target is added as a new task, so that the Frontier paces and deduplicates
 it like any other page. A parser can still return
 `worker.Retry` or `worker.Fail` for a 2xx page, for example a captcha served with status 200.
+
+A status means what the spider says it means. `WithStatus` hands a status to a parser of
+its own, whose return value is the outcome of the task:
+
+```go
+gone := worker.ParserFunc(func(ctx context.Context, t *worker.Task, r *worker.Response) (*worker.Result, error) {
+	return &worker.Result{Code: "gone"}, markGone(ctx, t.URL) // a 404 here is a result
+})
+h := worker.HTTP(parser,
+	worker.WithStatus(gone, http.StatusNotFound, http.StatusGone),
+	worker.WithStatus(worker.Blocked(72*time.Hour), http.StatusForbidden))
+```
+
+`worker.Blocked(d)` fails the task with code `blocked` and asks the Frontier to leave the
+site alone for `d`, for every run. A parser that recognises a challenge page served with
+status 200 can return the same: `return worker.Blocked(d).Parse(ctx, t, r)`.
+
+A 307 or 308 repeats the request, so the task added for it keeps the method and the body.
+It keeps the task's headers only on the same host: to another host, or from https to http,
+only `Accept`, `Accept-Language`, `Content-Language`, `Content-Type` and `User-Agent` go
+along, so that a site cannot send a spider's credentials to a host of its choosing. The
+body goes along in every case, as it does in browsers; `WithRedirect` is the place to
+change the task when the body carries a secret. A redirect from https to http is never
+followed inside a task, also with `WithSameHostRedirects`: its target becomes a task.
 
 ### Delivery
 
@@ -199,8 +226,45 @@ res.Tasks = append(res.Tasks, worker.NewTask{
 ```
 
 Discovered tasks are deduplicated per run by a normalised URL (scheme + host + path +
-sorted query; scheme and host lowercased, path and query as they are). Set `DedupKey` when
-a site needs special rules: case-insensitive paths, tracking parameters, POST bodies.
+sorted query; scheme and host lowercased, path and query as they are). A method other
+than GET and a body that is not empty are part of the key as well, so the pages of a
+search API behind one URL are separate tasks. Set `DedupKey` when a site needs special
+rules: case-insensitive paths, tracking parameters, requests told apart by a header.
+
+A task is limited to 1 MiB (`worker.MaxTaskBytes`): URL, headers, body and `Context`
+together. A handler that returns a larger one fails its own task with code
+`task_too_large`. Any number of tasks can be returned from one handler: the SDK sends them
+in batches bounded by count and by size. Upgrade the workers with the Frontier or before
+it: a worker of an older SDK does not notice a task the Frontier refuses for its size.
+
+### Testing a spider, and dry runs
+
+`sdk/crawlytest` runs a Frontier inside a test, on the in-memory store. The spider is
+tested end to end, with the retries, dedup and limits it meets in production, against
+pages you recorded, and without a Frontier process or a database:
+
+```go
+func TestSpider(t *testing.T) {
+	site := httptest.NewServer(recordedPages) // your fixtures
+	defer site.Close()
+
+	f := crawlytest.Start(t)
+	w, _ := f.Worker()
+	w.Register("listing", worker.HTTP(listing))
+	w.Register("product", worker.HTTP(product))
+
+	final, err := f.Crawl(t.Context(), w,
+		[]*task.Spec{{Request: &task.Request{Url: site.URL + "/"}, Handler: "listing"}})
+	// assert on final.GetStats() and on what the parsers emitted
+}
+```
+
+`sdk/local` is the same Frontier outside a test, for a dry run of a spider against a real
+site: `local.Start()`, then `Crawl` with a `max_tasks` limit (`local.WithRun`) and a
+deadline on its context. It applies the Frontier's default policies unless
+`local.WithPolicies` gives it your policy file, so a dry run is as polite as the real
+crawl. A crawl that is cut short returns the run as it stood, with its statistics, and
+cancels it. Its state is in memory and gone when the process ends.
 
 ## Scheduling a run
 
@@ -267,7 +331,8 @@ func main() {
 
 `CreateRun` is idempotent for the same request, so a scheduler can retry it. `Seed` sends
 tasks in batches; when it fails part of the way it returns the results of the batches
-that were committed together with the error, and seeding again is safe. `Wait` returns the
+that were committed together with the error, and seeding again is safe. A seed over
+1 MiB (`sdk.MaxTaskBytes`) is not sent and its result is `INVALID`. `Wait` returns the
 run once it is completed, cancelled or expired; it reconnects with backoff when the stream
 breaks, which happens on every restart of a Frontier, and fails with `NotFound` when the
 run does not exist. Underneath it is `WatchRuns`, a raw stream that starts with the run's
@@ -344,6 +409,13 @@ statistics, that long after it ended. With PostgreSQL the tasks and attempts liv
 monthly partitions, and `-retain-tasks 2160h` drops a partition once every run in it is
 older than that and has no work left; the in-memory store deletes a run's tasks with the
 run.
+
+**Deploys.** A worker that is given a task for a handler it does not have hands the task
+back, and the Frontier gives it to another worker of the pool. A rolling deploy that adds
+or renames a handler therefore loses nothing while both builds run. A task whose handler no
+worker has fails with code `no_handler` after `-no-handler-grace` (one hour by default). A
+worker that stops lets its handlers finish for `WithShutdownGrace`, then cancels them and
+hands their tasks back, so a deploy never uses up a task's attempts.
 
 **Logs.** A lease that expires is logged at `WARN` with its run, task and queue: the worker
 that held it has died or is stuck.

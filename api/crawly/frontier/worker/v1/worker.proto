@@ -19,7 +19,7 @@ message Hello {
   // Fields 3 (labels) and 4 (handlers) removed: routing is by pool name only.
   reserved 3, 4;
   // Required. The pool this session serves, e.g. "default" or "browser". A task whose
-  // handler the worker lacks is reported FAILED with code "no_handler".
+  // handler the worker lacks is handed back (Outcome RELEASED, code "no_handler").
   // Pool names match [a-z0-9_]{1,32}.
   string pool = 5;
 }
@@ -28,6 +28,9 @@ message Welcome {
   string session_id = 1;
   // Frontier clock; workers never compute scheduling times from their own clock.
   google.protobuf.Timestamp server_time = 2;
+  // The frontier understands Outcome RELEASED. A worker sends that kind only to a
+  // frontier that says so: an older one would fail the task for good.
+  bool releases = 3;
 }
 
 // One credit is one execution slot. Credits are additive; the frontier never holds more

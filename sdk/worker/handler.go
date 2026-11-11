@@ -40,8 +40,9 @@ import (
 //
 // Return a nil error for success. Return an error built with Retry or Fail to classify
 // a failure; any other error is reported as a retryable failure with code "error". The
-// context is cancelled when the lease is lost or the worker shuts down; a handler that
-// is cancelled that way is not reported.
+// context is cancelled when the lease is lost or when the worker shuts down and its
+// grace has passed. A handler that lost its lease is not reported. A handler cut by a
+// shutdown hands its task back: another worker gets it and no attempt is counted.
 type Handler interface {
 	Handle(ctx context.Context, task *Task) (*Result, error)
 }
@@ -112,12 +113,15 @@ type NewTask struct {
 	Pool string
 	// QueueKey overrides the queue derived from the URL.
 	QueueKey string
-	// DedupKey overrides the default URL normalisation. Set it when the site needs
-	// special rules: case-sensitive paths, tracking parameters, POST bodies.
+	// DedupKey overrides the default key: the normalised URL, with the method and the
+	// body for requests other than GET. Set it when the site needs special rules:
+	// case-insensitive paths, tracking parameters, requests told apart by a header.
 	DedupKey  string
 	Priority  int32
 	NotBefore time.Time
-	Context   map[string][]byte
+	// Context is opaque spider data, handed back with the task. The whole task, with
+	// Context, must fit into MaxTaskBytes.
+	Context map[string][]byte
 }
 
 // Kind classifies a failure.
@@ -129,6 +133,13 @@ const (
 	KindRetry Kind = iota + 1
 	// KindFail is a permanent failure. It is never retried.
 	KindFail
+)
+
+// Codes of a task the worker hands back to the Frontier: it was not run to an end,
+// and no attempt is counted. Only the SDK decides that; a handler cannot.
+const (
+	codeNoHandler = "no_handler"
+	codeShutdown  = "shutdown"
 )
 
 // Error is a classified failure. Build one with Retry or Fail.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -96,6 +97,58 @@ func TestSeed(t *testing.T) {
 	}
 	if got.GetRun().GetState() != run.StateOpen {
 		t.Fatalf("state: %v", got.GetRun().GetState())
+	}
+
+	// Requests to one URL that differ in body or method are separate tasks, and the
+	// spelling of the method does not make two of one.
+	api := func(method, body string) *task.Spec {
+		return &task.Spec{Request: &task.Request{Url: "https://api.example/search", Method: method, Body: []byte(body)}, Handler: "page"}
+	}
+	res, err = c.Seed(ctx, "seed", api("POST", `{"page":1}`), api("POST", `{"page":2}`), api("POST", `{"page":3}`),
+		api("post", `{"page":1}`), api("", ""), api("GET", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []task.AddStatus{task.StatusAdded, task.StatusAdded, task.StatusAdded, task.StatusDuplicate, task.StatusAdded, task.StatusDuplicate} {
+		if res[i].GetStatus() != want {
+			t.Fatalf("api request %d: %v, want %v", i, res[i].GetStatus(), want)
+		}
+	}
+
+	// Tasks that are large together go in several requests, and one over the limit is
+	// not sent at all.
+	large := make([]*task.Spec, 0, 61)
+	for i := range 60 {
+		large = append(large, &task.Spec{Request: &task.Request{Url: fmt.Sprintf("https://big.example/%d", i)}, Handler: "page",
+			Context: map[string][]byte{"meta": make([]byte, 100<<10)}})
+	}
+	large = slices.Insert(large, 30, &task.Spec{Request: &task.Request{Url: "https://big.example/huge"}, Handler: "page",
+		Context: map[string][]byte{"meta": make([]byte, sdk.MaxTaskBytes)}})
+	if res, err = c.Seed(ctx, "seed", large...); err != nil || len(res) != 61 {
+		t.Fatalf("large seeds: %d results, %v", len(res), err)
+	}
+	for i, r := range res {
+		if want := map[bool]task.AddStatus{false: task.StatusAdded, true: task.StatusInvalid}[i == 30]; r.GetStatus() != want {
+			t.Fatalf("large seed %d: %v, want %v", i, r.GetStatus(), want)
+		}
+	}
+
+	// The Frontier holds the limit itself, for callers that do not use Seed.
+	stream, err := c.Runs.AddTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&run.AddTasksRequest{RunId: "seed", BatchId: "raw", Tasks: []*task.Spec{large[30],
+		{Request: &task.Request{Url: "https://big.example/after"}, Handler: "page"}}}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := stream.Recv()
+	if err != nil || len(raw.GetResults()) != 2 || raw.GetResults()[0].GetStatus() != task.StatusInvalid ||
+		raw.GetResults()[1].GetStatus() != task.StatusAdded {
+		t.Fatalf("a task over the limit sent to the Frontier: %v %v", raw.GetResults(), err)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatal(err)
 	}
 
 	// Seeding nothing is not an error.

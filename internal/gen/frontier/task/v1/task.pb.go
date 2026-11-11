@@ -48,6 +48,12 @@ const (
 	Outcome_KIND_RETRY Outcome_Kind = 2
 	// Permanent failure (404/410, unparseable). Never retried.
 	Outcome_KIND_FAILED Outcome_Kind = 3
+	// The worker hands the task back without having run it to an end: it lacks the
+	// task's handler, or it shut down. The attempt is not counted and no attempt is
+	// recorded; another worker gets the task. Valid with the codes "no_handler" and
+	// "shutdown" only, and only when Welcome.releases is set; with any other code it
+	// is a permanent failure.
+	Outcome_KIND_RELEASED Outcome_Kind = 4
 )
 
 // Enum value maps for Outcome_Kind.
@@ -57,12 +63,14 @@ var (
 		1: "KIND_SUCCESS",
 		2: "KIND_RETRY",
 		3: "KIND_FAILED",
+		4: "KIND_RELEASED",
 	}
 	Outcome_Kind_value = map[string]int32{
 		"KIND_UNSPECIFIED": 0,
 		"KIND_SUCCESS":     1,
 		"KIND_RETRY":       2,
 		"KIND_FAILED":      3,
+		"KIND_RELEASED":    4,
 	}
 )
 
@@ -157,7 +165,11 @@ type Outcome struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Kind  Outcome_Kind           `protobuf:"varint,1,opt,name=kind,proto3,enum=crawly.frontier.task.v1.Outcome_Kind" json:"kind,omitempty"`
 	// Machine-readable code for stats and alerting, e.g. "http_404", "http_429", "captcha".
-	// Reserved codes: "no_handler" (FAILED: the worker lacks the task's handler),
+	// Reserved codes: "no_handler" (RELEASED: the worker lacks the task's handler; the
+	// frontier fails the task with this code when no worker has run it for the time it
+	// is configured to wait), "shutdown" (RELEASED: the worker stopped before the handler
+	// finished),
+	// "task_too_large" (FAILED: the handler returned a task over the size limit),
 	// "panic" (RETRY: the handler crashed), "redirect" (SUCCESS: a redirect to another
 	// host was added as a task instead of followed), "lease_expired" (set by the frontier).
 	Code    string `protobuf:"bytes,2,opt,name=code,proto3" json:"code,omitempty"`
@@ -332,17 +344,21 @@ func (x *FetchInfo) GetItemsEmitted() uint32 {
 	return 0
 }
 
-// What clients submit (scheduler seeds, worker discoveries).
+// What clients submit (scheduler seeds, worker discoveries). A spec is limited to 1 MiB
+// as encoded; a larger one is INVALID.
 type TaskSpec struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Request *Request               `protobuf:"bytes,1,opt,name=request,proto3" json:"request,omitempty"`
 	// Queue the task belongs to. Empty: derived from the run's KeyRule.
 	QueueKey string `protobuf:"bytes,2,opt,name=queue_key,json=queueKey,proto3" json:"queue_key,omitempty"`
-	// Dedup key. Empty: the default normalisation of request.url: scheme + host + path +
-	// query parameters sorted alphanumerically ascending. Scheme and host are lowercased,
-	// path and query keep their case (fragment, method, headers and body are ignored). Set
-	// it whenever a site needs special rules, e.g. case-insensitive paths, tracking
-	// parameters, or requests told apart by method or body.
+	// Dedup key. Empty: the default key of the request. For a GET that is the normalised
+	// request.url: scheme + host + path + query parameters sorted alphanumerically
+	// ascending. Scheme and host are lowercased, path and query keep their case, the
+	// fragment is ignored. A method other than GET is put in front of it, in upper case
+	// (an empty method is a GET), and the SHA-256 of a body that is not empty behind it.
+	// Headers are never part of it. Set it whenever a site needs special
+	// rules, e.g. case-insensitive paths, tracking parameters, or requests told apart by
+	// a header.
 	// Dedup is scoped to the run and the queue key (the fingerprint includes the queue key).
 	// With HOST or REGISTERED_DOMAIN key rules that is the same as per run.
 	DedupKey string `protobuf:"bytes,3,opt,name=dedup_key,json=dedupKey,proto3" json:"dedup_key,omitempty"`
@@ -575,7 +591,7 @@ func (x *Task) GetPool() string {
 type Request struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Url           string                 `protobuf:"bytes,1,opt,name=url,proto3" json:"url,omitempty"`
-	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`   // default GET
+	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`   // default GET; stored and sent in upper case
 	Headers       []*Header              `protobuf:"bytes,3,rep,name=headers,proto3" json:"headers,omitempty"` // repeated, to allow duplicate header names
 	Body          []byte                 `protobuf:"bytes,4,opt,name=body,proto3" json:"body,omitempty"`       // keep small; reference large payloads via context
 	unknownFields protoimpl.UnknownFields
@@ -748,20 +764,21 @@ var File_crawly_frontier_task_v1_task_proto protoreflect.FileDescriptor
 
 const file_crawly_frontier_task_v1_task_proto_rawDesc = "" +
 	"\n" +
-	"\"crawly/frontier/task/v1/task.proto\x12\x17crawly.frontier.task.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc2\x02\n" +
+	"\"crawly/frontier/task/v1/task.proto\x12\x17crawly.frontier.task.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd5\x02\n" +
 	"\aOutcome\x129\n" +
 	"\x04kind\x18\x01 \x01(\x0e2%.crawly.frontier.task.v1.Outcome.KindR\x04kind\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\x12:\n" +
 	"\vretry_after\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\n" +
 	"retryAfter\x12A\n" +
-	"\x0fblock_queue_for\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\rblockQueueFor\"O\n" +
+	"\x0fblock_queue_for\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\rblockQueueFor\"b\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\x10\n" +
 	"\fKIND_SUCCESS\x10\x01\x12\x0e\n" +
 	"\n" +
 	"KIND_RETRY\x10\x02\x12\x0f\n" +
-	"\vKIND_FAILED\x10\x03\"\xff\x01\n" +
+	"\vKIND_FAILED\x10\x03\x12\x11\n" +
+	"\rKIND_RELEASED\x10\x04\"\xff\x01\n" +
 	"\tFetchInfo\x12\x1f\n" +
 	"\vhttp_status\x18\x01 \x01(\rR\n" +
 	"httpStatus\x12\x1b\n" +

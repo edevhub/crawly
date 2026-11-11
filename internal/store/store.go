@@ -366,10 +366,11 @@ const (
 	ResultSucceeded TaskResult = iota + 1
 	ResultFailed
 	ResultRetry
-	// ResultReleased returns a task whose assignment never reached a worker to its
-	// backlog. The dispatch is undone as far as the task is concerned: no attempt is
-	// recorded and the attempt number is reused. The politeness slot it took is not
-	// given back, so a release never lets a queue exceed its limits.
+	// ResultReleased returns a task that was not run to its backlog: its assignment
+	// never reached a worker, or the worker handed it back. The dispatch is undone as
+	// far as the task is concerned: no attempt is recorded and the attempt number is
+	// reused. The politeness slot it took is not given back, so a release never lets a
+	// queue exceed its limits. RetryIn delays the next dispatch.
 	ResultReleased
 )
 
@@ -378,7 +379,7 @@ type Finish struct {
 	Lease   LeaseRef
 	Source  FinishSource
 	Result  TaskResult
-	RetryIn time.Duration // Retry only
+	RetryIn time.Duration // Retry and Released: not before this delay
 	Block   time.Duration // > 0: block the task's queue for all runs
 	Record  AttemptRecord
 }

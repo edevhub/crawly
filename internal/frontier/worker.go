@@ -234,7 +234,7 @@ func (w workerService) Work(stream grpc.BidiStreamingServer[workerv1.WorkRequest
 		return grpcErr(err)
 	}
 	sess.send(&workerv1.WorkResponse{Msg: &workerv1.WorkResponse_Welcome{Welcome: &workerv1.Welcome{
-		SessionId: string(id), ServerTime: timestamppb.New(now)}}})
+		SessionId: string(id), ServerTime: timestamppb.New(now), Releases: true}}})
 	s.log.Info("session opened", "session", id, "pool", p.name, "worker", sess.worker.ID)
 	defer s.log.Info("session closed", "session", id)
 
@@ -383,8 +383,12 @@ func (s *Server) handleComplete(ctx context.Context, p *pool, sess *session, m *
 	}
 	st := store.FinishStale
 	if ok {
-		if st, err = s.store.Finish(ctx, s.decide(info, m.GetOutcome(), m.GetFetch())); err != nil {
+		f := s.decide(info, m.GetOutcome(), m.GetFetch())
+		if st, err = s.store.Finish(ctx, f); err != nil {
 			return err
+		}
+		if st == store.FinishAccepted {
+			s.served(info, sess.worker, m.GetOutcome(), f)
 		}
 	}
 	s.leases.Delete(ref.ID)
