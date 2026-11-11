@@ -101,7 +101,7 @@ func main() {
 func openStore(ctx context.Context, cfg config, pol store.Policies, log *slog.Logger) (store.Store, func(), error) {
 	if cfg.postgres == "" {
 		log.Warn("the store is in memory: the state is lost on restart")
-		return memstore.New(pol, memstore.WithRetention(cfg.retainRuns)), func() {}, nil
+		return memstore.New(pol, memstore.WithRetention(cfg.retainRuns), memstore.WithLogger(log)), func() {}, nil
 	}
 	opts := []pgstore.Option{pgstore.WithLogger(log), pgstore.WithMigrationsTable(cfg.migrationsTable),
 		pgstore.WithRetention(cfg.retainTasks, cfg.retainRuns)}

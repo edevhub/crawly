@@ -236,8 +236,9 @@ func (s *Server) maintain(ctx context.Context) {
 	}
 }
 
-// revoker pushes LeaseRevoked to sessions holding leases of runs that were cancelled
-// or expired.
+// revoker pushes LeaseRevoked to sessions holding leases of runs that were cancelled,
+// expired or aborted. All three use REASON_RUN_CANCELLED: the worker's reaction is the
+// same, and a worker of an older build knows no other reason for a run that ended.
 func (s *Server) revoker(ctx context.Context) {
 	cursor, err := s.store.LastEventCursor(ctx)
 	if err != nil {
@@ -252,7 +253,7 @@ func (s *Server) revoker(ctx context.Context) {
 		for i := range evs {
 			ev := &evs[i]
 			cursor = ev.Cursor
-			if ev.Type == store.EventCancelled || ev.Type == store.EventExpired {
+			if ev.Type == store.EventCancelled || ev.Type == store.EventExpired || ev.Type == store.EventAborted {
 				s.revokeRun(ev.Run.Spec.ID)
 			}
 		}
@@ -638,7 +639,7 @@ func grpcErr(err error) error {
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, store.ErrConflict):
 		return status.Error(codes.AlreadyExists, err.Error())
-	case errors.Is(err, store.ErrRunClosed):
+	case errors.Is(err, store.ErrRunClosed), errors.Is(err, store.ErrUnsupported):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, store.ErrUnavailable):
 		return status.Error(codes.Unavailable, err.Error())

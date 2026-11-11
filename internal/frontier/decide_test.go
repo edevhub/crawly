@@ -1,12 +1,16 @@
 package frontier
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	policyv1 "github.com/edevhub/crawly/internal/gen/frontier/policy/v1"
+	runv1 "github.com/edevhub/crawly/internal/gen/frontier/run/v1"
 	taskv1 "github.com/edevhub/crawly/internal/gen/frontier/task/v1"
 	"github.com/edevhub/crawly/internal/policy"
 	"github.com/edevhub/crawly/internal/store"
@@ -56,5 +60,41 @@ func TestQueueBlockCeiling(t *testing.T) {
 	short := &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, BlockQueueFor: durationpb.New(time.Minute)}
 	if got := s.decide(store.LeaseInfo{Queue: "shop.example", Ref: store.LeaseRef{Attempt: 1}}, short, nil).Block; got != time.Minute {
 		t.Errorf("a block under the ceiling: %v", got)
+	}
+}
+
+// TestValidateAbortRules: abort_on_codes that cannot work as written are rejected at
+// CreateRun.
+func TestValidateAbortRules(t *testing.T) {
+	many := make([]string, maxAbortCodes+1)
+	for i := range many {
+		many[i] = "code" + string(rune('a'+i%26)) + string(rune('a'+i/26))
+	}
+	for name, tc := range map[string]struct {
+		limits *runv1.RunLimits
+		ok     bool
+	}{
+		"none":                {nil, true},
+		"rules without codes": {&runv1.RunLimits{MaxFailed: 5, MaxConsecutiveFailures: 3}, true},
+		"codes":               {&runv1.RunLimits{AbortOnCodes: []string{"blocked", "captcha", "no_handler", "lease_expired"}}, true},
+		"empty code":          {&runv1.RunLimits{AbortOnCodes: []string{"blocked", ""}}, false},
+		"duplicate":           {&runv1.RunLimits{AbortOnCodes: []string{"blocked", "captcha", "blocked"}}, false},
+		"revoked":             {&runv1.RunLimits{AbortOnCodes: []string{"revoked"}}, false},
+		"shutdown":            {&runv1.RunLimits{AbortOnCodes: []string{"shutdown"}}, false},
+		"at the bound":        {&runv1.RunLimits{AbortOnCodes: many[:maxAbortCodes]}, true},
+		"over the bound":      {&runv1.RunLimits{AbortOnCodes: many}, false},
+	} {
+		if err := validateAbortRules(tc.limits); (err == nil) != tc.ok {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// TestUnsupportedIsAFailedPrecondition: a deployment that cannot take abort rules yet is
+// reported as a condition the caller can fix, not as an internal error.
+func TestUnsupportedIsAFailedPrecondition(t *testing.T) {
+	err := grpcErr(fmt.Errorf("%w: a replica is old", store.ErrUnsupported))
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("%v", err)
 	}
 }

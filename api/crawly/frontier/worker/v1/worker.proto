@@ -85,7 +85,7 @@ message LeaseRevoked {
     REASON_UNSPECIFIED = 0;
     REASON_EXPIRED = 1;            // extension came too late
     REASON_FENCED = 2;             // a newer attempt exists
-    REASON_RUN_CANCELLED = 3;
+    REASON_RUN_CANCELLED = 3;      // the run ended before the task did: cancelled, expired or aborted
     REASON_MAX_DURATION = 4;       // Behaviour.max_lease_duration reached
   }
   Reason reason = 2;

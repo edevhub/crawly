@@ -66,7 +66,7 @@ runs ── run_events                     pools
 ### Enums and identifiers
 
 ```sql
-CREATE TYPE run_state  AS ENUM ('open', 'sealed', 'completed', 'cancelled', 'expired');
+CREATE TYPE run_state  AS ENUM ('open', 'sealed', 'completed', 'cancelled', 'expired', 'aborted');
 CREATE TYPE task_state AS ENUM ('pending', 'in_flight', 'succeeded', 'failed', 'expired', 'cancelled');
 ```
 
@@ -97,6 +97,14 @@ CREATE TABLE runs (
   deadline    timestamptz,
   max_tasks   bigint,
   max_depth   int,
+  abort_codes text[],                                               -- abort rules, see Abort
+  max_failed  bigint,
+  max_consecutive_failures int,
+  failed_count  bigint    NOT NULL DEFAULT 0,                       -- counters of the abort rules,
+  failed_streak bigint    NOT NULL DEFAULT 0,                       -- kept only for runs that have such rules; fillfactor 70
+  abort_rule  smallint,                                             -- why the run was aborted
+  abort_code  text,
+  abort_task  text,
   state       run_state   NOT NULL DEFAULT 'open',
   paused      boolean     NOT NULL DEFAULT false,
   resuming    boolean     NOT NULL DEFAULT false,                   -- resume sweep not finished
@@ -105,7 +113,7 @@ CREATE TABLE runs (
   finished_at timestamptz
 );
 CREATE INDEX runs_active   ON runs (deadline) WHERE state IN ('open', 'sealed');
-CREATE INDEX runs_draining ON runs (run_no)   WHERE state IN ('cancelled', 'expired');
+CREATE INDEX runs_draining ON runs (run_no)   WHERE state IN ('cancelled', 'expired', 'aborted');
 CREATE INDEX runs_resuming ON runs (run_no)   WHERE resuming;
 CREATE INDEX runs_labels   ON runs USING gin (labels);
 
@@ -649,8 +657,8 @@ Used for worker completions (`Source = Worker`) and the reaper (`Source = Reaper
      `attempt -= 1`, lease columns cleared. Steps 5 and 8 are skipped: no attempt row and
      no outcome code. The queue's politeness state is left as dispatch advanced it, so a
      release never lets a queue exceed its limits;
-   - if the run is `cancelled` or `expired`, the task becomes `cancelled` / `expired`
-     instead, the attempt is recorded as `revoked` and the call reports the lease as
+   - if the run is `cancelled`, `expired` or `aborted`, the task becomes `cancelled` /
+     `expired` / `cancelled` instead, the attempt is recorded as `revoked` and the call reports the lease as
      `STALE`: the result the worker sent is not applied.
 5. **Attempt row** insert.
 6. **Queue:** `in_flight -= 1`; if `Block > 0`:
@@ -662,7 +670,7 @@ Used for worker completions (`Source = Worker`) and the reaper (`Source = Reaper
    `ready_at` to their next admission time if the freed slot changes it (this is what brings
    a lane back from `'infinity'`), or raise it to the end of a new block.
 8. **`backlog_codes`:** `count += 1` for the outcome code.
-9. **Completion** if the backlog now has `pending = 0 AND in_flight = 0` (see below).
+9. **Abort rules** (below), then **completion** unless the run was aborted, if the backlog now has `pending = 0 AND in_flight = 0` (see below).
 10. Commit; `NOTIFY` if a backlog became ready.
 
 ### Lease lookup
@@ -672,11 +680,60 @@ AND task_id = $t`, with the key decoded from the lease ID. One primary key read,
 The core calls it only when a `Complete` arrives for a lease this replica did not dispatch;
 `Finish` does the fencing.
 
+### Abort
+
+Part of Finish, after step 8, for an attempt that was applied (not `Released`, not a task of a
+run that was over). The rules are those of `RunLimits` (ADR 0001); `store.RunLimits.Trip`
+evaluates them for both stores. A run with no rules is not touched.
+
+1. Needed only when the attempt can change a counter or trip the code rule: a final failure
+   of a run with `max_failed` or `max_consecutive_failures` (not one of the reaper's), a
+   success of a run with `max_consecutive_failures`, or an attempt with a listed code.
+2. If the completion check of step 9 is due (the backlog is empty),
+   `pg_advisory_xact_lock(1, $run_no)` first: `complete` takes it, and the order of every
+   lifecycle change is the lock, then the row. Otherwise this lock is not taken, so a
+   failure storm does not queue ahead of `AddTasks`, which takes it in shared mode.
+3. A final failure: `UPDATE runs SET failed_count = failed_count + 1, failed_streak =
+   failed_streak + 1 WHERE run_no = $r AND state IN ('open', 'sealed') RETURNING ...`. A
+   success: `SET failed_streak = 0 WHERE ... AND failed_streak <> 0`, which locks the row
+   only when there is a streak. No row means the run is over: another outcome ended it first.
+4. If `Trip` says a rule trips: `UPDATE runs SET state = 'aborted', finished_at,
+   resuming = false, abort_rule, abort_code, abort_task WHERE run_no = $r AND state IN
+   ('open', 'sealed')`, and `ABORTED` is appended to `run_events` only if a row changed.
+   `end` does this for cancel and deadline too. The completion check of step 9 is skipped,
+   and `complete` itself updates only a run that is still `sealed`.
+
+The row lock, held from the counter update to the commit, orders the outcomes of a run that
+change a counter, whichever queues they come from, which is what "in a row" means. Two
+outcomes that trip a rule at once give one abort: the second finds the run over. No path
+takes the advisory lock while it holds the run's row, so the order cannot be reversed. The
+cost of a failure storm is one row update per final failure on one row, and the table is
+created with `fillfactor = 70` so that these updates stay on their page. Waiting for that
+row counts against the pool's `lock_timeout`: a storm slower than that fails Finish, which
+is retried; `TestFailureStormOnOneRun` runs 64 queues against it. The drain handles an aborted run like a cancelled
+one. Adding the `aborted` value to `run_state` and to the draining index is a migration that
+runs outside a transaction, because PostgreSQL cannot use a new enum value in the
+transaction that adds it. The migrator sets a `lock_timeout` of three seconds, so a
+statement that needs a lock the live Frontier holds fails and is run again instead of
+queueing every query behind it, and the index is built `CONCURRENTLY` next to the old one.
+
+**Rollout and rollback.** A build without the rules reads `aborted` as no known state, which
+is not final: it would dispatch the run, extend its leases and never drain it. The
+Frontier gates on this. `replicas.abort_rules` is set by a replica that knows the rules
+(the column defaults to false for any other), and `CreateRun` with rules, for a run that
+does not exist yet, is refused with `store.ErrUnsupported` while a replica without it has
+reported within the last minute. The order is: migrate, upgrade every replica, then let
+schedulers use the rules. A replica that keeps its ID across a downgrade keeps its flag, so
+give replicas fresh IDs, or clear it, when going back. To go back to a build without the
+rules, run the Down step of the migration first: it turns `aborted` runs into `cancelled`
+ones. The enum value stays. Within this build an unknown run state name reads as
+`cancelled` and is logged, so a later state is final here too.
+
 ### Extend lease
 
 Lock the task by lease, check validity as in Finish, then
 `lease_expires_at = least(now() + $by, lease_deadline)`. One row, no other locks. A lease
-of a run that was cancelled or has expired is not extended: it is reported as `STALE`.
+of a run that was cancelled, has expired or was aborted is not extended: it is reported as `STALE`.
 
 ### Block queue
 
@@ -749,10 +806,11 @@ number of rows, whatever the size of the run, and the effect on backlogs is even
   Dispatch works out the readiness again.
 - **CancelRun:** `state = 'cancelled'`, `finished_at = now()`. Returns at once; dispatch
   skips the run's backlogs as for a paused run, and `Maintain` drains them.
+- **Abort:** by `Finish` (see Abort), not by a call.
 - **Deadline:** `Maintain` finds runs past `deadline` (`runs_active`) and ends them like
   cancel with `state = 'expired'`.
 
-Replicas learn about `CANCELLED` and `EXPIRED` from `run_events` and push `LeaseRevoked` for
+Replicas learn about `CANCELLED`, `EXPIRED` and `ABORTED` from `run_events` and push `LeaseRevoked` for
 the leases they dispatched to their sessions.
 
 ### Maintain
@@ -764,7 +822,7 @@ with `SKIP LOCKED`, or `pg_try_advisory_xact_lock` per job):
 |---|---|
 | Task TTL | Per backlog with expired pending tasks (`tasks_ttl`): lock queue, backlog, expire tasks `SKIP LOCKED`, adjust `pending` / `expired`, recompute the lanes' `ready_at`, completion check |
 | Resume sweep | For runs with `resuming` (`runs_resuming`): the batches described under ResumeRun |
-| Cancel and deadline drain | Per backlog of a `cancelled` / `expired` run (`runs_draining`, `backlogs_active`): pending tasks to `cancelled` / `expired`; in-flight tasks to the same state with a `revoked` attempt; release `queues.in_flight`; adjust the ledger |
+| Cancel, abort and deadline drain | Per backlog of a `cancelled` / `aborted` / `expired` run (`runs_draining`, `backlogs_active`): pending tasks to `cancelled` / `expired`; in-flight tasks to the same state with a `revoked` attempt; release `queues.in_flight`; adjust the ledger |
 | Partitions | Create next month's `tasks` and `attempts` partitions; drop partitions past retention, except in months where a run is still `open` / `sealed` or has tasks to drain |
 | Queues | Delete `queues` rows with no backlog rows and `last_used_at` older than a day: lock the candidates `FOR UPDATE SKIP LOCKED` (an add holding `KEY SHARE` makes the row skipped), re-check that no backlog exists, then delete |
 | Replicas | Delete replicas not seen for an hour |

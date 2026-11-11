@@ -313,7 +313,7 @@ func (s *Store) accepts(ctx context.Context, q querier, m *runMeta, discovered b
 	if err != nil {
 		return false, err
 	}
-	st := runStates[name]
+	st := s.parseRunState(name)
 	return st == store.RunOpen || (discovered && st == store.RunSealed), nil
 }
 

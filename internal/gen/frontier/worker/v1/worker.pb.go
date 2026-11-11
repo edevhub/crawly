@@ -33,7 +33,7 @@ const (
 	LeaseRevoked_REASON_UNSPECIFIED   LeaseRevoked_Reason = 0
 	LeaseRevoked_REASON_EXPIRED       LeaseRevoked_Reason = 1 // extension came too late
 	LeaseRevoked_REASON_FENCED        LeaseRevoked_Reason = 2 // a newer attempt exists
-	LeaseRevoked_REASON_RUN_CANCELLED LeaseRevoked_Reason = 3
+	LeaseRevoked_REASON_RUN_CANCELLED LeaseRevoked_Reason = 3 // the run ended before the task did: cancelled, expired or aborted
 	LeaseRevoked_REASON_MAX_DURATION  LeaseRevoked_Reason = 4 // Behaviour.max_lease_duration reached
 )
 

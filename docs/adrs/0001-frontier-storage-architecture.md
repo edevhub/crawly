@@ -23,8 +23,8 @@ tasks, report outcomes and add discovered tasks to the same run.
 
 The state has to support:
 
-- **Runs** with a lifecycle (`OPEN → SEALED → COMPLETED | CANCELLED | EXPIRED`), budgets, a
-  deadline, an immutable policy override, stats and an event stream.
+- **Runs** with a lifecycle (`OPEN → SEALED → COMPLETED | CANCELLED | EXPIRED | ABORTED`), budgets, a
+  deadline, abort rules, an immutable policy override, stats and an event stream.
 - **Tasks** deduplicated per run, with lineage (depth, parent), retries and fenced leases.
 - **Queues** identified by an opaque, global key. Politeness state is shared by every run
   with work on the queue.
@@ -110,6 +110,9 @@ deliberately override the limits.
 4. Workers add discovered links to the run. Dedup drops the ones the run already has.
 5. The last task finishes. Nothing is pending or in flight on a sealed run: the run
    completes, and WatchRuns emits COMPLETED with final stats.
+   Or a site blocks the crawler for a long time, and the run lists that outcome code in
+   its abort rules: the run ends ABORTED at once, with the rule and the task that tripped
+   it, instead of waiting for the block to end. The block stays on the queue.
 6. Whatever consumes the results reads the run's stats, outcome codes and items and
    decides what they mean.
 ```
@@ -194,11 +197,14 @@ belong to an implementation and its deployment (ADR 0002 has them for the first 
 | One dispatch loop per pool on each replica: it holds the free credits of the pool's sessions, asks for work at once on a notification, otherwise at `NextReadyAt`, with a fallback poll every second, and hands each assignment to a session | Selecting and claiming tasks; readiness index |
 | Reaper loop: expired leases → retry or fail | Finding expired leases |
 | `WatchRuns`: events plus periodic stats snapshots | Ordered, gap-free run event log; aggregated stats |
-| Pushing `LeaseRevoked` for runs that were cancelled or expired | Run limits (`max_tasks`, `max_depth`, `deadline`), run termination |
+| Pushing `LeaseRevoked` for runs that were cancelled, expired or aborted | Run limits (`max_tasks`, `max_depth`, `deadline`), abort rules, run termination |
 | A per-replica budget of store calls: when exhausted, fail the call with `UNAVAILABLE` instead of queueing, so a slow store does not become a retry storm | The clock (`Now`) and background maintenance |
 | Metrics, logging, tracing | |
 
-The store never interprets an `Outcome`: it receives a decided transition. The core never
+The store never interprets an `Outcome`: it receives a decided transition. The abort rules of
+a run are the one place where it looks further: it applies them to the transition and the
+outcome code of the attempt it records, because the counters they need are the run's and the
+decision must be atomic with the outcome that trips it. The core never
 reads a timestamp from its own clock to schedule anything: it passes durations, and the
 store applies them with its own clock.
 
@@ -327,7 +333,7 @@ type RunSpec struct {
 	ID      RunID
 	Labels  map[string]string
 	Policy  *policyv1.RunPolicy // immutable after creation
-	Limits  RunLimits             // deadline, max_tasks, max_depth
+	Limits  RunLimits             // deadline, max_tasks, max_depth, abort rules
 	KeyRule KeyRule
 	Paused  bool
 	Hash    []byte                // canonical hash of the fields above
@@ -556,8 +562,47 @@ prevent. `TaskSpec.priority` orders tasks inside one run's backlog only.
   completing their parent (ADR 0003).
 - **A run completes exactly when it is sealed and none of its backlogs has pending or
   in-flight tasks.** The check is atomic with the change that empties the last backlog (or
-  with `SealRun`). No task is ever added to a completed, cancelled or expired run: a seed
+  with `SealRun`). No task is ever added to a completed, cancelled, expired or aborted run: a seed
   racing `SealRun` is either accepted before the seal or rejected with `RUN_CLOSED`.
+- **A run can end on an outcome: abort rules.** `RunLimits` carries three: `abort_on_codes`,
+  `max_failed` and `max_consecutive_failures`. They are checked by `Finish`, in the
+  transaction that applies the attempt, and when one trips the same transaction ends the run
+  as `ABORTED` and records why: the rule, the code of the attempt and its task. The rest is
+  as for `CancelRun`: the run is over at once, pending tasks and leases are drained in the
+  background, leases are revoked, and the tasks dropped count as `cancelled`. An abort is an
+  outcome of the run, not of an operator: the run's state and its reason tell the two apart.
+  - `abort_on_codes`: an attempt that is recorded with a listed code ends the run, whether
+    it is a final failure, a retry or a success. A task handed back unrun (`Released`)
+    records no attempt and never counts. The block that comes with the outcome is applied
+    first, so the queue stays blocked after the run is gone.
+  - `max_failed`: the run ends when that many of its tasks have failed for good. Retries,
+    expiries and drops do not count. Neither does a task whose last attempt ended because
+    its lease expired (a `Source = Reaper` outcome): that is the worker fleet failing, and
+    an outage of the fleet must not end the run. The same holds for the streak below,
+    which such an outcome neither adds to nor resets. The code `lease_expired` can still be
+    listed in `abort_on_codes`.
+  - `max_consecutive_failures`: the run ends when that many tasks have failed for good in a
+    row. "In a row" is the order in which the store applies the outcomes of the run, one at
+    a time: a task that fails for good adds one, a task that succeeds resets the count, and
+    nothing else changes it. With concurrent workers this is the order of application, not
+    the order in which pages were fetched.
+  - Several rules that trip on one outcome give the first of: the code, the streak, the
+    total. A run that is already over is not aborted, so a run has at most one reason, also
+    when workers on different queues trip a rule at the same moment. A sealed run whose
+    last task trips a rule ends `ABORTED`, not `COMPLETED`.
+  - A run without abort rules pays nothing for them. A run with them keeps its failure
+    counters on its own row, and the outcomes that change them are applied one at a time
+    through that row's lock; a success takes it only when there is a streak to reset.
+  - **Rollout.** A build that predates the rules takes an `ABORTED` run for a live one: it
+    dispatches it, extends its leases and does not drain it. So the rules are used only
+    after every Frontier replica runs a build that has them, then the schedulers that set
+    them. A store that registers its replicas enforces this: `CreateRun` with rules is
+    refused (`FAILED_PRECONDITION`) while a replica that does not know them has reported
+    within the last minute. The SDK checks that the answer to `CreateRun` carries the rules
+    that were sent, which catches a Frontier too old to know them. Going back to an
+    earlier build first turns aborted runs into cancelled ones (the Down step of the
+    migration). A state name a build does not know reads as cancelled, so a later state
+    added the same way is final in this build.
 - **Pause, resume and cancel change the run's state in one small step and take effect
   eventually.** They never touch the run's backlogs in the same operation, so their cost
   does not depend on the size of the run.
@@ -565,9 +610,9 @@ prevent. `TaskSpec.priority` orders tasks inside one run's backlog only.
     dispatch already under way may still hand out its tasks, and leases in flight continue.
   - `ResumeRun`: the run's backlogs are made ready again in background batches, so its
     queues come back over a short time, not at once.
-  - `CancelRun` and a passed `deadline` end the run immediately (`CANCELLED`, `EXPIRED`).
-    Pending tasks and leases are drained in the background: pending tasks are cancelled or
-    expired, leases end as revoked attempts, and their completions return `STALE`. A
+  - `CancelRun` and a passed `deadline` end the run immediately (`CANCELLED`, `EXPIRED`), as
+    does a tripped abort rule (`ABORTED`). Pending tasks and leases are drained in the
+    background: pending tasks are cancelled or expired (cancelled for an aborted run), leases end as revoked attempts, and their completions return `STALE`. A
     dispatch under way when the run ends may hand out tasks; they are drained the same way.
 - `max_tasks` is soft: a batch is rejected (`OVER_BUDGET`) once the run's task count has
   reached the limit, and the count may be stale by at most one second, so concurrent
@@ -615,13 +660,18 @@ bucket, so no implementation needs a cross-partition write to add a task.
 
 ### Events and stats
 
-- Run events (`CREATED`, `SEALED`, `PAUSED`, `RESUMED`, `COMPLETED`, `CANCELLED`, `EXPIRED`)
+- Run events (`CREATED`, `SEALED`, `PAUSED`, `RESUMED`, `COMPLETED`, `CANCELLED`, `EXPIRED`, `ABORTED`)
   have a cursor that is ordered by commit: a client that resumes from cursor `c` sees every
   event after `c`, exactly once per read. `STATS` events are not stored; `WatchRuns`
   produces them from `GetRun` reads at `stats_interval`.
 - Stats are exact counters kept on backlogs and summed on read. A read is not a snapshot
   across backlogs: during dispatch, `pending + in_flight` can be off by the tasks moving
   between them.
+- `RunStats.blocked_queues` lists the blocked queues on which the run has pending or delayed
+  tasks: the queue, when the block ends, why, and how many of the run's tasks wait there. A
+  run can touch many queues, so the list holds at most 20, the ones with the most waiting
+  tasks first. It is empty for a run that has ended. It is what tells a run that its tasks
+  are delayed by a block, which `pending` and `delayed` alone do not.
 - `RunStats.delayed` is the pending tasks whose `not_before` is in the future, and
   `RunStats.pending` the rest. Tasks that wait for a session with their handler count as
   pending.
@@ -723,6 +773,9 @@ supports it. Each one names the rule it proves:
 | `RunEvents` resumed from any cursor under concurrent transitions never misses or repeats an event | Event order |
 | A backlog whose tasks have all expired stops being selected without waiting for `Maintain` | No spin on expired tasks |
 | No `ready_at` is ever later than the true eligible time (property test over random operations) | Readiness never late |
+| Each abort rule ends the run with its reason on the outcome that trips it, drops the rest as `cancelled`, fences the leases still out, and keeps the queue block that came with the outcome | Abort rules |
+| Workers on different queues that trip a rule at the same moment give one `ABORTED` event and one reason | Abort is atomic |
+| `blocked_queues` lists the blocked queues a run waits on, busiest first and bounded, and nothing once the block ends | Blocks on the run |
 | A session with handlers is given only tasks of those handlers, in priority order across them; tasks no session can run take no politeness slot and do not hide the tasks behind them | Dispatch by handler |
 | A task whose handler no session has had for the grace period fails with `no_handler`; a handler a session reports keeps its tasks | Unserved handlers |
 | Pause, resume and cancel racing dispatch and finish: a dispatch that starts after pause or cancel returns takes nothing from the run; a task handed out during the race is drained or completes normally; after resume every backlog with pending tasks becomes ready | Lifecycle (eventual) |
@@ -772,7 +825,7 @@ These are the known limits of the current design. Each names what it is proporti
 | Cost | Grows with | Effect at large size | Way out |
 |---|---|---|---|
 | `ResumeRun` and the cancel drain work through the run's backlogs in background batches | Queues one run has work on | A resumed run spread over millions of hosts takes a while to be fully ready again | Accepted: the state change itself is one step |
-| `GetRun` stats and the `max_tasks` count sum the run's backlogs | Queues one run has work on | Stats reads become scans | Accepted. Rollups per run and bucket if it ever hurts |
+| `GetRun` stats, `blocked_queues` and the `max_tasks` count read the run's backlogs | Queues one run has work on | Stats reads become scans | Accepted. Rollups per run and bucket if it ever hurts |
 | Run completion on a sharded store reads the run's backlogs on every shard it touched | Shards one run has work on | A completion check fans out | Per-shard "run active here" markers |
 | Dispatch and finish lock every backlog with pending tasks on the queue | Runs with work on one queue | Thousands of concurrent runs on one host slow that host's dispatch | Pick from an index of the lowest start tags, lock only the winner |
 | A changed policy set resets the readiness of every active backlog | Active backlogs | A deploy that changes policies causes a write burst | Reset lazily, on the next check of each backlog |

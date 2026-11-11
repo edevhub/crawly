@@ -266,7 +266,7 @@ func TestMigrationDown(t *testing.T) {
 	}
 	mustExec(t, db, `UPDATE lanes SET ready_at = now() + interval '1 hour' WHERE queue_key = 'a'`)
 	want := backlogReady(t, db, "a")
-	if _, err := p.Down(ctx); err != nil {
+	if _, err := p.DownTo(ctx, 1); err != nil { // the migrations after it go first
 		t.Fatal(err)
 	}
 	if got := backlogReady(t, db, "a"); got == nil || !got.Equal(*want) {

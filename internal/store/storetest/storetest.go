@@ -706,6 +706,7 @@ func Run(t *testing.T, f Factory) {
 		}
 	})
 
+	abortSuite(t, f)
 	t.Run("HandlerSelection", func(t *testing.T) {
 		// A session is given the tasks of its handlers and none of the others; one
 		// that names no handler is given everything; a task with no handler is for
