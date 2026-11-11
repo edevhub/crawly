@@ -1,4 +1,5 @@
-// Package testfrontier runs a Frontier on the in-memory store inside a test.
+// Package testfrontier runs a Frontier inside a test, on the in-memory store or on
+// PostgreSQL.
 package testfrontier
 
 import (
@@ -15,6 +16,8 @@ import (
 	"github.com/edevhub/crawly/internal/policy"
 	"github.com/edevhub/crawly/internal/store"
 	"github.com/edevhub/crawly/internal/store/memstore"
+	"github.com/edevhub/crawly/internal/store/pgstore"
+	"github.com/edevhub/crawly/internal/store/pgstore/pgtest"
 )
 
 // Policies are fast limits and short leases, so tests finish quickly.
@@ -47,11 +50,37 @@ func Start(tb testing.TB) *Frontier {
 // StartAt is Start on a given address.
 func StartAt(tb testing.TB, addr string) *Frontier {
 	tb.Helper()
+	pol := policies(tb)
+	return start(tb, addr, pol, memstore.New(pol))
+}
+
+// StartPostgres is Start with the PostgreSQL store, in a schema of its own. The test
+// is skipped when no PostgreSQL is configured (see pgtest).
+func StartPostgres(tb testing.TB) *Frontier {
+	tb.Helper()
+	dsn := pgtest.Schema(tb)
+	pol := policies(tb)
+	st, err := pgstore.New(context.Background(), dsn, pol)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	f := start(tb, "127.0.0.1:0", pol, st)
+	tb.Cleanup(st.Close) // runs after the replica has stopped
+	return f
+}
+
+func policies(tb testing.TB) *policy.Set {
+	tb.Helper()
 	pol, err := policy.Parse([]byte(Policies))
 	if err != nil {
 		tb.Fatal(err)
 	}
-	f := &Frontier{Addr: addr, tb: tb, pol: pol, store: memstore.New(pol)}
+	return pol
+}
+
+func start(tb testing.TB, addr string, pol *policy.Set, st store.Store) *Frontier {
+	tb.Helper()
+	f := &Frontier{Addr: addr, tb: tb, pol: pol, store: st}
 	f.Restart()
 	tb.Cleanup(f.Stop)
 	return f

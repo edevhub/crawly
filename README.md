@@ -21,19 +21,31 @@ Early. What exists today:
 | SDK (`sdk/worker`, `sdk`): workers and scheduler client | Usable: handler and parser strategies, pools, heartbeats, reconnects, graceful shutdown |
 | Frontier core (`internal/frontier`) | Usable: all four gRPC services, dispatch loop per pool, reaper, lease revocation |
 | In-memory store (`internal/store/memstore`) | Passes the conformance suite. State is lost on restart; one replica only |
-| PostgreSQL store (ADR 0002) | Not implemented yet |
+| PostgreSQL store (`internal/store/pgstore`, ADR 0002) | Passes the conformance suite. State survives restarts; several replicas share one database. Not benchmarked yet |
 | Conformance suite (`internal/store/storetest`) | Covers politeness, overrides, blocks, fairness, pools, fencing, termination, lifecycle |
 
-Not implemented yet: the PostgreSQL store, bucket ownership, the per-replica store call
-budget, and the SDK's resource-based tuner.
+Not implemented yet: bucket ownership, the per-replica store call budget, Frontier metrics,
+and the SDK's resource-based tuner.
 
 ## Try it
 
-Start a Frontier (in-memory store):
+Start a Frontier. Without a database it keeps the state in memory and loses it on restart:
 
 ```sh
 go run github.com/edevhub/crawly/cmd/crawly-frontier@latest -listen :7070
 ```
+
+With PostgreSQL 18 the state survives restarts and several replicas can share the database.
+The schema is created on the first start:
+
+```sh
+export CRAWLY_POSTGRES='postgres://crawly:secret@localhost:5432/crawly'
+go run github.com/edevhub/crawly/cmd/crawly-frontier@latest -listen :7070
+```
+
+`-postgres` takes the same URL. When that URL goes through a transaction pooler such as
+PgBouncer, give the Frontier a direct one for `LISTEN` with `-postgres-listen` (or
+`CRAWLY_POSTGRES_LISTEN`).
 
 Run the example spider and scheduler against it:
 
@@ -282,6 +294,10 @@ These are the global policies. A run's own policy is given at `CreateRun` (see a
 make generate   # regenerate Go code from the protos (needs buf)
 make check      # buf lint, golangci-lint (strict, see .golangci.yml), tests with the race detector
 ```
+
+`make check` starts a throwaway PostgreSQL 18 in Docker for the tests of the PostgreSQL
+store (`make postgres-stop` removes it). Plain `go test ./...` skips those tests unless
+`CRAWLY_TEST_POSTGRES` names a database they may use.
 
 Releases are semantic version tags. The `Release` workflow computes the next version, runs
 the full test suite and only then tags and publishes; a `v*` tag pushed by hand goes

@@ -1,6 +1,6 @@
 # ADR 0002: PostgreSQL store
 
-- **Status:** Proposed
+- **Status:** Implemented in [`internal/store/pgstore`](../../internal/store/pgstore)
 - **Date:** 2026-11-09
 - **Related:** [ADR 0001: Frontier storage architecture](0001-frontier-storage-architecture.md),
   [`api/crawly/frontier/`](../../api/crawly/frontier/) (proto packages)
@@ -24,8 +24,9 @@ across pools, and finished backlogs kept off the hot path.
 ## Decision
 
 Implement `Store` on one PostgreSQL primary. Each `Store` method is one short transaction at
-`READ COMMITTED`, sent as one round trip (a server-side function per operation, or a
-pipeline of prepared statements). `Dispatch` is the exception: one transaction per queue it
+`READ COMMITTED`. The scheduling arithmetic runs in Go inside the transaction, so a
+transaction is a few round trips: statements that do not depend on each other's results
+are sent as one pipeline. `Dispatch` is the exception: one transaction per queue it
 dispatches from (ADR 0001). No transaction stays open while a worker fetches.
 
 The schema follows ADR 0001's locality rule: everything a hot transaction writes is keyed by
@@ -74,7 +75,8 @@ Opaque IDs, encoded by the store and never parsed by clients:
   lease ID unique per dispatch even if a dispatch is lost and the attempt number repeats.
 
 `bucket` = `hash(queue_key) mod 256` with a fixed hash (xxh64 of the key bytes), computed in
-Go.
+Go. A task's ID carries the bucket of its own queue, so a task row keeps the bucket of its
+parent next to the parent's UUID: a child on another queue can still name its parent.
 
 ### Runs and events
 
@@ -104,7 +106,7 @@ CREATE INDEX runs_labels   ON runs USING gin (labels);
 
 CREATE TABLE run_events (
   id     bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,  -- the EventCursor
-  run_no bigint      NOT NULL REFERENCES runs,
+  run_no bigint      NOT NULL REFERENCES runs ON DELETE CASCADE,
   type   smallint    NOT NULL,
   at     timestamptz NOT NULL DEFAULT now()
 );
@@ -146,9 +148,11 @@ CREATE TABLE pools (
 
 Pools exist only to give backlogs and indexes a small key. A session subscribes by name; a
 pool row is created by the first task in it, and a session for a pool with no row yet simply
-finds no work and listens on the pool's channel, which is named after the pool, not its id.
-The name rule keeps `frontier_work_<name>` a valid channel identifier (under 63 bytes, no
-quoting).
+finds no work. Work in a pool is announced on the pool's channel, which is named after the
+pool, not its id. The name rule keeps `frontier_work_<name>` a valid channel identifier
+(under 63 bytes, no quoting). Creating a pool row is announced on `frontier_pools`: a
+replica then listens on the new pool's channel and wakes that pool once, because the
+pool's first notification may have been sent before it listened.
 
 ### Queues and backlogs
 
@@ -244,9 +248,11 @@ CREATE TABLE tasks (
   expires_at       timestamptz,
   depth            int         NOT NULL,
   parent_task_id   uuid,
+  parent_bucket    smallint,                         -- the bucket in the parent's task_id
   attempt          int         NOT NULL DEFAULT 0,
   lease_nonce      bigint,
   worker_id        text,
+  worker_version   text,
   dispatched_at    timestamptz,
   lease_expires_at timestamptz,
   lease_deadline   timestamptz,
@@ -274,8 +280,8 @@ Partitions are monthly, created ahead of time by `Maintain`. All tasks of a run 
 run's `created_on`, so the dedup constraint is valid on the partitioned table and every
 run-scoped query names one partition.
 
-`tasks_claim` includes `not_before` and `expires_at`, so a claim passes over tasks that wait
-for a retry backoff without visiting the heap.
+`tasks_claim` includes `not_before` and `expires_at`. A claim locks rows, so it still
+fetches the heap tuple of a task that waits for a retry backoff before it passes over it.
 
 `spec` is stored out of line from a few hundred bytes up, so state transitions copy a small
 heap tuple and only dispatch reads the spec (one TOAST fetch).
@@ -299,6 +305,7 @@ CREATE TABLE attempts (
   dispatched_at  timestamptz NOT NULL,
   finished_at    timestamptz NOT NULL,
   result         smallint    NOT NULL,  -- succeeded, failed, retry, lease_expired, revoked
+  kind           smallint    NOT NULL DEFAULT 0,  -- the worker's outcome kind, as reported
   code           text,
   message        text,
   http_status    int,
@@ -404,7 +411,11 @@ that wait. Pause and cancel do not lock backlogs (see Lifecycle), so a dispatch 
 the state just before they committed still hands out its tasks; ADR 0001 accepts that.
 
 4. **Admit and pick, in Go** (`sched`). Backlogs of paused or ended runs are set to
-   `ready_at = NULL` (this heals an add that raced a pause). For each remaining backlog,
+   `ready_at = NULL` (this heals an add that raced a pause). Before it does that, the
+   dispatch locks those `runs` rows `FOR SHARE` and reads them again: a resume either
+   committed before, and the backlog stays, or waits for this transaction, and its sweep
+   then finds the backlog. Without the lock a resume sweep could pass a backlog just
+   before a dispatch that still saw the pause takes it out. For each remaining backlog,
    compute admission (ADR 0001: block, shared or own GCRA, concurrency) and the number
    admitted. Take the admitted backlog with the lowest start tag `greatest(vtime, vclock)`
    across every pool:
@@ -423,19 +434,25 @@ the state just before they committed still hands out its tasks; ADR 0001 accepts
 5. **Claim:**
 
    ```sql
-   UPDATE tasks t SET state = 'in_flight', attempt = t.attempt + 1, lease_nonce = $nonce,
-          worker_id = $w, dispatched_at = now(),
-          lease_expires_at = now() + $lease, lease_deadline = now() + $max_lease
-   WHERE (t.run_created_on, t.task_id) IN (
-     SELECT run_created_on, task_id FROM tasks
+   WITH picked AS MATERIALIZED (
+     SELECT task_id FROM tasks
      WHERE run_created_on = $d AND run_no = $r AND queue_key = $k AND pool_id = $c
        AND state = 'pending' AND not_before <= now()
        AND (expires_at IS NULL OR expires_at > now())
      ORDER BY priority DESC, task_id
      LIMIT $n
      FOR UPDATE SKIP LOCKED)
-   RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.spec;
+   UPDATE tasks t SET state = 'in_flight', attempt = t.attempt + 1, lease_nonce = $nonce,
+          worker_id = $w, worker_version = $v, dispatched_at = now(),
+          lease_expires_at = now() + $lease, lease_deadline = now() + $max_lease
+   FROM picked WHERE t.run_created_on = $d AND t.task_id = picked.task_id
+   RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.spec;
    ```
+
+   The picked rows are materialised on purpose. Written as `WHERE (…) IN (SELECT … LIMIT $n
+   FOR UPDATE SKIP LOCKED)`, the planner may run the sub-select again for every outer row,
+   and the statement then claims more than `n` tasks. The same form is used wherever
+   `Maintain` changes a bounded batch of tasks.
 
    If it returns fewer than `n` rows, recompute this backlog's `ready_at` from `tasks_next`
    (the earliest `not_before` among non-expired pending tasks, or `NULL`) and, if slots
@@ -504,8 +521,8 @@ pools and TTLs come from the core.
 5. **Backlogs**, one upsert per (queue, run, pool) in primary key order:
    - `pending += added`, `tasks_total += added`, `discovered += added` (discovered only),
      `duplicates += dup`, `over_budget += rejected`;
-   - `ready_at = least(ready_at, greatest(now(), min_not_before))`, unless the run is
-     paused (read from the cached run state; dispatch heals a race).
+   - `ready_at = least(ready_at, greatest(now(), min_not_before))`. This is done for a
+     paused run too: dispatch takes the backlog out again the first time it meets it.
 6. **Run state:** `SELECT pg_advisory_xact_lock_shared(1, $run_no)`, then read `runs.state`.
    For seeds, anything but `open` rolls back the batch as `RUN_CLOSED`; for discoveries,
    anything but `open` or `sealed` does. Because the lock comes last, `SealRun` and
@@ -536,7 +553,8 @@ Used for worker completions (`Source = Worker`) and the reaper (`Source = Reaper
      no outcome code. The queue's politeness state is left as dispatch advanced it, so a
      release never lets a queue exceed its limits;
    - if the run is `cancelled` or `expired`, the task becomes `cancelled` / `expired`
-     instead and the attempt is recorded as `revoked`.
+     instead, the attempt is recorded as `revoked` and the call reports the lease as
+     `STALE`: the result the worker sent is not applied.
 5. **Attempt row** insert.
 6. **Queue:** `in_flight -= 1`; if `Block > 0`:
    `blocked_until = greatest(blocked_until, now() + $block)`, `block_reason = $code`.
@@ -559,7 +577,16 @@ The core calls it only when a `Complete` arrives for a lease this replica did no
 ### Extend lease
 
 Lock the task by lease, check validity as in Finish, then
-`lease_expires_at = least(now() + $by, lease_deadline)`. One row, no other locks.
+`lease_expires_at = least(now() + $by, lease_deadline)`. One row, no other locks. A lease
+of a run that was cancelled or has expired is not extended: it is reported as `STALE`.
+
+### Block queue
+
+The operator call follows the lock order of Finish: create the queue row if it is missing,
+lock it `FOR NO KEY UPDATE`, lock its backlogs with pending tasks, set or clear
+`blocked_until`. A block raises the `ready_at` of those backlogs to its end. Lifting or
+shortening a block lowers every `ready_at` that lies in the future to `now()`: a value
+that an earlier block raised would otherwise be late.
 
 ### Expired leases (reaper)
 
@@ -616,9 +643,12 @@ number of rows, whatever the size of the run, and the effect on backlogs is even
 - **ResumeRun:** clear `paused`, set `resuming`. The replica that served the call then runs
   the resume sweep, and `Maintain` finishes it if that replica dies: in batches, each its
   own transaction in primary key order,
-  `UPDATE backlogs SET ready_at = now() WHERE run_no = $r AND pending > 0 AND ready_at IS NULL`,
+  `UPDATE backlogs SET ready_at = now() WHERE run_no = $r AND pending > 0`,
   with a `NOTIFY` per pool. Each batch re-reads the run and stops if it was paused again.
-  The last batch clears `resuming`.
+  The last batch clears `resuming`. The sweep resets every backlog with pending tasks and
+  not only the ones with `NULL`: nothing keeps the readiness of a paused run up to date,
+  so a backlog may still wait (`'infinity'`) for a slot that was freed during the pause,
+  or for a block that was lifted. Dispatch works out the readiness again.
 - **CancelRun:** `state = 'cancelled'`, `finished_at = now()`. Returns at once; dispatch
   skips the run's backlogs as for a paused run, and `Maintain` drains them.
 - **Deadline:** `Maintain` finds runs past `deadline` (`runs_active`) and ends them like
@@ -637,10 +667,10 @@ with `SKIP LOCKED`, or `pg_try_advisory_xact_lock` per job):
 | Task TTL | Per backlog with expired pending tasks (`tasks_ttl`): lock queue, backlog, expire tasks `SKIP LOCKED`, adjust `pending` / `expired`, recompute `ready_at`, completion check |
 | Resume sweep | For runs with `resuming` (`runs_resuming`): the batches described under ResumeRun |
 | Cancel and deadline drain | Per backlog of a `cancelled` / `expired` run (`runs_draining`, `backlogs_active`): pending tasks to `cancelled` / `expired`; in-flight tasks to the same state with a `revoked` attempt; release `queues.in_flight`; adjust the ledger |
-| Partitions | Create next month's `tasks` and `attempts` partitions; detach and drop partitions past retention |
+| Partitions | Create next month's `tasks` and `attempts` partitions; drop partitions past retention, except in months where a run is still `open` / `sealed` or has tasks to drain |
 | Queues | Delete `queues` rows with no backlog rows and `last_used_at` older than a day: lock the candidates `FOR UPDATE SKIP LOCKED` (an add holding `KEY SHARE` makes the row skipped), re-check that no backlog exists, then delete |
 | Replicas | Delete replicas not seen for an hour |
-| Ledger audit | Compare a sample of backlogs' `pending` / `in_flight` with counts from `tasks`, and count backlogs without a `queues` row; export both as metrics (should be zero) |
+| Ledger audit | Compare a sample of backlogs' `pending` / `in_flight` with counts from `tasks`, and count backlogs without a `queues` row; report both (they should be zero). One statement, so it sees one snapshot and can run under load |
 
 ### Start
 
@@ -656,9 +686,15 @@ backlogs of paused and ended runs keep `NULL` on purpose) and `NOTIFY` every poo
 ## Retention
 
 - `tasks` and `attempts`: monthly partitions by `run_created_on`, dropped (or archived)
-  after the retention period. No bulk `DELETE`.
+  after the retention period. No bulk `DELETE`. A month is kept while one of its runs is
+  not ended or still has pending or in-flight tasks, because their tasks live in that
+  partition and a lease of a dropped task could never be finished.
 - `runs`, `run_events`, `backlogs`, `backlog_codes`: deleted with the run after a longer
-  retention, kept for run comparisons.
+  retention, kept for run comparisons. The delete locks the run before its backlogs, which
+  is the reverse of the lock order. It is allowed because it only takes ended runs whose
+  backlogs have no pending or in-flight tasks, so nothing else locks those backlogs. The
+  replica then sends `deleted` on `frontier_runs`, and every replica drops its run cache,
+  because a run ID is free again after the delete.
 - Raw responses live in object storage (`response_ref`) under their own retention.
 
 ## Operational settings
@@ -676,7 +712,8 @@ backlogs of paused and ended runs keep `NULL` on purpose) and `NOTIFY` every poo
   connection** for `LISTEN frontier_work_<pool name>, frontier_runs` (LISTEN does not work through
   a transaction pooler). Notifications carry no payload.
 - **Timeouts:** `statement_timeout` 2s and `lock_timeout` 1s on operation transactions;
-  `idle_in_transaction_session_timeout` 5s.
+  `idle_in_transaction_session_timeout` 5s. The store sets them on its connections unless
+  the connection URL sets them.
 - **Internal retries:** the store retries deadlock (`40P01`), serialization (`40001`) and
   lock timeout (`55P03`) errors up to three times with jitter before returning
   `ErrUnavailable`. Under the lock order, deadlocks are a bug: each one is logged and
@@ -684,8 +721,8 @@ backlogs of paused and ended runs keep `NULL` on purpose) and `NOTIFY` every poo
 
 ## Capacity
 
-First-principles estimate per vCPU for this schema, with one round trip per operation, a
-warm cache and synchronous commit (from the review, to be replaced by the benchmark):
+First-principles estimate per vCPU for this schema, with a warm cache and synchronous
+commit (from the review, to be replaced by the benchmark):
 
 | Figure | Estimate |
 |---|---|

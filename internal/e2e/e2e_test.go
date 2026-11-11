@@ -21,6 +21,17 @@ import (
 
 var clients = map[string]*sdk.Client{}
 
+// startFunc starts a Frontier for a test.
+type startFunc func(testing.TB) *testfrontier.Frontier
+
+// backends runs a test on every store. The PostgreSQL one is skipped when no
+// database is configured.
+func backends(t *testing.T, test func(*testing.T, startFunc)) {
+	t.Helper()
+	t.Run("memory", func(t *testing.T) { test(t, testfrontier.Start) })
+	t.Run("postgres", func(t *testing.T) { test(t, testfrontier.StartPostgres) })
+}
+
 func runClient(t *testing.T, addr string) run.Client {
 	t.Helper()
 	c, err := sdk.NewClient(addr, sdk.WithInsecure())
@@ -78,7 +89,9 @@ var link = regexp.MustCompile(`href="([^"]+)"`)
 
 // TestCrawl follows links over a small site: discovery, dedup, a permanent failure, a
 // retried failure and a panic, through to run completion.
-func TestCrawl(t *testing.T) {
+func TestCrawl(t *testing.T) { backends(t, testCrawl) }
+
+func testCrawl(t *testing.T, start startFunc) { //nolint:thelper // a test body, not a helper: failures must point into it
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -105,7 +118,7 @@ func TestCrawl(t *testing.T) {
 	site := httptest.NewServer(mux)
 	defer site.Close()
 
-	addr := testfrontier.Start(t).Addr
+	addr := start(t).Addr
 	rc := runClient(t, addr)
 
 	var mu sync.Mutex
@@ -177,9 +190,11 @@ func TestCrawl(t *testing.T) {
 
 // TestHandlerStrategies covers a plain Handler, pools, a missing handler, a classified
 // error with a queue block, and a lease that outlives its first duration.
-func TestHandlerStrategies(t *testing.T) {
+func TestHandlerStrategies(t *testing.T) { backends(t, testHandlerStrategies) }
+
+func testHandlerStrategies(t *testing.T, start startFunc) { //nolint:thelper // a test body, not a helper: failures must point into it
 	ctx := t.Context()
-	addr := testfrontier.Start(t).Addr
+	addr := start(t).Addr
 	rc := runClient(t, addr)
 
 	var slowRuns, blocked atomic.Int32
@@ -248,4 +263,70 @@ func TestHandlerStrategies(t *testing.T) {
 	if st.GetQueueBlocks() != 1 {
 		t.Fatalf("queue blocks: %d", st.GetQueueBlocks())
 	}
+}
+
+// TestCancel cancels a run with work in flight: the running handlers are revoked and
+// every task of the run ends as cancelled, the ones that never ran included.
+func TestCancel(t *testing.T) { backends(t, testCancel) }
+
+func testCancel(t *testing.T, start startFunc) { //nolint:thelper // a test body, not a helper: failures must point into it
+	ctx := t.Context()
+	addr := start(t).Addr
+	rc := runClient(t, addr)
+
+	started, revoked := make(chan struct{}, 8), make(chan struct{}, 8)
+	w, err := worker.New(addr, worker.WithInsecure(), worker.WithMaxConcurrentTasks(2), worker.WithShutdownGrace(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	register(t, w, "hang", worker.HandlerFunc(func(ctx context.Context, _ *worker.Task) (*worker.Result, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		revoked <- struct{}{}
+		return nil, ctx.Err()
+	}))
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- w.Run(ctx) }()
+	t.Cleanup(func() {
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker: %v", err)
+		}
+	})
+
+	if _, err := rc.CreateRun(ctx, &run.CreateRunRequest{RunId: "doomed"}); err != nil {
+		t.Fatal(err)
+	}
+	seed(t, ctx, addr, "doomed",
+		&task.Spec{Request: &task.Request{Url: "https://a.example/1"}, Handler: "hang"},
+		&task.Spec{Request: &task.Request{Url: "https://b.example/2"}, Handler: "hang"},
+		&task.Spec{Request: &task.Request{Url: "https://c.example/3"}, Handler: "hang"},
+	)
+	wait := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		for range 2 {
+			select {
+			case <-ch:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("two handlers were not %s", what)
+			}
+		}
+	}
+	wait(started, "started")
+	res, err := rc.CancelRun(ctx, &run.CancelRunRequest{RunId: "doomed"})
+	if err != nil || res.GetRun().GetState() != run.StateCancelled {
+		t.Fatalf("CancelRun: %v %v", res, err)
+	}
+	wait(revoked, "revoked")
+
+	var last *run.Stats
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		got, err := rc.GetRun(ctx, &run.GetRunRequest{RunId: "doomed"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if last = got.GetRun().GetStats(); last.GetCancelled() == 3 && last.GetPending() == 0 && last.GetInFlight() == 0 {
+			return
+		}
+	}
+	t.Fatalf("the cancelled run did not drain: %v", last)
 }
