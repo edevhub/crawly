@@ -285,3 +285,7 @@ make check      # buf lint, golangci-lint (strict, see .golangci.yml), tests wit
 Releases are semantic version tags. The `Release` workflow computes the next version, runs
 the full test suite and only then tags and publishes; a `v*` tag pushed by hand goes
 through the same gate.
+
+## License
+
+[MIT](LICENSE).
