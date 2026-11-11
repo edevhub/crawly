@@ -148,7 +148,9 @@ One worker can register any number of handlers. A task is routed by its handler 
 | `worker.HTTP` | `WithUserAgent(ua)` | User-Agent for requests that carry none |
 | | `WithHTTPClient(c)` | Your own client: proxies, cookies, TLS |
 | | `WithMaxBodyBytes(n)` | Largest body accepted; a larger one fails with `body_too_large`. Default 10 MiB |
-| | `WithCrossHostRedirects()` | Follow redirects to other hosts instead of adding them as tasks |
+| | `WithContentTypes(types...)` | Parse only these media types; another one fails with `unsupported_content_type`. Default: all |
+| | `WithSameHostRedirects()` | Follow redirects on the task's host inside the task. Each hop is a request on top of the site's rate limit, and it is not deduplicated |
+| | `WithCrossHostRedirects()` | Follow every redirect, also to other hosts, which are then fetched outside their own limits |
 
 ### Outcomes
 
@@ -167,8 +169,9 @@ Outcomes are plain Go errors:
 The codes end up in the run's stats (`Stats.ByCode`), so they are what you alert on.
 
 The HTTP adapter classifies responses itself: 2xx is parsed, 429 retries and blocks the
-site for the `Retry-After` delay, 408 and 5xx retry, other statuses fail, and a redirect to
-another host is added as a new task instead of followed. A parser can still return
+site for the `Retry-After` delay, 408 and 5xx retry, other statuses fail, and a redirect is
+not followed: its target is added as a new task, so that the Frontier paces and deduplicates
+it like any other page. A parser can still return
 `worker.Retry` or `worker.Fail` for a 2xx page, for example a captcha served with status 200.
 
 ### Discovered tasks
