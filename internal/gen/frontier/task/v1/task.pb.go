@@ -158,6 +158,7 @@ type Outcome struct {
 	Kind  Outcome_Kind           `protobuf:"varint,1,opt,name=kind,proto3,enum=crawly.frontier.task.v1.Outcome_Kind" json:"kind,omitempty"`
 	// Machine-readable code for stats and alerting, e.g. "http_404", "http_429", "captcha".
 	// Reserved codes: "no_handler" (FAILED: the worker lacks the task's handler),
+	// "task_too_large" (FAILED: the handler returned a task over the size limit),
 	// "panic" (RETRY: the handler crashed), "redirect" (SUCCESS: a redirect to another
 	// host was added as a task instead of followed), "lease_expired" (set by the frontier).
 	Code    string `protobuf:"bytes,2,opt,name=code,proto3" json:"code,omitempty"`
@@ -332,7 +333,8 @@ func (x *FetchInfo) GetItemsEmitted() uint32 {
 	return 0
 }
 
-// What clients submit (scheduler seeds, worker discoveries).
+// What clients submit (scheduler seeds, worker discoveries). A spec is limited to 1 MiB
+// as encoded; a larger one is INVALID.
 type TaskSpec struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Request *Request               `protobuf:"bytes,1,opt,name=request,proto3" json:"request,omitempty"`

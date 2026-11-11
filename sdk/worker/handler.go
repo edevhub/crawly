@@ -118,7 +118,9 @@ type NewTask struct {
 	DedupKey  string
 	Priority  int32
 	NotBefore time.Time
-	Context   map[string][]byte
+	// Context is opaque spider data, handed back with the task. The whole task, with
+	// Context, must fit into MaxTaskBytes.
+	Context map[string][]byte
 }
 
 // Kind classifies a failure.

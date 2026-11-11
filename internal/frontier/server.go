@@ -32,6 +32,7 @@ import (
 	workerv1 "github.com/edevhub/crawly/internal/gen/frontier/worker/v1"
 	"github.com/edevhub/crawly/internal/policy"
 	"github.com/edevhub/crawly/internal/store"
+	"github.com/edevhub/crawly/internal/wire"
 )
 
 // Config configures a Frontier replica.
@@ -419,7 +420,7 @@ func (s *Server) newTasks(spec store.RunSpec, specs []*taskv1.TaskSpec) []store.
 	out := make([]store.NewTask, len(specs))
 	for i, ts := range specs {
 		pool, queue, fp, err := identify(spec.KeyRule, ts)
-		if err != nil {
+		if err != nil || proto.Size(ts) > wire.MaxTaskBytes {
 			out[i].Invalid = true
 			continue
 		}
