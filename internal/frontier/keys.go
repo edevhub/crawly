@@ -15,12 +15,28 @@ import (
 	"github.com/edevhub/crawly/internal/store"
 )
 
-// DedupKey is the default normalisation of a request URL (ADR 0001, Dedup): scheme +
-// host + path + query parameters sorted ascending. Scheme and host are lowercased;
-// path and query keep their case, because it carries meaning on many sites. The host
-// keeps an explicit non-default port, and an empty path is "/". Fragment, method,
-// headers and body are not part of it.
-func DedupKey(rawURL string) (string, error) {
+// DedupKey is the default dedup key of a request (ADR 0001, Dedup). For a GET it is
+// the normalised URL. Any other method is told apart by the method and by the body:
+// APIs page through one URL with a cursor in the body, and merging those requests
+// would drop pages without a signal. Headers are not part of the key.
+func DedupKey(r *taskv1.Request) (string, error) {
+	key, err := urlKey(r.GetUrl())
+	method := strings.ToUpper(r.GetMethod())
+	if err != nil || method == "" || method == "GET" {
+		return key, err
+	}
+	key = method + " " + key
+	if body := r.GetBody(); len(body) > 0 {
+		key += fmt.Sprintf(" sha256:%x", sha256.Sum256(body))
+	}
+	return key, nil
+}
+
+// urlKey is the default normalisation of a request URL: scheme + host + path + query
+// parameters sorted ascending. Scheme and host are lowercased; path and query keep
+// their case, because it carries meaning on many sites. The host keeps an explicit
+// non-default port, and an empty path is "/". The fragment is not part of it.
+func urlKey(rawURL string) (string, error) {
 	u, err := parseURL(rawURL)
 	if err != nil {
 		return "", err
@@ -109,7 +125,7 @@ func identify(rule store.KeyRule, ts *taskv1.TaskSpec) (pool store.PoolName, que
 	}
 	dedup := ts.GetDedupKey()
 	if dedup == "" {
-		if dedup, err = DedupKey(rawURL); err != nil {
+		if dedup, err = DedupKey(ts.GetRequest()); err != nil {
 			return "", "", fp, err
 		}
 	}

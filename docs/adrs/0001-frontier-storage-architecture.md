@@ -556,10 +556,12 @@ computes the fingerprint over the queue key and the task's dedup key, so **dedup
 and queue**.
 
 The dedup key is `TaskSpec.dedup_key` when the client sets it. Otherwise it is the
-**default normalisation** of the request URL: scheme + host + path + query parameters,
-with the parameters sorted alphanumerically ascending. Scheme and host are lowercased; path
-and query keep their case. The host keeps an explicit non-default port, and an empty path
-is `/`. The fragment, method, headers and body are not part of it.
+**default key** of the request. For a GET that is the normalised URL: scheme + host + path
++ query parameters, with the parameters sorted alphanumerically ascending. Scheme and host
+are lowercased; path and query keep their case. The host keeps an explicit non-default
+port, and an empty path is `/`. The fragment is not part of it. For any other method the
+key is the method, the normalised URL and the SHA-256 of the body. Headers are never part
+of it.
 
 Path and query are not lowercased because the two possible mistakes are not equal. A key
 that is too loose merges two pages, and one of them is never crawled, with no signal but
@@ -567,11 +569,16 @@ one more duplicate among many. A key that is too strict costs one extra fetch, w
 in the stats. Case carries meaning on many sites (short ids, encoded tokens, wiki titles,
 object keys), and only scheme and host are case-insensitive by the URL standard.
 
+Method and body are part of the key for the same reason. Search and GraphQL APIs page
+through one URL with a cursor in the body; a key of the URL alone keeps the first page and
+drops the others as duplicates. A body that differs only in formatting costs one extra
+fetch.
+
 The default is one rule for every site, computed in the Frontier so that seeds from a
 scheduler and links from a spider hash the same way. It is deliberately simple, and it is
-wrong for some sites: it merges requests that differ only in method or body, and it keeps
-apart URLs that differ only in case on a case-insensitive site, or only in tracking or
-session parameters. Anything site-specific is the spider's job: it sets `dedup_key` whenever
+wrong for some sites: it merges requests that differ only in headers, and it keeps apart
+URLs that differ only in case on a case-insensitive site, or only in tracking or session
+parameters. Anything site-specific is the spider's job: it sets `dedup_key` whenever
 special rules apply.
  With the `HOST` and `REGISTERED_DOMAIN` key rules the queue
 key follows from the URL, so this is the same as per run. It differs only when a client
@@ -814,9 +821,8 @@ implementation carries out an operation, and each fix stays inside the store or 
   intended meaning of an override.
 - Policy changes need a deploy and are mixed during the rollout.
 - Dedup is per run and queue (identical to per run with host-derived keys).
-- The default dedup key ignores method and body, and keeps the case of path and query.
-  Spiders for sites where method or body matter, or where case does not, must set
-  `dedup_key`.
+- The default dedup key ignores headers, and keeps the case of path and query. Spiders
+  for sites where headers matter, or where case does not, must set `dedup_key`.
 - `max_tasks` can be overshot by up to one second of concurrent additions.
 - Opaque `task_id` and `lease_id` encodings belong to the implementation and must not be
   parsed by clients.

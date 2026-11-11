@@ -67,11 +67,13 @@ message TaskSpec {
   Request request = 1;
   // Queue the task belongs to. Empty: derived from the run's KeyRule.
   string queue_key = 2;
-  // Dedup key. Empty: the default normalisation of request.url: scheme + host + path +
-  // query parameters sorted alphanumerically ascending. Scheme and host are lowercased,
-  // path and query keep their case (fragment, method, headers and body are ignored). Set
-  // it whenever a site needs special rules, e.g. case-insensitive paths, tracking
-  // parameters, or requests told apart by method or body.
+  // Dedup key. Empty: the default key of the request. For a GET that is the normalised
+  // request.url: scheme + host + path + query parameters sorted alphanumerically
+  // ascending. Scheme and host are lowercased, path and query keep their case, the
+  // fragment is ignored. For any other method it is the method, that URL and the SHA-256
+  // of the body. Headers are never part of it. Set it whenever a site needs special
+  // rules, e.g. case-insensitive paths, tracking parameters, or requests told apart by
+  // a header.
   // Dedup is scoped to the run and the queue key (the fingerprint includes the queue key).
   // With HOST or REGISTERED_DOMAIN key rules that is the same as per run.
   string dedup_key = 3;
