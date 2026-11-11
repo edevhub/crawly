@@ -148,19 +148,19 @@ func TestAnsweredOutcomes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	status := func(code uint32) *taskv1.FetchInfo { return &taskv1.FetchInfo{HttpStatus: code} }
+	answer := func(code uint32) *taskv1.FetchInfo { return &taskv1.FetchInfo{HttpStatus: code} }
 	cases := []struct {
 		name  string
 		o     *taskv1.Outcome
 		fetch *taskv1.FetchInfo
 		want  bool
 	}{
-		{"success", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_SUCCESS}, status(200), true},
-		{"a 404", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_FAILED, Code: "http_404"}, status(404), true},
-		{"a 500 that is no strain", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_500"}, status(500), true},
+		{"success", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_SUCCESS}, answer(200), true},
+		{"a 404", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_FAILED, Code: "http_404"}, answer(404), true},
+		{"a 500 that is no strain", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_500"}, answer(500), true},
 		{"a retry without an answer", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "panic"}, nil, false},
-		{"strain", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_503", Strain: true}, status(503), false},
-		{"a block", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_429", BlockQueueFor: durationpb.New(time.Minute)}, status(429), false},
+		{"strain", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_503", Strain: true}, answer(503), false},
+		{"a block", &taskv1.Outcome{Kind: taskv1.Outcome_KIND_RETRY, Code: "http_429", BlockQueueFor: durationpb.New(time.Minute)}, answer(429), false},
 	}
 	for _, c := range cases {
 		if got := s.decide(store.LeaseInfo{Queue: "a.example", Ref: store.LeaseRef{Attempt: 1}}, c.o, c.fetch).Answered; got != c.want {
