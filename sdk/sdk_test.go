@@ -70,11 +70,12 @@ func TestSeed(t *testing.T) {
 		t.Fatalf("the repeated URL: %v, want a duplicate", res[n].GetStatus())
 	}
 
-	// The default dedup key ignores case and query order.
+	// The default dedup key ignores the case of scheme and host and the query order,
+	// but not the case of the path.
 	res, err = c.Seed(ctx, "seed",
 		&task.Spec{Request: &task.Request{Url: "https://x.example/a?b=2&a=1"}, Handler: "page"},
-		&task.Spec{Request: &task.Request{Url: "HTTPS://X.example/A?a=1&b=2"}, Handler: "page"},
-		&task.Spec{Request: &task.Request{Url: "HTTPS://X.example/A?a=1&b=2"}, Handler: "page", DedupKey: "case-sensitive:/A"},
+		&task.Spec{Request: &task.Request{Url: "HTTPS://X.example/a?a=1&b=2"}, Handler: "page"},
+		&task.Spec{Request: &task.Request{Url: "https://x.example/A?a=1&b=2"}, Handler: "page"},
 	)
 	if err != nil {
 		t.Fatal(err)

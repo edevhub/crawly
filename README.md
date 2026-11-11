@@ -186,8 +186,8 @@ res.Tasks = append(res.Tasks, worker.NewTask{
 ```
 
 Discovered tasks are deduplicated per run by a normalised URL (scheme + host + path +
-sorted query, lowercased). Set `DedupKey` when a site needs special rules: case-sensitive
-paths, tracking parameters, POST bodies.
+sorted query; scheme and host lowercased, path and query as they are). Set `DedupKey` when
+a site needs special rules: case-insensitive paths, tracking parameters, POST bodies.
 
 ## Scheduling a run
 

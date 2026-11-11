@@ -339,9 +339,10 @@ type TaskSpec struct {
 	// Queue the task belongs to. Empty: derived from the run's KeyRule.
 	QueueKey string `protobuf:"bytes,2,opt,name=queue_key,json=queueKey,proto3" json:"queue_key,omitempty"`
 	// Dedup key. Empty: the default normalisation of request.url: scheme + host + path +
-	// query parameters sorted alphanumerically ascending, all lowercased (fragment, method,
-	// headers and body are ignored). Set it whenever a site needs special rules, e.g.
-	// case-sensitive paths, tracking parameters, or requests told apart by method or body.
+	// query parameters sorted alphanumerically ascending. Scheme and host are lowercased,
+	// path and query keep their case (fragment, method, headers and body are ignored). Set
+	// it whenever a site needs special rules, e.g. case-insensitive paths, tracking
+	// parameters, or requests told apart by method or body.
 	// Dedup is scoped to the run and the queue key (the fingerprint includes the queue key).
 	// With HOST or REGISTERED_DOMAIN key rules that is the same as per run.
 	DedupKey string `protobuf:"bytes,3,opt,name=dedup_key,json=dedupKey,proto3" json:"dedup_key,omitempty"`
