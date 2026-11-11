@@ -335,7 +335,8 @@ type runMeta struct {
 	createdAt time.Time
 }
 
-const metaColumns = `run_no, run_id, spec_hash, created_on, labels, policy, key_rule, deadline, max_tasks, max_depth, created_at`
+const metaColumns = `run_no, run_id, spec_hash, created_on, labels, policy, key_rule, deadline, max_tasks, max_depth, created_at,
+	abort_codes, max_failed, max_consecutive_failures`
 
 func scanMeta(row pgx.Row) (*runMeta, error) {
 	var (
@@ -346,8 +347,11 @@ func scanMeta(row pgx.Row) (*runMeta, error) {
 		deadline pgtype.Timestamptz
 		maxTasks *int64
 		maxDepth *int32
+		maxFail  *int64
+		maxRow   *int32
 	)
-	if err := row.Scan(&m.no, &id, &m.spec.Hash, &m.createdOn, &m.spec.Labels, &pol, &rule, &deadline, &maxTasks, &maxDepth, &m.createdAt); err != nil {
+	if err := row.Scan(&m.no, &id, &m.spec.Hash, &m.createdOn, &m.spec.Labels, &pol, &rule, &deadline, &maxTasks, &maxDepth, &m.createdAt,
+		&m.spec.Limits.AbortOnCodes, &maxFail, &maxRow); err != nil {
 		return nil, err
 	}
 	m.createdOn, m.createdAt = m.createdOn.UTC(), m.createdAt.UTC()
@@ -359,6 +363,12 @@ func scanMeta(row pgx.Row) (*runMeta, error) {
 	}
 	if maxDepth != nil && *maxDepth > 0 {
 		m.spec.Limits.MaxDepth = uint32(*maxDepth)
+	}
+	if maxFail != nil && *maxFail > 0 {
+		m.spec.Limits.MaxFailed = uint64(*maxFail)
+	}
+	if maxRow != nil && *maxRow > 0 {
+		m.spec.Limits.MaxConsecutiveFailures = uint32(*maxRow)
 	}
 	if len(pol) > 0 {
 		m.spec.Policy = &policyv1.RunPolicy{}
@@ -460,7 +470,7 @@ func (s *Store) meta(ctx context.Context, q querier, no int64) (*runMeta, error)
 
 var runStates = map[string]store.RunState{
 	"open": store.RunOpen, "sealed": store.RunSealed, "completed": store.RunCompleted,
-	"cancelled": store.RunCancelled, "expired": store.RunExpired,
+	"cancelled": store.RunCancelled, "expired": store.RunExpired, "aborted": store.RunAborted,
 }
 
 func runStateName(st store.RunState) string {

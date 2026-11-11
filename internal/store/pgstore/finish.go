@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -238,7 +239,7 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 
 	// 3. The transition.
 	status := store.FinishAccepted
-	ended := own.state == store.RunCancelled || own.state == store.RunExpired
+	ended := own.state == store.RunCancelled || own.state == store.RunExpired || own.state == store.RunAborted
 	own.inFlight--
 	own.dirty = true
 	q.inFlight--
@@ -307,12 +308,83 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 	if err := flush(ctx, tx, now, q, bs); err != nil {
 		return store.FinishUnknown, err
 	}
+	if !ended && f.Result != store.ResultReleased {
+		// After the outcome is applied and the backlogs are written: an abort ends the
+		// run, and what it leaves is drained like a cancelled run's.
+		aborted, err := s.tripAbort(ctx, tx, now, t, f)
+		if err != nil {
+			return store.FinishUnknown, err
+		}
+		ended = ended || aborted
+	}
 	if own.pending == 0 && own.inFlight == 0 && !ended {
 		if err := s.complete(ctx, tx, t.run, now); err != nil {
 			return store.FinishUnknown, err
 		}
 	}
 	return status, s.wakeWaiting(ctx, tx, bs)
+}
+
+// tripAbort applies the abort rules of the run to an attempt that was just applied, and
+// ends the run if one trips. The run's counters sit on its row, and the row is locked
+// for every outcome that changes them, so outcomes of the run are applied one at a time
+// whichever queues they come from: two that trip a rule at once give one abort, since the
+// second finds the run over. A success only takes the lock when there is a streak to
+// reset; a run without rules never touches its row. The advisory lock comes first, as in
+// every lifecycle change, so that the order of locks is the same.
+func (s *Store) tripAbort(ctx context.Context, tx pgx.Tx, now time.Time, t *leased, f store.Finish) (bool, error) {
+	m, err := s.meta(ctx, tx, t.run)
+	if err != nil {
+		return false, err
+	}
+	lim := m.spec.Limits
+	failed := f.Result == store.ResultFailed
+	codeHit := f.Record.Code != "" && slices.Contains(lim.AbortOnCodes, f.Record.Code)
+	switch {
+	case !lim.HasAbortRules():
+		return false, nil
+	case failed && lim.CountsFailures(), codeHit:
+	case f.Result == store.ResultSucceeded && lim.MaxConsecutiveFailures > 0:
+		var streak int64
+		if err := tx.QueryRow(ctx, "SELECT failed_streak FROM runs WHERE run_no = $1", t.run).Scan(&streak); err != nil || streak == 0 {
+			return false, ignoreNoRows(err)
+		}
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int, $2::int)", lockRun, lockKey(t.run)); err != nil {
+			return false, err
+		}
+		_, err := tx.Exec(ctx, "UPDATE runs SET failed_streak = 0 WHERE run_no = $1 AND state IN ('open', 'sealed')", t.run)
+		return false, err
+	default:
+		return false, nil
+	}
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int, $2::int)", lockRun, lockKey(t.run)); err != nil {
+		return false, err
+	}
+	var name string
+	var total, streak int64
+	err = tx.QueryRow(ctx, "SELECT state::text, failed_count, failed_streak FROM runs WHERE run_no = $1 FOR UPDATE", t.run).Scan(&name, &total, &streak)
+	if err != nil || runStates[name].Ended() {
+		return false, ignoreNoRows(err) // the run was over before this outcome: nothing to end
+	}
+	if failed && lim.CountsFailures() {
+		total, streak = total+1, streak+1
+		if _, err := tx.Exec(ctx, "UPDATE runs SET failed_count = $2, failed_streak = $3 WHERE run_no = $1", t.run, total, streak); err != nil {
+			return false, err
+		}
+	}
+	rule, ok := lim.Trip(f.Record.Code, uint64(total), uint64(streak)) //nolint:gosec // G115: counters are not negative
+	if !ok {
+		return false, nil
+	}
+	return true, s.abort(ctx, tx, t.run, store.AbortReason{Rule: rule, Code: f.Record.Code, Task: t.key.ID()}, now)
+}
+
+// ignoreNoRows turns "no such row" into nil: the run was deleted, so there is nothing to do.
+func ignoreNoRows(err error) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	return err
 }
 
 // refresh brings the readiness of a queue's locked backlogs up to date after a slot

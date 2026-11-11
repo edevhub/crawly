@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	policyv1 "github.com/edevhub/crawly/internal/gen/frontier/policy/v1"
@@ -169,12 +170,14 @@ type Page struct {
 type RunState int
 
 // RunOpen accepts seeds; RunSealed takes no more and drains; the other states are final.
+// RunAborted is a run a rule of its RunLimits ended.
 const (
 	RunOpen RunState = iota + 1
 	RunSealed
 	RunCompleted
 	RunCancelled
 	RunExpired
+	RunAborted
 )
 
 // Ended reports whether the run has reached a final state.
@@ -190,11 +193,57 @@ const (
 	KeyExplicit
 )
 
-// RunLimits caps what a run may do.
+// RunLimits caps what a run may do, and says when it ends early.
 type RunLimits struct {
 	Deadline time.Time // zero: none
 	MaxTasks uint64    // 0: none
 	MaxDepth uint32    // 0: none
+	// The abort rules. Finish evaluates them in the transaction that applies an attempt.
+	AbortOnCodes           []string // empty: none; an attempt recorded with one of these codes ends the run
+	MaxFailed              uint64   // 0: none; tasks failed for good
+	MaxConsecutiveFailures uint32   // 0: none; tasks failed for good with no success applied between
+}
+
+// AbortRule is the rule of RunLimits that ended a run.
+type AbortRule int
+
+// AbortOnCode is the abort_on_codes rule, AbortMaxFailed max_failed and AbortConsecutiveFailures max_consecutive_failures.
+const (
+	AbortOnCode AbortRule = iota + 1
+	AbortMaxFailed
+	AbortConsecutiveFailures
+)
+
+// AbortReason is why a run was aborted: the rule, and the attempt that tripped it.
+type AbortReason struct {
+	Rule AbortRule
+	Code string // of the attempt; may be empty
+	Task TaskID
+}
+
+// HasAbortRules reports whether any abort rule is set.
+func (l RunLimits) HasAbortRules() bool {
+	return len(l.AbortOnCodes) > 0 || l.MaxFailed > 0 || l.MaxConsecutiveFailures > 0
+}
+
+// CountsFailures reports whether a rule needs the run's failure counters.
+func (l RunLimits) CountsFailures() bool { return l.MaxFailed > 0 || l.MaxConsecutiveFailures > 0 }
+
+// Trip reports which rule an applied attempt trips. code is the attempt's code,
+// failed the number of tasks that have failed for good, run included, and streak the
+// number of them in a row. Both stores call it, so the rules read the same in both. When
+// several rules trip at once the code rule wins, then the streak, then the total.
+func (l RunLimits) Trip(code string, failed, streak uint64) (AbortRule, bool) {
+	switch {
+	case code != "" && slices.Contains(l.AbortOnCodes, code):
+		return AbortOnCode, true
+	case l.MaxConsecutiveFailures > 0 && streak >= uint64(l.MaxConsecutiveFailures):
+		return AbortConsecutiveFailures, true
+	case l.MaxFailed > 0 && failed >= l.MaxFailed:
+		return AbortMaxFailed, true
+	default:
+		return 0, false
+	}
 }
 
 // RunSpec is the immutable definition of a run.
@@ -216,6 +265,7 @@ type Run struct {
 	CreatedAt  time.Time
 	SealedAt   time.Time
 	FinishedAt time.Time
+	Abort      *AbortReason // set when State is RunAborted
 	Stats      RunStats
 }
 
@@ -226,6 +276,20 @@ type RunStats struct {
 	Attempts, QueueBlocks                 uint64
 	Discovered, Duplicates, OverBudget    uint64
 	ByCode                                map[string]uint64
+	// BlockedQueues are the blocked queues the run's pending and delayed tasks wait on,
+	// the ones with the most waiting tasks first, at most MaxBlockedQueues.
+	BlockedQueues []BlockedQueue
+}
+
+// MaxBlockedQueues bounds RunStats.BlockedQueues.
+const MaxBlockedQueues = 20
+
+// BlockedQueue is a blocked queue a run waits on.
+type BlockedQueue struct {
+	Queue   QueueKey
+	Until   time.Time
+	Reason  string
+	Waiting uint64 // the run's pending and delayed tasks on the queue
 }
 
 // RunFilter selects runs by state and labels; empty fields match everything.
@@ -246,6 +310,8 @@ const (
 	EventCompleted
 	EventCancelled
 	EventExpired
+	// EventAborted is 9, as in the API: 8 is the statistics event, which is not logged.
+	EventAborted RunEventType = 9
 )
 
 // RunEvent is one entry of the run event log.

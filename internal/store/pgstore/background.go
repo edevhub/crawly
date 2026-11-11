@@ -327,11 +327,11 @@ func scanBacklogRef(row pgx.CollectableRow) (backlogRef, error) {
 	return b, err
 }
 
-// drain moves the tasks of cancelled and expired runs to their final state, one
+// drain moves the tasks of cancelled, aborted and expired runs to their final state, one
 // backlog per transaction, and releases the slots their in-flight tasks held.
 func (s *Store) drain(ctx context.Context, _ time.Time) error {
 	rows, err := s.db.Query(ctx, `SELECT b.queue_key, b.run_no, b.pool_id FROM runs r JOIN backlogs b ON b.run_no = r.run_no
-		WHERE r.state IN ('cancelled', 'expired') AND (b.pending > 0 OR b.in_flight > 0)
+		WHERE r.state IN ('cancelled', 'expired', 'aborted') AND (b.pending > 0 OR b.in_flight > 0)
 		ORDER BY b.queue_key, b.run_no, b.pool_id LIMIT $1`, maintainBacklogs)
 	if err != nil {
 		return wrap(err)
@@ -364,7 +364,7 @@ func (s *Store) drainBacklog(ctx context.Context, tx pgx.Tx, now time.Time, ref 
 			own = b
 		}
 	}
-	if own == nil || own.meta == nil || (own.state != store.RunCancelled && own.state != store.RunExpired) {
+	if own == nil || own.meta == nil || (own.state != store.RunCancelled && own.state != store.RunExpired && own.state != store.RunAborted) {
 		return nil
 	}
 	final := taskCancelled
@@ -563,7 +563,7 @@ func (s *Store) retain(ctx context.Context, now time.Time) error {
 	// The run is locked before its backlogs, against the lock order: these backlogs
 	// have no work left, so nothing else locks them.
 	rows, err := s.db.Query(ctx, `WITH old AS (
-			SELECT run_no FROM runs r WHERE state IN ('completed', 'cancelled', 'expired') AND finished_at < $1
+			SELECT run_no FROM runs r WHERE state IN ('completed', 'cancelled', 'expired', 'aborted') AND finished_at < $1
 				AND NOT EXISTS (SELECT 1 FROM backlogs b WHERE b.run_no = r.run_no AND (b.pending > 0 OR b.in_flight > 0))
 			ORDER BY run_no LIMIT $2 FOR UPDATE SKIP LOCKED),
 		codes AS (DELETE FROM backlog_codes WHERE run_no IN (SELECT run_no FROM old)),

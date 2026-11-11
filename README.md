@@ -333,12 +333,58 @@ func main() {
 tasks in batches; when it fails part of the way it returns the results of the batches
 that were committed together with the error, and seeding again is safe. A seed over
 1 MiB (`sdk.MaxTaskBytes`) is not sent and its result is `INVALID`. `Wait` returns the
-run once it is completed, cancelled or expired; it reconnects with backoff when the stream
+run once it is completed, cancelled, expired or aborted; it reconnects with backoff when the stream
 breaks, which happens on every restart of a Frontier, and fails with `NotFound` when the
 run does not exist. Underneath it is `WatchRuns`, a raw stream that starts with the run's
 current state when it is given a `RunId`. The other
 run calls are `PauseRun`, `ResumeRun`, `CancelRun`, `GetRun`, `ListRuns`, `ListTasks` and
 `GetTask`. `c.Queues` and `c.Policies` are the operator APIs.
+
+### Ending a run on an outcome
+
+Without further rules a sealed run ends when it has nothing left to do, however long that
+takes: a site that blocks the crawler for 72 hours holds the run's tasks for 72 hours. Three
+limits end a run early, as `ABORTED`, in the same transaction that applies the outcome that
+trips them:
+
+```go
+c.Runs.CreateRun(ctx, &run.CreateRunRequest{
+	RunId: id,
+	Limits: &run.Limits{
+		AbortOnCodes:           []string{worker.CodeBlocked},
+		MaxFailed:              500,
+		MaxConsecutiveFailures: 20,
+	},
+})
+```
+
+- `AbortOnCodes`: an attempt recorded with one of these codes ends the run. It counts
+  whether the attempt is a final failure, a retry or a success; a task a worker handed back
+  without running it records no attempt and does not count. The queue block that came with
+  the outcome stays: only the run goes.
+- `MaxFailed`: the run ends when that many tasks have failed for good. Retries do not count.
+- `MaxConsecutiveFailures`: the run ends when that many tasks have failed for good in a row.
+  A success resets the count; a retry does not change it. The Frontier applies the outcomes
+  of a run one at a time, and "in a row" is that order, which with several workers is not
+  the order in which the pages were fetched.
+
+`CreateRun` rejects an empty or repeated code, more than 64 codes, and the codes `revoked`
+and `shutdown`, which no recorded attempt carries. When two rules trip at once the code rule
+wins, then the streak, then the total; workers that trip a rule at the same moment give one
+abort and one reason.
+
+An aborted run is as final as a cancelled one: its remaining tasks are dropped and counted
+as `cancelled`, the handlers still running its tasks are revoked, and its state is
+`run.StateAborted`. What `Wait` returns and what `WatchRuns` ends with (`run.EventAborted`)
+carries `AbortReason`: the rule (`run.AbortOnCode`, `run.AbortMaxFailed` or
+`run.AbortConsecutiveFailures`), the code of the attempt and the task that tripped it. That
+tells an abort from an operator's `CancelRun`.
+
+A run whose tasks wait for a blocked queue says so: `Stats.BlockedQueues` lists the queues
+that are blocked now and hold pending or delayed tasks of the run, each with the time the
+block ends, its reason and the number of the run's tasks waiting there. A run can touch many
+queues, so the list holds at most 20, those with the most waiting tasks first, and it is
+empty once the run has ended.
 
 A run can set limits for itself, for every site or for the sites a glob matches:
 

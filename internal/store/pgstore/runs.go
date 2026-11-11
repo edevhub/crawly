@@ -43,6 +43,20 @@ func (s *Store) CreateRun(ctx context.Context, spec store.RunSpec) (store.Run, e
 		n := int32(min(spec.Limits.MaxDepth, math.MaxInt32))
 		maxDepth = &n
 	}
+	var maxFailed *int64
+	if spec.Limits.MaxFailed > 0 {
+		n := int64(min(spec.Limits.MaxFailed, math.MaxInt64))
+		maxFailed = &n
+	}
+	var maxStreak *int32
+	if spec.Limits.MaxConsecutiveFailures > 0 {
+		n := int32(min(spec.Limits.MaxConsecutiveFailures, math.MaxInt32))
+		maxStreak = &n
+	}
+	var abortCodes []string // NULL when there are none
+	if len(spec.Limits.AbortOnCodes) > 0 {
+		abortCodes = spec.Limits.AbortOnCodes
+	}
 	now, err := s.Now(ctx)
 	if err != nil {
 		return store.Run{}, err
@@ -53,10 +67,11 @@ func (s *Store) CreateRun(ctx context.Context, spec store.RunSpec) (store.Run, e
 	var no int64
 	err = s.tx(ctx, func(tx pgx.Tx, now time.Time) error {
 		day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-		err := tx.QueryRow(ctx, `INSERT INTO runs (run_id, spec_hash, created_on, labels, policy, key_rule, deadline, max_tasks, max_depth, paused, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (run_id) DO NOTHING RETURNING run_no`,
+		err := tx.QueryRow(ctx, `INSERT INTO runs (run_id, spec_hash, created_on, labels, policy, key_rule, deadline, max_tasks, max_depth, paused, created_at,
+				abort_codes, max_failed, max_consecutive_failures)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (run_id) DO NOTHING RETURNING run_no`,
 			string(spec.ID), spec.Hash, day, labels, pol, int16(spec.KeyRule), //nolint:gosec // G115: a small enum
-			tszNull(spec.Limits.Deadline), maxTasks, maxDepth, spec.Paused, now).Scan(&no)
+			tszNull(spec.Limits.Deadline), maxTasks, maxDepth, spec.Paused, now, abortCodes, maxFailed, maxStreak).Scan(&no)
 		if errors.Is(err, pgx.ErrNoRows) {
 			var hash []byte
 			if err := tx.QueryRow(ctx, "SELECT run_no, spec_hash FROM runs WHERE run_id = $1", string(spec.ID)).Scan(&no, &hash); err != nil {
@@ -272,6 +287,17 @@ func (s *Store) end(ctx context.Context, tx pgx.Tx, no int64, st store.RunState,
 	return s.event(ctx, tx, no, typ, now)
 }
 
+// abort ends a run that a rule of its limits tripped, and keeps the reason. The caller
+// holds the run's exclusive lock and has seen the run is not over.
+func (s *Store) abort(ctx context.Context, tx pgx.Tx, no int64, why store.AbortReason, now time.Time) error {
+	if _, err := tx.Exec(ctx, `UPDATE runs SET state = 'aborted', finished_at = $2, resuming = false,
+			abort_rule = $3, abort_code = $4, abort_task = $5 WHERE run_no = $1`,
+		no, now, int16(why.Rule), nullString(why.Code), string(why.Task)); err != nil { //nolint:gosec // G115: a small enum
+		return err
+	}
+	return s.event(ctx, tx, no, store.EventAborted, now)
+}
+
 // complete finishes a sealed run that has nothing pending or in flight. It takes the
 // run's exclusive lock, so of two transactions that empty the last two backlogs, the
 // second sees the first one's commit.
@@ -323,7 +349,10 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, err
 	r := store.Run{Spec: m.spec, CreatedAt: m.createdAt, Stats: store.RunStats{ByCode: map[string]uint64{}}}
 	var name string
 	var sealed, finished pgtype.Timestamptz
-	err = q.QueryRow(ctx, "SELECT state::text, paused, sealed_at, finished_at FROM runs WHERE run_no = $1", m.no).Scan(&name, &r.Paused, &sealed, &finished)
+	var abortRule *int16
+	var abortCode, abortTask *string
+	err = q.QueryRow(ctx, `SELECT state::text, paused, sealed_at, finished_at, abort_rule, abort_code, abort_task
+		FROM runs WHERE run_no = $1`, m.no).Scan(&name, &r.Paused, &sealed, &finished, &abortRule, &abortCode, &abortTask)
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.forget(m)
 		return store.Run{}, store.ErrNotFound
@@ -332,6 +361,15 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, err
 		return store.Run{}, wrap(err)
 	}
 	r.State, r.SealedAt, r.FinishedAt = runStates[name], timeOf(sealed), timeOf(finished)
+	if r.State == store.RunAborted && abortRule != nil {
+		r.Abort = &store.AbortReason{Rule: store.AbortRule(*abortRule)}
+		if abortCode != nil {
+			r.Abort.Code = *abortCode
+		}
+		if abortTask != nil {
+			r.Abort.Task = store.TaskID(*abortTask)
+		}
+	}
 
 	st := &r.Stats
 	var pending, delayed int64
@@ -351,6 +389,11 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, err
 	}
 	delayed = min(delayed, pending)
 	st.Pending, st.Delayed = uint64(pending-delayed), uint64(delayed) //nolint:gosec // G115: counters are not negative
+	if pending > 0 && !r.State.Ended() {
+		if st.BlockedQueues, err = s.blockedQueues(ctx, q, m.no, now); err != nil {
+			return store.Run{}, wrap(err)
+		}
+	}
 	rows, err := q.Query(ctx, "SELECT code, sum(count)::bigint FROM backlog_codes WHERE run_no = $1 GROUP BY code", m.no)
 	if err != nil {
 		return store.Run{}, wrap(err)
@@ -364,6 +407,28 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, err
 		return store.Run{}, wrap(err)
 	}
 	return r, nil
+}
+
+// blockedQueues lists the blocked queues a run's pending and delayed tasks wait on: the
+// ones with the most waiting tasks, at most store.MaxBlockedQueues.
+func (s *Store) blockedQueues(ctx context.Context, q querier, no int64, now time.Time) ([]store.BlockedQueue, error) {
+	rows, err := q.Query(ctx, `SELECT b.queue_key, q.blocked_until, coalesce(q.block_reason, ''), sum(b.pending)::bigint
+		FROM backlogs b JOIN queues q ON q.key = b.queue_key
+		WHERE b.run_no = $1 AND b.pending > 0 AND q.blocked_until > $2
+		GROUP BY b.queue_key, q.blocked_until, q.block_reason
+		ORDER BY sum(b.pending) DESC, b.queue_key LIMIT $3`, no, now, store.MaxBlockedQueues)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (store.BlockedQueue, error) {
+		var b store.BlockedQueue
+		var key string
+		var until pgtype.Timestamptz
+		var n int64
+		err := row.Scan(&key, &until, &b.Reason, &n)
+		b.Queue, b.Until, b.Waiting = store.QueueKey(key), timeOf(until), uint64(n) //nolint:gosec // G115: counters are not negative
+		return b, err
+	})
 }
 
 const defaultPage = 100

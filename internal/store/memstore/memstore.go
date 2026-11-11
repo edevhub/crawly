@@ -80,6 +80,8 @@ type run struct {
 	tasks                     []*task
 	backlogs                  []*backlog
 	stats                     store.RunStats // counters only; ledger figures are computed
+	streak                    uint64         // tasks failed for good in a row, for the abort rule
+	abort                     *store.AbortReason
 }
 
 func (r *run) dispatchable() bool {
@@ -229,6 +231,7 @@ func (s *Store) CancelRun(_ context.Context, id store.RunID) (store.Run, error) 
 func (s *Store) end(r *run, state store.RunState) {
 	now := s.now()
 	r.state, r.finished = state, now
+	// Cancelled and aborted runs drop their tasks as cancelled.
 	final, counter := store.TaskCancelled, &r.stats.Cancelled
 	if state == store.RunExpired {
 		final, counter = store.TaskExpired, &r.stats.Expired
@@ -254,9 +257,12 @@ func (s *Store) end(r *run, state store.RunState) {
 		s.wakeQueue(b.q)
 	}
 	r.active = 0
-	if state == store.RunExpired {
+	switch state {
+	case store.RunExpired:
 		s.event(r, store.EventExpired)
-	} else {
+	case store.RunAborted:
+		s.event(r, store.EventAborted)
+	default:
 		s.event(r, store.EventCancelled)
 	}
 }
@@ -349,8 +355,31 @@ func (s *Store) view(r *run) store.Run {
 			}
 		}
 	}
+	if !r.state.Ended() {
+		st.BlockedQueues = r.blockedQueues(now)
+	}
 	return store.Run{Spec: r.spec, State: r.state, Paused: r.paused, CreatedAt: r.created,
-		SealedAt: r.sealed, FinishedAt: r.finished, Stats: st}
+		SealedAt: r.sealed, FinishedAt: r.finished, Abort: r.abort, Stats: st}
+}
+
+// blockedQueues lists the blocked queues the run's undispatched tasks wait on.
+func (r *run) blockedQueues(now time.Time) []store.BlockedQueue {
+	var out []store.BlockedQueue
+	for _, b := range r.backlogs {
+		if len(b.pending) == 0 || !now.Before(b.q.blockedUntil) {
+			continue
+		}
+		i := slices.IndexFunc(out, func(o store.BlockedQueue) bool { return o.Queue == b.q.key })
+		if i < 0 {
+			out = append(out, store.BlockedQueue{Queue: b.q.key, Until: b.q.blockedUntil, Reason: b.q.blockReason})
+			i = len(out) - 1
+		}
+		out[i].Waiting += safeconv.Uint64(len(b.pending))
+	}
+	slices.SortFunc(out, func(a, b store.BlockedQueue) int {
+		return cmp.Or(cmp.Compare(b.Waiting, a.Waiting), cmp.Compare(a.Queue, b.Queue))
+	})
+	return out[:min(len(out), store.MaxBlockedQueues)]
 }
 
 // ---- tasks
@@ -736,11 +765,20 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 	case store.ResultFailed:
 		t.state = store.TaskFailed
 		r.stats.Failed++
+		r.streak++
 		r.active--
 	default:
 		t.state = store.TaskSucceeded
 		r.stats.Succeeded++
+		r.streak = 0
 		r.active--
+	}
+	if rule, ok := r.spec.Limits.Trip(f.Record.Code, r.stats.Failed, r.streak); ok {
+		// The outcome is applied: now the rule ends the run, in the same critical section.
+		r.abort = &store.AbortReason{Rule: rule, Code: f.Record.Code, Task: t.id}
+		s.end(r, store.RunAborted)
+		s.wakeQueue(q)
+		return store.FinishAccepted, nil
 	}
 	s.complete(r)
 	s.wakeQueue(q)
