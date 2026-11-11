@@ -180,6 +180,11 @@ type Outcome struct {
 	// Retry-After header on a 429. Extends, never shortens, an existing block.
 	// Capped by the queue's policy (Behaviour.max_queue_block, 24 hours by default).
 	BlockQueueFor *durationpb.Duration `protobuf:"bytes,5,opt,name=block_queue_for,json=blockQueueFor,proto3" json:"block_queue_for,omitempty"`
+	// The failure is a sign that the site is under strain (a 503, a timeout, slow
+	// answers): the queue slows down, and the task is retried against
+	// Behaviour.max_strain_attempts instead of max_attempts. Absent on an older worker,
+	// which means no strain. Ignored for RELEASED.
+	Strain        bool `protobuf:"varint,6,opt,name=strain,proto3" json:"strain,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -247,6 +252,13 @@ func (x *Outcome) GetBlockQueueFor() *durationpb.Duration {
 		return x.BlockQueueFor
 	}
 	return nil
+}
+
+func (x *Outcome) GetStrain() bool {
+	if x != nil {
+		return x.Strain
+	}
+	return false
 }
 
 type FetchInfo struct {
@@ -764,14 +776,15 @@ var File_crawly_frontier_task_v1_task_proto protoreflect.FileDescriptor
 
 const file_crawly_frontier_task_v1_task_proto_rawDesc = "" +
 	"\n" +
-	"\"crawly/frontier/task/v1/task.proto\x12\x17crawly.frontier.task.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd5\x02\n" +
+	"\"crawly/frontier/task/v1/task.proto\x12\x17crawly.frontier.task.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xed\x02\n" +
 	"\aOutcome\x129\n" +
 	"\x04kind\x18\x01 \x01(\x0e2%.crawly.frontier.task.v1.Outcome.KindR\x04kind\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\x12:\n" +
 	"\vretry_after\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\n" +
 	"retryAfter\x12A\n" +
-	"\x0fblock_queue_for\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\rblockQueueFor\"b\n" +
+	"\x0fblock_queue_for\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\rblockQueueFor\x12\x16\n" +
+	"\x06strain\x18\x06 \x01(\bR\x06strain\"b\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\x10\n" +
 	"\fKIND_SUCCESS\x10\x01\x12\x0e\n" +

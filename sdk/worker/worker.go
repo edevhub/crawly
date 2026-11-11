@@ -820,6 +820,7 @@ func buildReport(a *active, task *Task, res *Result, err error, release string, 
 		if e.BlockQueueFor > 0 {
 			out.BlockQueueFor = durationpb.New(e.BlockQueueFor)
 		}
+		out.Strain = e.Strain && release == ""
 	}
 	rep := &report{leaseID: a.leaseID, complete: &workerv1.Complete{LeaseId: a.leaseID, Attempt: a.attempt, Outcome: out,
 		Fetch: &taskv1.FetchInfo{ItemsEmitted: safeconv.Uint32(res.Items)}}}

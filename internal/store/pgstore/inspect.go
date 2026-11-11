@@ -195,23 +195,33 @@ type queueRow struct {
 	tat, blocked pgtype.Timestamptz
 	inFlight     int
 	reason       string
+	strain       store.Strain
 }
 
-const queueColumns = "key, tat, in_flight, blocked_until, coalesce(block_reason, '')"
+const queueColumns = "key, tat, in_flight, blocked_until, coalesce(block_reason, ''), slow_interval_ns, strain_at, strain_steps, last_strain_at, ceiling_at"
 
 func scanQueue(row pgx.CollectableRow) (queueRow, error) {
 	var q queueRow
-	err := row.Scan(&q.key, &q.tat, &q.inFlight, &q.blocked, &q.reason)
+	var slow, steps int64
+	var at, last, ceiling pgtype.Timestamptz
+	err := row.Scan(&q.key, &q.tat, &q.inFlight, &q.blocked, &q.reason, &slow, &at, &steps, &last, &ceiling)
+	q.strain = store.Strain{Interval: time.Duration(slow), At: timeOf(at), Steps: uint64(max(steps, 0)), Last: timeOf(last),
+		CeilingAt: timeOf(ceiling)}
 	return q, err
 }
 
 // queueView builds the queue as the API shows it, with its active backlogs.
 func (s *Store) queueView(ctx context.Context, q queueRow, now time.Time) (store.Queue, error) {
 	key := store.QueueKey(q.key)
-	lim := s.pol.For("", nil, key).Queue
+	e := s.pol.For("", nil, key)
+	q.strain = e.Adaptive.Decayed(q.strain, now)
+	lim := e.Adaptive.Apply(e.Queue, q.strain)
 	tat := timeOf(q.tat)
 	v := store.Queue{Key: key, InFlight: q.inFlight, NextEligibleAt: sched.EligibleAt(lim, tat),
-		AdmissibleNow: sched.Admitted(lim, tat, now, q.inFlight)}
+		AdmissibleNow: sched.Admitted(lim, tat, now, q.inFlight), Strain: q.strain}
+	if !e.Adaptive.Enabled {
+		v.Strain.Interval = 0
+	}
 	if until := timeOf(q.blocked); now.Before(until) {
 		v.BlockedUntil, v.BlockReason, v.AdmissibleNow = until, q.reason, 0
 	}
@@ -312,8 +322,8 @@ func (s *Store) ListQueues(ctx context.Context, f store.QueueFilter, page store.
 		qs, next = qs[:size], qs[size-1].key
 	}
 	out := make([]store.Queue, 0, len(qs))
-	for _, q := range qs {
-		v, err := s.queueView(ctx, q, now)
+	for i := range qs {
+		v, err := s.queueView(ctx, qs[i], now)
 		if err != nil {
 			return nil, "", wrap(err)
 		}
@@ -344,6 +354,13 @@ func (s *Store) BlockQueue(ctx context.Context, key store.QueueKey, until time.T
 		q.blockedUntil, q.blockReason = until, reason
 		if until.IsZero() {
 			q.blockReason = ""
+		}
+		if until.IsZero() && q.strain.Interval > 0 {
+			// Back to the policy's rate: what the slowdown made the queue wait is cancelled.
+			q.strain.Interval, q.strain.At, q.strain.CeilingAt = 0, now, time.Time{}
+			if q.tat.After(now) {
+				q.tat = now
+			}
 		}
 		// A block that was lifted or shortened leaves readiness late: bring it back.
 		for _, b := range bs {

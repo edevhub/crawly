@@ -1170,4 +1170,6 @@ func Run(t *testing.T, f Factory) {
 			}
 		}
 	})
+
+	adaptivePacing(t, f)
 }

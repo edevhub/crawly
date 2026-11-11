@@ -109,6 +109,7 @@ type Inspect interface {
 	GetQueue(ctx context.Context, key QueueKey) (Queue, error)
 	ListQueues(ctx context.Context, f QueueFilter, page Page) ([]Queue, string, error)
 	// BlockQueue sets (or with a zero time, clears) an operator block for all runs.
+	// Clearing it also resets the queue's adaptive slowdown.
 	BlockQueue(ctx context.Context, key QueueKey, until time.Time, reason string) (Queue, error)
 }
 
@@ -150,12 +151,18 @@ type Policies interface {
 
 // Effective is the resolved scheduling input for one run on one queue.
 type Effective struct {
-	Limits Limits        // what this run's tasks are admitted against
-	Own    bool          // Limits come from a run override: admitted on the run's own allowance
-	Queue  Limits        // the queue's shared limits, consumed by every dispatch
-	Weight float64       // fair share on this queue
-	Lease  LeaseSettings // duration and maximum duration
+	Limits Limits // what this run's tasks are admitted against
+	Own    bool   // Limits come from a run override: admitted on the run's own allowance
+	Queue  Limits // the queue's shared limits, consumed by every dispatch
+	// Adaptive is the queue's AIMD pacing. It is the queue's, not the run's: every run
+	// on the queue resolves the same value.
+	Adaptive sched.Adaptive
+	Weight   float64       // fair share on this queue
+	Lease    LeaseSettings // duration and maximum duration
 }
+
+// Strain is the adaptive state of a queue, kept with its limiter state.
+type Strain = sched.Strain
 
 // Limits are politeness limits in GCRA form: T = max(1/rate, min_delay), burst, concurrency.
 type Limits = sched.Limits
@@ -480,6 +487,9 @@ type LeaseInfo struct {
 	Fingerprint Fingerprint
 	Depth       uint32
 	Parent      TaskID
+	// StrainAttempts is how many earlier attempts of the task ended in a retry with
+	// strain. Attempt minus StrainAttempts is what max_attempts is judged against.
+	StrainAttempts uint32
 }
 
 // FinishSource says who ends an attempt, which decides how the lease is checked.
@@ -514,7 +524,20 @@ type Finish struct {
 	Result  TaskResult
 	RetryIn time.Duration // Retry and Released: not before this delay
 	Block   time.Duration // > 0: block the task's queue for all runs
-	Record  AttemptRecord
+	// Strain says the attempt failed for a reason that is a sign of strain on the
+	// site. The store moves the queue's adaptive state with it, in the same
+	// transaction, and counts the attempt as a strain attempt of the task when it is
+	// retried.
+	Strain bool
+	// Answered says the site answered, and not with a sign of strain: a success, a
+	// 404, any outcome that carries an HTTP answer. It is a step back towards the
+	// policy's rate. Neither flag set changes nothing.
+	Answered bool
+	// Extended says a Retry is granted only by the task's strain budget, past what
+	// max_attempts allows. The store turns it into a failure while the queue is in an
+	// outage (sched.Adaptive.Outage).
+	Extended bool
+	Record   AttemptRecord
 }
 
 // AttemptRecord is what is kept about one finished attempt.
@@ -598,6 +621,7 @@ type Queue struct {
 	AdmissibleNow  int // sched.Unlimited when nothing bounds it
 	BlockedUntil   time.Time
 	BlockReason    string
+	Strain         Strain // zero Interval: the queue runs at its policy's rate
 	Backlogs       []Backlog
 }
 

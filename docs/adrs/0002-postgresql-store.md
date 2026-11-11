@@ -178,6 +178,11 @@ CREATE TABLE queues (
   vclock        double precision NOT NULL DEFAULT 0,            -- fair-queueing clock
   blocked_until timestamptz,
   block_reason  text,
+  slow_interval_ns bigint        NOT NULL DEFAULT 0,            -- adaptive pacing: 0 = at the policy's rate
+  strain_at        timestamptz,                                 -- start of the current epoch
+  strain_steps     bigint        NOT NULL DEFAULT 0,
+  last_strain_at   timestamptz,
+  ceiling_at       timestamptz,                                 -- since when the interval is at its ceiling
   last_used_at  timestamptz      NOT NULL DEFAULT now()         -- for cleanup
 );
 
@@ -311,6 +316,7 @@ CREATE TABLE tasks (
   parent_task_id   uuid,
   parent_bucket    smallint,                         -- the bucket in the parent's task_id
   attempt          int         NOT NULL DEFAULT 0,
+  strain_attempts  int         NOT NULL DEFAULT 0,    -- attempts that ended in a retry with strain
   lease_nonce      bigint,
   worker_id        text,
   worker_version   text,
@@ -499,7 +505,7 @@ the state just before they committed still hands out its tasks; ADR 0001 accepts
    committed before, and the backlog stays, or waits for this transaction, and its sweep
    then finds the backlog. Without the lock a resume sweep could pass a backlog just
    before a dispatch that still saw the pause takes it out. For each remaining backlog,
-   compute admission (ADR 0001: block, shared or own GCRA, concurrency) and the number
+   compute admission (ADR 0001: block, shared or own GCRA, concurrency, as slowed by adaptive pacing) and the number
    admitted. A backlog of the session's pool is a candidate only if it has a ready lane for
    a handler the session can run; a backlog of another pool, if it has a ready lane for a
    handler of unknown name `''`, or one that `pool_handlers` says a session of that pool had
@@ -663,6 +669,19 @@ Used for worker completions (`Source = Worker`) and the reaper (`Source = Reaper
 5. **Attempt row** insert.
 6. **Queue:** `in_flight -= 1`; if `Block > 0`:
    `blocked_until = greatest(blocked_until, now() + $block)`, `block_reason = $code`.
+   The adaptive state moves with the outcome (ADR 0001, Adaptive pacing), in the same
+   row update: it is decayed and, when adaptive pacing is off, cleared; a `Strain` outcome
+   takes a strain step (`slow_interval_ns`, `strain_at`, `ceiling_at`, `strain_steps`,
+   `tat = greatest(tat, now() + interval)`, and the same for the `own_tat` of the locked
+   backlogs of runs with limits of their own); an `Answered` outcome takes a recovery step.
+   `last_strain_at` is set for every `Strain` outcome. Both compare the attempt's
+   `dispatched_at` with `strain_at`, which the task row already has. An `Extended` retry
+   becomes a failure while the queue has been at its ceiling for the policy's
+   `max_outage`. A retry with `Strain` adds one to `tasks.strain_attempts`, which the
+   lease context carries to the core. When the interval got shorter, the `ready_at` of the
+   locked backlogs that wait for a time is
+   lowered to their new admission time: a value computed for the longer interval would be
+   late.
 7. **Backlog** of the task: `in_flight -= 1`, result counter `+= 1`, `queue_blocks += 1` if
    blocked; for a retry `pending += 1` and
    `ready_at = least(ready_at, now() + $retry_in)` on the task's lane (it is added if the
@@ -739,7 +758,8 @@ of a run that was cancelled, has expired or was aborted is not extended: it is r
 
 The operator call follows the lock order of Finish: create the queue row if it is missing,
 lock it `FOR NO KEY UPDATE`, lock its backlogs with pending tasks, set or clear
-`blocked_until`. A block raises the `ready_at` of those backlogs' lanes to its end. Lifting
+`blocked_until`. Clearing it also resets the adaptive state (`slow_interval_ns = 0`,
+`strain_at = now()`, `tat = least(tat, now())`). A block raises the `ready_at` of those backlogs' lanes to its end. Lifting
 or shortening a block lowers every `ready_at` that lies in the future to `now()`: a value
 that an earlier block raised would otherwise be late.
 

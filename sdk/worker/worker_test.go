@@ -303,7 +303,8 @@ func TestTaskFields(t *testing.T) {
 }
 
 // TestHandlerTimeout: WithTimeout bounds a handler, and a handler that runs out of
-// time is a retryable failure.
+// time is a retryable failure, and no sign of strain on a site: it is given
+// max_attempts.
 func TestHandlerTimeout(t *testing.T) {
 	e := newEnv(t)
 	var calls atomic.Int32

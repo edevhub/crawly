@@ -23,6 +23,8 @@ type (
 	Selector = policyv1.PolicySelector
 	// Limits are a queue's politeness limits.
 	Limits = policyv1.QueueLimits
+	// AdaptiveLimits slow a queue down while its site is under strain.
+	AdaptiveLimits = policyv1.AdaptiveLimits
 	// Behaviour is how tasks are retried and leased: attempts, backoff and timeouts.
 	Behaviour = policyv1.Behaviour
 	// Backoff is the delay between retries of a task.

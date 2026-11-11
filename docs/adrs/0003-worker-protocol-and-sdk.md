@@ -176,7 +176,9 @@ This ADR borrows it.
 ### Outcomes
 
 Unchanged: `SUCCESS`, `RETRY` (with optional `retry_after`), `FAILED`, any of them with
-`block_queue_for`. The spider classifies; the Frontier applies `max_attempts` and backoff,
+`block_queue_for`, and any failure with `strain` (field 6: a sign of strain on the site,
+ADR 0001, Adaptive pacing; absent from an older worker, which means none). The spider
+classifies; the Frontier applies `max_attempts` and backoff,
 as Temporal's retry policy does, with `FAILED` in the place of a non-retryable error type.
 
 `RELEASED` is the fourth outcome, and the SDK's own: the worker did not run the task to an
@@ -248,7 +250,8 @@ else on this page.
 - **`Parser`** is the simpler strategy: `Parse(ctx, *Task, *Response) (*Result, error)`. The
   adapter `HTTP(parser, options...)` turns it into a `Handler`: it fetches, classifies the
   response (2xx parsed, 429 retried with a queue block, 408 and 5xx retried, other statuses
-  failed) and applies the redirect rule above. The classification is a default: a spider
+  failed; 502, 503, 504, a 429 without `Retry-After`, timeouts and failed connections carry
+  `strain`) and applies the redirect rule above. The classification is a default: a spider
   hands any status to a parser of its own, whose return value is then the outcome. That is
   how a 404 becomes a result ("the product is gone") and a 403 a block of the queue.
 - **Registration:** `Worker.Register(name, handler, options...)`, where `name` is the task's

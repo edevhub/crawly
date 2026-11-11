@@ -94,3 +94,40 @@ func TestRateTooSmall(t *testing.T) {
 		t.Fatalf("interval %v", got)
 	}
 }
+
+func TestAdaptiveLimits(t *testing.T) {
+	s, err := Parse([]byte(`{"policies": [
+		{"name": "slow", "match": {"queueKey": "*.slow.example"}, "limits": {"adaptive": {"maxInterval": "600s", "decreaseFactor": 0.25}}},
+		{"name": "off", "match": {"queueKey": "off.example"}, "limits": {"adaptive": {"enabled": false}}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := s.For("r", nil, "a.example").Adaptive
+	if def.Enabled != true || def.MaxInterval != time.Minute || def.Decrease != 0.5 || def.Recovery != 0.1 {
+		t.Fatalf("defaults: %+v", def)
+	}
+	if got := s.For("r", nil, "x.slow.example").Adaptive; got.MaxInterval != 10*time.Minute || got.Decrease != 0.25 || got.Recovery != 0.1 || !got.Enabled {
+		t.Fatalf("field by field: %+v", got)
+	}
+	if s.For("r", nil, "off.example").Adaptive.Enabled {
+		t.Fatal("a policy can switch it off")
+	}
+	// It belongs to the queue: a run's limits do not carry it, and a run cannot set it.
+	rp := &policyv1.RunPolicy{Limits: &policyv1.QueueLimits{RatePerSecond: proto.Float64(10)}}
+	if e := s.For("own", rp, "off.example"); e.Adaptive.Enabled || !e.Own {
+		t.Fatalf("run limits: %+v", e)
+	}
+	bad := &policyv1.RunPolicy{Limits: &policyv1.QueueLimits{Adaptive: &policyv1.AdaptiveLimits{Enabled: new(false)}}}
+	if ValidateRun(bad) == nil {
+		t.Error("a run that sets adaptive limits must be rejected")
+	}
+	override := &policyv1.RunPolicy{Overrides: []*policyv1.RunQueueOverride{{QueueKey: "*", Limits: bad.GetLimits()}}}
+	if ValidateRun(override) == nil {
+		t.Error("a run override that sets adaptive limits must be rejected")
+	}
+	for _, v := range []string{`"decreaseFactor": 1`, `"decreaseFactor": 0`, `"recoveryStep": 0`, `"recoveryStep": 1.5`, `"maxInterval": "0s"`} {
+		if _, err := Parse([]byte(`{"policies": [{"name": "p", "limits": {"adaptive": {` + v + `}}}]}`)); err == nil {
+			t.Errorf("%s must be rejected", v)
+		}
+	}
+}

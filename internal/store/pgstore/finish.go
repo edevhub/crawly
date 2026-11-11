@@ -43,24 +43,25 @@ type leased struct {
 	parent       pgtype.UUID
 	parentBucket *int16
 	fingerprint  store.Fingerprint
+	strained     uint32
 	handler      string
 }
 
 const leasedColumns = `run_created_on, task_id, run_no, queue_key, pool_id, state::text, attempt, coalesce(lease_nonce, 0),
 	lease_expires_at, lease_deadline, coalesce(worker_id, ''), coalesce(worker_version, ''), dispatched_at,
-	depth, parent_task_id, parent_bucket, fingerprint, handler`
+	depth, parent_task_id, parent_bucket, fingerprint, strain_attempts, handler`
 
 func scanLeased(row pgx.Row) (*leased, error) {
 	var (
 		t                             leased
 		day                           time.Time
 		queue                         string
-		attempt, depth                int32
+		attempt, depth, strained      int32
 		expires, deadline, dispatched pgtype.Timestamptz
 		fp                            []byte
 	)
 	if err := row.Scan(&day, &t.key.id, &t.run, &queue, &t.pool, &t.state, &attempt, &t.nonce, &expires, &deadline,
-		&t.worker.ID, &t.worker.Version, &dispatched, &depth, &t.parent, &t.parentBucket, &fp, &t.handler); err != nil {
+		&t.worker.ID, &t.worker.Version, &dispatched, &depth, &t.parent, &t.parentBucket, &fp, &strained, &t.handler); err != nil {
 		return nil, err
 	}
 	t.queue = store.QueueKey(queue)
@@ -68,6 +69,7 @@ func scanLeased(row pgx.Row) (*leased, error) {
 	t.attempt, t.depth = uint32(attempt), uint32(depth) //nolint:gosec // G115: neither is negative
 	t.expires, t.deadline, t.dispatched = timeOf(expires), timeOf(deadline), timeOf(dispatched)
 	t.fingerprint = store.Fingerprint(fp)
+	t.strained = uint32(max(strained, 0))
 	return &t, nil
 }
 
@@ -101,7 +103,7 @@ func (s *Store) info(ctx context.Context, q querier, t *leased) (store.LeaseInfo
 	}
 	return store.LeaseInfo{Ref: t.lease().ref(), Task: t.key.ID(), Run: m.spec.ID, RunPolicy: m.spec.Policy,
 		Queue: t.queue, Pool: pool, Fingerprint: t.fingerprint, Depth: t.depth,
-		Parent: parentID(t.parent, t.parentBucket, t.key.day)}, nil
+		Parent: parentID(t.parent, t.parentBucket, t.key.day), StrainAttempts: t.strained}, nil
 }
 
 // Lease returns the context of the task's current lease, or store.ErrNotFound if the
@@ -239,6 +241,12 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 	}
 
 	// 3. The transition.
+	if first := firstLoaded(bs); first != nil {
+		q.strain = first.eff.Adaptive.Decayed(q.strain, now)
+		if f.Result == store.ResultRetry && f.Extended && first.eff.Adaptive.Outage(q.strain, now) {
+			f.Result = store.ResultFailed // the site is down: the extended budget ends
+		}
+	}
 	status := store.FinishAccepted
 	ended := own.state == store.RunCancelled || own.state == store.RunExpired || own.state == store.RunAborted
 	own.inFlight--
@@ -264,10 +272,10 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 		// queue's politeness state stays as dispatch advanced it.
 		due = now.Add(f.RetryIn)
 		own.attempts--
-		reopenTask(batch, t, due, 1)
+		reopenTask(batch, t, due, 1, false)
 	case f.Result == store.ResultRetry:
 		due = now.Add(f.RetryIn)
-		reopenTask(batch, t, due, 0)
+		reopenTask(batch, t, due, 0, f.Strain)
 		result = resultRetry
 	case f.Result == store.ResultFailed:
 		own.failed++
@@ -295,6 +303,9 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 				q.blockedUntil, q.blockReason = until, f.Record.Code
 			}
 			own.blocks++
+		}
+		if narrowed := adapt(q, bs, own, f, t.dispatched, now); narrowed {
+			quicken(q, bs, now)
 		}
 		if f.Record.Code != "" {
 			batch.Queue(`INSERT INTO backlog_codes (queue_key, run_no, code, count) VALUES ($1, $2, $3, 1)
@@ -325,6 +336,66 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 		}
 	}
 	return status, s.wakeWaiting(ctx, tx, bs)
+}
+
+// adapt moves the queue's adaptive state with an attempt that ended, and reports
+// whether the queue's interval got shorter.
+func adapt(q *qrow, bs []*brow, b *brow, f store.Finish, dispatched, now time.Time) (narrowed bool) {
+	was := q.strain.Interval
+	if !b.eff.Adaptive.Enabled {
+		q.strain.Interval, q.strain.At, q.strain.CeilingAt = 0, now, time.Time{} // switched off: forgotten
+		return false
+	}
+	switch {
+	case f.Strain:
+		q.strain = b.eff.Adaptive.Strained(b.eff.Queue.Interval, q.strain, now, dispatched)
+	case f.Answered:
+		q.strain = b.eff.Adaptive.Answered(b.eff.Queue.Interval, q.strain, now, dispatched)
+	}
+	if q.strain.Interval > was {
+		// The next request waits a whole new interval, counted from now, for every run.
+		next := now.Add(q.strain.Interval)
+		q.tat = latest(q.tat, next)
+		for _, o := range bs {
+			if o.eff.Own && next.After(o.ownTat) {
+				o.ownTat, o.dirty = next, true
+			}
+		}
+	}
+	return q.strain.Interval < was
+}
+
+// firstLoaded is a backlog whose run is loaded, for what is the queue's and the same for
+// all of them: its adaptive settings.
+func firstLoaded(bs []*brow) *brow {
+	for _, b := range bs {
+		if b.meta != nil {
+			return b
+		}
+	}
+	return nil
+}
+
+// quicken brings the readiness of the backlogs that wait for the rate limit forward,
+// after the queue's interval got shorter: their readiness was set for the longer one.
+// Early is allowed, late is not.
+func quicken(q *qrow, bs []*brow, now time.Time) {
+	for _, b := range bs {
+		if b.pending == 0 || !b.live {
+			continue
+		}
+		admit, at := admission(q, b, now)
+		for _, l := range b.lanes {
+			if l.ready.IsZero() || l.ready.Equal(forever) || !l.ready.After(now) {
+				continue
+			}
+			if admit > 0 {
+				l.setReady(now)
+			} else if at.Before(l.ready) {
+				l.setReady(at)
+			}
+		}
+	}
 }
 
 // tripAbort applies the abort rules of the run to an attempt that was just applied, and
@@ -424,10 +495,18 @@ func closeTask(batch *pgx.Batch, t *leased, state string, now time.Time) {
 
 // reopenTask returns a task to its backlog, due at the given time. undo is 1 when
 // the attempt did not happen and its number is to be used again.
-func reopenTask(batch *pgx.Batch, t *leased, due time.Time, undo int) {
+func reopenTask(batch *pgx.Batch, t *leased, due time.Time, undo int, strained bool) {
 	batch.Queue(`UPDATE tasks SET state = 'pending', not_before = $3, attempt = attempt - $4,
+			strain_attempts = strain_attempts + $5,
 			lease_nonce = NULL, lease_expires_at = NULL, lease_deadline = NULL
-		WHERE run_created_on = $1 AND task_id = $2`, t.key.date(), t.key.id, due, undo)
+		WHERE run_created_on = $1 AND task_id = $2`, t.key.date(), t.key.id, due, undo, boolInt(strained))
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // recordAttempt appends the attempt row.

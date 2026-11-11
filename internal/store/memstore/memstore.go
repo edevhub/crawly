@@ -110,6 +110,7 @@ type queue struct {
 	vclock       float64
 	blockedUntil time.Time
 	blockReason  string
+	strain       store.Strain
 	backlogs     []*backlog
 	offer        *offer
 	served       uint64
@@ -145,6 +146,7 @@ type task struct {
 	seq       uint64
 	notBefore time.Time
 	expiresAt time.Time
+	strained  uint32          // attempts that ended in a retry with strain
 	state     store.TaskState // Pending, InFlight or a final state; Delayed is derived
 	attempt   uint32
 	nonce     string
@@ -603,6 +605,7 @@ func (s *Store) Dispatch(_ context.Context, req store.DispatchRequest) (store.Di
 // dispatchQueue claims up to slots tasks of req.Pool from one queue and returns how many.
 func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, h handlerSet, slots int, now time.Time,
 	res *store.DispatchResult, note func(time.Time)) int {
+	q.strain = s.pol.For("", nil, q.key).Adaptive.Decayed(q.strain, now)
 	taken := 0
 	for taken < slots {
 		if now.Before(q.blockedUntil) {
@@ -632,9 +635,16 @@ func (s *Store) dispatchQueue(q *queue, req store.DispatchRequest, h handlerSet,
 				continue
 			}
 			e := s.pol.For(b.r.spec.ID, b.r.spec.Policy, q.key)
+			slowed := e.Adaptive.Slowed(e.Queue, q.strain)
+			e.Queue, e.Limits = e.Adaptive.Apply(e.Queue, q.strain), e.Adaptive.Apply(e.Limits, q.strain)
 			admit, at := sched.Admitted(e.Queue, q.tat, now, q.inFlight), sched.EligibleAt(e.Queue, q.tat)
 			if e.Own {
 				admit, at = sched.Admitted(e.Limits, b.ownTat, now, b.inFlight), sched.EligibleAt(e.Limits, b.ownTat)
+				if slowed {
+					// A run with limits of its own is no faster than the slowed queue.
+					qa := sched.Admitted(e.Queue, q.tat, now, q.inFlight)
+					admit, at = min(admit, qa), latest(at, sched.EligibleAt(e.Queue, q.tat))
+				}
 			}
 			if admit == 0 {
 				// Refused by rate: ready at a known time. Refused by concurrency: a
@@ -737,7 +747,8 @@ func (b *backlog) claim(n int, now time.Time, h handlerSet) []*task {
 
 func (s *Store) info(t *task) store.LeaseInfo {
 	return store.LeaseInfo{Ref: store.LeaseRef{ID: t.leaseID(), Attempt: t.attempt}, Task: t.id, Run: t.r.spec.ID,
-		RunPolicy: t.r.spec.Policy, Queue: t.b.q.key, Pool: t.b.pool, Fingerprint: t.fp, Depth: t.depth, Parent: t.parent}
+		RunPolicy: t.r.spec.Policy, Queue: t.b.q.key, Pool: t.b.pool, Fingerprint: t.fp, Depth: t.depth, Parent: t.parent,
+		StrainAttempts: t.strained}
 }
 
 // byLease finds the task of a lease. Accepted means the lease is the task's current
@@ -829,6 +840,15 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 		}
 		r.stats.QueueBlocks++
 	}
+	e := s.pol.For(r.spec.ID, r.spec.Policy, q.key)
+	q.strain = e.Adaptive.Decayed(q.strain, now)
+	if f.Result == store.ResultRetry && f.Extended && e.Adaptive.Outage(q.strain, now) {
+		f.Result = store.ResultFailed // the site is down: the extended budget ends
+	}
+	if f.Result == store.ResultRetry && f.Strain {
+		t.strained++
+	}
+	s.adapt(q, r, f, t.dispatch, now)
 	switch f.Result {
 	case store.ResultRetry:
 		t.state, t.notBefore = store.TaskPending, now.Add(f.RetryIn)
@@ -861,6 +881,37 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 	s.complete(r)
 	s.wakeQueue(q)
 	return store.FinishAccepted, nil
+}
+
+func latest(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// adapt moves the queue's adaptive state with an attempt that ended.
+func (s *Store) adapt(q *queue, r *run, f store.Finish, dispatched, now time.Time) {
+	e := s.pol.For(r.spec.ID, r.spec.Policy, q.key)
+	if !e.Adaptive.Enabled {
+		q.strain.Interval, q.strain.At, q.strain.CeilingAt = 0, now, time.Time{} // switched off: forgotten
+		return
+	}
+	before := q.strain
+	switch {
+	case f.Strain:
+		q.strain = e.Adaptive.Strained(e.Queue.Interval, q.strain, now, dispatched)
+	case f.Answered:
+		q.strain = e.Adaptive.Answered(e.Queue.Interval, q.strain, now, dispatched)
+	}
+	if q.strain.Interval > before.Interval {
+		// The next request waits a whole new interval, counted from now, for every run.
+		next := now.Add(q.strain.Interval)
+		q.tat = latest(q.tat, next)
+		for _, b := range q.backlogs {
+			b.ownTat = latest(b.ownTat, next)
+		}
+	}
 }
 
 // ExpiredLeases returns up to limit leases past their expiry, oldest first.
@@ -968,9 +1019,14 @@ func (s *Store) ListTasks(_ context.Context, f store.TaskFilter, page store.Page
 }
 
 func (s *Store) queueView(q *queue, now time.Time) store.Queue {
-	lim := s.pol.For("", nil, q.key).Queue
+	e := s.pol.For("", nil, q.key)
+	q.strain = e.Adaptive.Decayed(q.strain, now)
+	lim := e.Adaptive.Apply(e.Queue, q.strain)
 	v := store.Queue{Key: q.key, InFlight: q.inFlight, NextEligibleAt: sched.EligibleAt(lim, q.tat),
-		AdmissibleNow: sched.Admitted(lim, q.tat, now, q.inFlight), BlockReason: q.blockReason}
+		AdmissibleNow: sched.Admitted(lim, q.tat, now, q.inFlight), BlockReason: q.blockReason, Strain: q.strain}
+	if !e.Adaptive.Enabled {
+		v.Strain.Interval = 0
+	}
 	if now.Before(q.blockedUntil) {
 		v.BlockedUntil, v.AdmissibleNow = q.blockedUntil, 0
 	} else {
@@ -1039,6 +1095,13 @@ func (s *Store) BlockQueue(_ context.Context, key store.QueueKey, until time.Tim
 	defer s.mu.Unlock()
 	q := s.queue(key)
 	q.blockedUntil, q.blockReason = until, reason
+	if now := s.now(); until.IsZero() && q.strain.Interval > 0 {
+		// Back to the policy's rate: what the slowdown made the queue wait is cancelled.
+		q.strain.Interval, q.strain.At, q.strain.CeilingAt = 0, now, time.Time{}
+		if q.tat.After(now) {
+			q.tat = now
+		}
+	}
 	s.wakeQueue(q)
 	return s.queueView(q, s.now()), nil
 }
