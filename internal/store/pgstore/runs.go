@@ -363,6 +363,9 @@ func (s *Store) view(ctx context.Context, q querier, m *runMeta) (store.Run, err
 	}); err != nil {
 		return store.Run{}, wrap(err)
 	}
+	if st.ByLabel, err = labelStats(ctx, q, m.no); err != nil {
+		return store.Run{}, wrap(err)
+	}
 	return r, nil
 }
 

@@ -15,7 +15,7 @@ import (
 	"github.com/edevhub/crawly/internal/store"
 )
 
-const statusColumns = `t.task_id, t.queue_key, t.pool_id, t.fingerprint, t.depth, t.parent_task_id, t.parent_bucket, t.spec, t.state::text, t.not_before`
+const statusColumns = `t.task_id, t.queue_key, t.pool_id, t.fingerprint, t.depth, t.parent_task_id, t.parent_bucket, t.spec, t.state::text, t.not_before, t.label`
 
 var taskStates = map[string]store.TaskState{
 	taskPending: store.TaskPending, taskInFlight: store.TaskInFlight, taskSucceeded: store.TaskSucceeded,
@@ -42,7 +42,7 @@ func (s *Store) statuses(ctx context.Context, m *runMeta, now time.Time, sql str
 			parentBucket *int16
 			notBefore    pgtype.Timestamptz
 		)
-		if err := row.Scan(&id, &queue, &pool, &fp, &depth, &parent, &parentBucket, &st.Spec, &state, &notBefore); err != nil {
+		if err := row.Scan(&id, &queue, &pool, &fp, &depth, &parent, &parentBucket, &st.Spec, &state, &notBefore, &st.Label); err != nil {
 			return st, err
 		}
 		st.Run, st.Queue, st.Fingerprint = m.spec.ID, store.QueueKey(queue), store.Fingerprint(fp)
@@ -145,6 +145,9 @@ func (s *Store) ListTasks(ctx context.Context, f store.TaskFilter, page store.Pa
 	if f.Queue != "" {
 		sql.WriteString(" AND t.queue_key = " + param(string(f.Queue)))
 	}
+	if f.Label != "" {
+		sql.WriteString(" AND t.label = " + param(f.Label))
+	}
 	if len(f.States) > 0 {
 		var plain []string
 		var pending, delayed bool
@@ -162,13 +165,15 @@ func (s *Store) ListTasks(ctx context.Context, f store.TaskFilter, page store.Pa
 				}
 			}
 		}
-		at := param(now)
 		sql.WriteString(" AND (t.state::text = ANY(" + param(plain) + ")")
-		if pending {
-			sql.WriteString(" OR (t.state = 'pending' AND t.not_before <= " + at + ")")
-		}
-		if delayed {
-			sql.WriteString(" OR (t.state = 'pending' AND t.not_before > " + at + ")")
+		if pending || delayed {
+			at := param(now) // a parameter the statement does not use cannot be typed
+			if pending {
+				sql.WriteString(" OR (t.state = 'pending' AND t.not_before <= " + at + ")")
+			}
+			if delayed {
+				sql.WriteString(" OR (t.state = 'pending' AND t.not_before > " + at + ")")
+			}
 		}
 		sql.WriteString(")")
 	}

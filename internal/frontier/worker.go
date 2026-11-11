@@ -362,7 +362,8 @@ func (s *Server) handleDiscover(ctx context.Context, sess *session, m *workerv1.
 	if err != nil {
 		return err
 	}
-	res, err := s.store.AddTasks(ctx, store.AddRequest{Run: info.Run, Parent: &ref, Tasks: s.newTasks(spec, m.GetTasks())})
+	res, err := s.store.AddTasks(ctx, store.AddRequest{Run: info.Run, Parent: &ref, Tasks: s.newTasks(spec, m.GetTasks(), info.Label),
+		MaxLabels: s.cfg.MaxLabelsPerRun})
 	switch {
 	case errors.Is(err, store.ErrLeaseStale):
 		return reply(workerv1.DiscoverAck_STATUS_STALE)

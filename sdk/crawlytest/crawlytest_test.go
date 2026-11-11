@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -211,4 +212,59 @@ func TestCrawlCut(t *testing.T) {
 		t.Fatalf("the crawl outlived its frontier by %v", took)
 	}
 	closing.Close() // twice is safe
+}
+
+// TestLabels: a label follows the subtree of the task that has it, unless a task sets
+// another or clears it, and the run's statistics are kept per label.
+func TestLabels(t *testing.T) {
+	f := crawlytest.Start(t)
+	w, err := f.Worker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const base = "https://a.example"
+	var seen sync.Map // URL -> label the handler saw
+	err = w.Register("node", worker.HandlerFunc(func(_ context.Context, tk *worker.Task) (*worker.Result, error) {
+		seen.Store(tk.URL, tk.Label)
+		switch tk.URL {
+		case base + "/n":
+			return &worker.Result{Tasks: []worker.NewTask{
+				{URL: base + "/n/1"},                   // inherits
+				{URL: base + "/n/2", NoLabel: true},    // cleared
+				{URL: base + "/n/3", Label: "shop"},    // replaced
+				{URL: base + "/n/4", Label: "no good"}, // invalid: not an allowed label
+			}}, nil
+		case base + "/n/1":
+			return &worker.Result{Tasks: []worker.NewTask{{URL: base + "/n/1/a"}}}, nil
+		case base + "/n/1/a":
+			return nil, worker.Fail("boom", errors.New("the page is broken"))
+		default:
+			return nil, nil
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	news := "news"
+	final, err := f.Crawl(t.Context(), w, []*task.Spec{{Request: &task.Request{Url: base + "/n"}, Handler: "node", Label: &news}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{base + "/n": "news", base + "/n/1": "news", base + "/n/1/a": "news", base + "/n/2": "", base + "/n/3": "shop"}
+	for url, label := range want {
+		if got, ok := seen.Load(url); !ok || got != label {
+			t.Errorf("%s: the handler saw label %v (%v), want %q", url, got, ok, label)
+		}
+	}
+	if _, ok := seen.Load(base + "/n/4"); ok {
+		t.Error("a task with an invalid label ran")
+	}
+	by := final.GetStats().GetByLabel()
+	if len(by) != 2 || by["news"].GetSucceeded() != 2 || by["news"].GetFailed() != 1 || by["news"].GetFailedByCode()["boom"] != 1 ||
+		by["shop"].GetSucceeded() != 1 || by["shop"].GetFailed() != 0 {
+		t.Fatalf("by label: %v", by)
+	}
+	if st := final.GetStats(); st.GetSucceeded() != 4 || st.GetFailed() != 1 {
+		t.Fatalf("stats: %v", st)
+	}
 }

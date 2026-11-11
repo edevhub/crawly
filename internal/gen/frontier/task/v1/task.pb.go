@@ -370,7 +370,18 @@ type TaskSpec struct {
 	Context map[string][]byte `protobuf:"bytes,8,rep,name=context,proto3" json:"context,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Worker pool that executes the task. Empty: "default". Must match [a-z0-9_]{1,32},
 	// otherwise the task is INVALID.
-	Pool          string `protobuf:"bytes,10,opt,name=pool,proto3" json:"pool,omitempty"`
+	Pool string `protobuf:"bytes,10,opt,name=pool,proto3" json:"pool,omitempty"`
+	// Optional label: a second dimension of the run's statistics (RunStats.by_label) next
+	// to the outcome code, for example the section of a source a page belongs to. Must
+	// match [A-Za-z0-9_.:/-]{1,64}, otherwise the task is INVALID. A run takes a limited
+	// number of distinct labels (a Frontier setting); a task whose label would exceed it is
+	// INVALID. The label is not part of the dedup key: a task that repeats another with
+	// a different label is a duplicate and keeps the label of the first.
+	// Seeds: unset or empty means no label. Discovered tasks: unset inherits the label of
+	// the task that discovered them, so a label is normally a property of a subtree; an
+	// empty value clears it, any other value replaces it. The field has explicit presence
+	// for that reason.
+	Label         *string `protobuf:"bytes,11,opt,name=label,proto3,oneof" json:"label,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -461,6 +472,13 @@ func (x *TaskSpec) GetPool() string {
 	return ""
 }
 
+func (x *TaskSpec) GetLabel() string {
+	if x != nil && x.Label != nil {
+		return *x.Label
+	}
+	return ""
+}
+
 // What workers receive.
 type Task struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
@@ -475,8 +493,10 @@ type Task struct {
 	ParentTaskId string            `protobuf:"bytes,9,opt,name=parent_task_id,json=parentTaskId,proto3" json:"parent_task_id,omitempty"`
 	Context      map[string][]byte `protobuf:"bytes,10,rep,name=context,proto3" json:"context,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Resolved fetch timeout the worker must honour.
-	FetchTimeout  *durationpb.Duration `protobuf:"bytes,11,opt,name=fetch_timeout,json=fetchTimeout,proto3" json:"fetch_timeout,omitempty"`
-	Pool          string               `protobuf:"bytes,12,opt,name=pool,proto3" json:"pool,omitempty"`
+	FetchTimeout *durationpb.Duration `protobuf:"bytes,11,opt,name=fetch_timeout,json=fetchTimeout,proto3" json:"fetch_timeout,omitempty"`
+	Pool         string               `protobuf:"bytes,12,opt,name=pool,proto3" json:"pool,omitempty"`
+	// The task's label, after inheritance: pass it on by leaving TaskSpec.label unset.
+	Label         string `protobuf:"bytes,13,opt,name=label,proto3" json:"label,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -584,6 +604,13 @@ func (x *Task) GetFetchTimeout() *durationpb.Duration {
 func (x *Task) GetPool() string {
 	if x != nil {
 		return x.Pool
+	}
+	return ""
+}
+
+func (x *Task) GetLabel() string {
+	if x != nil {
+		return x.Label
 	}
 	return ""
 }
@@ -787,7 +814,7 @@ const file_crawly_frontier_task_v1_task_proto_rawDesc = "" +
 	"\x05bytes\x18\x04 \x01(\x04R\x05bytes\x12!\n" +
 	"\fresponse_ref\x18\x05 \x01(\tR\vresponseRef\x12!\n" +
 	"\fcontent_hash\x18\x06 \x01(\tR\vcontentHash\x12#\n" +
-	"\ritems_emitted\x18\a \x01(\rR\fitemsEmitted\"\xa0\x03\n" +
+	"\ritems_emitted\x18\a \x01(\rR\fitemsEmitted\"\xc5\x03\n" +
 	"\bTaskSpec\x12:\n" +
 	"\arequest\x18\x01 \x01(\v2 .crawly.frontier.task.v1.RequestR\arequest\x12\x1b\n" +
 	"\tqueue_key\x18\x02 \x01(\tR\bqueueKey\x12\x1b\n" +
@@ -797,11 +824,13 @@ const file_crawly_frontier_task_v1_task_proto_rawDesc = "" +
 	"\x0fnot_before_time\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\rnotBeforeTime\x12H\n" +
 	"\acontext\x18\b \x03(\v2..crawly.frontier.task.v1.TaskSpec.ContextEntryR\acontext\x12\x12\n" +
 	"\x04pool\x18\n" +
-	" \x01(\tR\x04pool\x1a:\n" +
+	" \x01(\tR\x04pool\x12\x19\n" +
+	"\x05label\x18\v \x01(\tH\x00R\x05label\x88\x01\x01\x1a:\n" +
 	"\fContextEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01J\x04\b\a\x10\bJ\x04\b\t\x10\n" +
-	"\"\xe3\x03\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01B\b\n" +
+	"\x06_labelJ\x04\b\a\x10\bJ\x04\b\t\x10\n" +
+	"\"\xf9\x03\n" +
 	"\x04Task\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x15\n" +
 	"\x06run_id\x18\x02 \x01(\tR\x05runId\x12\x1b\n" +
@@ -814,7 +843,8 @@ const file_crawly_frontier_task_v1_task_proto_rawDesc = "" +
 	"\acontext\x18\n" +
 	" \x03(\v2*.crawly.frontier.task.v1.Task.ContextEntryR\acontext\x12>\n" +
 	"\rfetch_timeout\x18\v \x01(\v2\x19.google.protobuf.DurationR\ffetchTimeout\x12\x12\n" +
-	"\x04pool\x18\f \x01(\tR\x04pool\x1a:\n" +
+	"\x04pool\x18\f \x01(\tR\x04pool\x12\x14\n" +
+	"\x05label\x18\r \x01(\tR\x05label\x1a:\n" +
 	"\fContextEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01J\x04\b\x03\x10\x04\"\x82\x01\n" +
@@ -891,6 +921,7 @@ func file_crawly_frontier_task_v1_task_proto_init() {
 	if File_crawly_frontier_task_v1_task_proto != nil {
 		return
 	}
+	file_crawly_frontier_task_v1_task_proto_msgTypes[2].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

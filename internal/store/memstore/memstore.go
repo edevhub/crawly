@@ -80,6 +80,30 @@ type run struct {
 	tasks                     []*task
 	backlogs                  []*backlog
 	stats                     store.RunStats // counters only; ledger figures are computed
+	labels                    map[string]*store.LabelStats
+}
+
+// countEnded counts a task that reached a final state under its label. code is the
+// outcome code of a failed task's last attempt.
+func (r *run) countEnded(label string, state store.TaskState, code string) {
+	if label == "" {
+		return
+	}
+	l := r.labels[label]
+	switch state {
+	case store.TaskSucceeded:
+		l.Succeeded++
+	case store.TaskFailed:
+		l.Failed++
+		if code != "" {
+			l.FailedByCode[code]++
+		}
+	case store.TaskExpired:
+		l.Expired++
+	case store.TaskCancelled:
+		l.Cancelled++
+	default:
+	}
 }
 
 func (r *run) dispatchable() bool {
@@ -122,6 +146,7 @@ type task struct {
 	depth     uint32
 	parent    store.TaskID
 	spec      []byte
+	label     string
 	priority  int32
 	seq       uint64
 	notBefore time.Time
@@ -154,7 +179,8 @@ func (s *Store) CreateRun(_ context.Context, spec store.RunSpec) (store.Run, err
 		return s.view(r), nil
 	}
 	r := &run{spec: spec, state: store.RunOpen, paused: spec.Paused, created: s.now(),
-		fps: map[store.Fingerprint]*task{}, stats: store.RunStats{ByCode: map[string]uint64{}}}
+		fps: map[store.Fingerprint]*task{}, stats: store.RunStats{ByCode: map[string]uint64{}},
+		labels: map[string]*store.LabelStats{}}
 	s.runs[spec.ID] = r
 	s.order = append(s.order, r)
 	s.event(r, store.EventCreated)
@@ -248,6 +274,7 @@ func (s *Store) end(r *run, state store.RunState) {
 		}
 		t.state = final
 		*counter++
+		r.countEnded(t.label, final, "")
 	}
 	for _, b := range r.backlogs {
 		b.pending = nil
@@ -339,6 +366,14 @@ func (s *Store) view(r *run) store.Run {
 	st := r.stats
 	st.ByCode = make(map[string]uint64, len(r.stats.ByCode))
 	maps.Copy(st.ByCode, r.stats.ByCode)
+	if len(r.labels) > 0 {
+		st.ByLabel = make(map[string]store.LabelStats, len(r.labels))
+		for k, l := range r.labels {
+			c := *l
+			c.FailedByCode = maps.Clone(l.FailedByCode)
+			st.ByLabel[k] = c
+		}
+	}
 	for _, b := range r.backlogs {
 		st.InFlight += safeconv.Uint64(b.inFlight)
 		for _, t := range b.pending {
@@ -379,7 +414,8 @@ func (s *Store) AddTasks(_ context.Context, req store.AddRequest) ([]store.AddRe
 	out := make([]store.AddResult, len(req.Tasks))
 	open := r.state == store.RunOpen || (req.Parent != nil && r.state == store.RunSealed)
 	woken := map[store.PoolName]bool{}
-	for i, nt := range req.Tasks {
+	for i := range req.Tasks {
+		nt := &req.Tasks[i]
 		switch {
 		case nt.Invalid:
 			out[i].Status = store.AddInvalid
@@ -392,14 +428,19 @@ func (s *Store) AddTasks(_ context.Context, req store.AddRequest) ([]store.AddRe
 		case r.fps[nt.Fingerprint] != nil:
 			out[i] = store.AddResult{Status: store.AddDuplicate, TaskID: r.fps[nt.Fingerprint].id}
 			r.stats.Duplicates++
+		case nt.Label != "" && r.labels[nt.Label] == nil && req.MaxLabels > 0 && len(r.labels) >= req.MaxLabels:
+			out[i].Status = store.AddInvalid
 		default:
 			pool := nt.Pool
 			if pool == "" {
 				pool = store.DefaultPool
 			}
+			if nt.Label != "" && r.labels[nt.Label] == nil {
+				r.labels[nt.Label] = &store.LabelStats{FailedByCode: map[string]uint64{}}
+			}
 			s.seq++
 			t := &task{id: store.TaskID("t" + strconv.FormatUint(s.seq, 36)), r: r, fp: nt.Fingerprint,
-				depth: depth, parent: parent, spec: nt.Spec, priority: nt.Priority, seq: s.seq,
+				depth: depth, parent: parent, spec: nt.Spec, label: nt.Label, priority: nt.Priority, seq: s.seq,
 				notBefore: nt.NotBefore, state: store.TaskPending}
 			if nt.TTL > 0 {
 				t.expiresAt = now.Add(nt.TTL)
@@ -634,7 +675,7 @@ func (b *backlog) claim(n int, now time.Time) []*task {
 
 func (s *Store) info(t *task) store.LeaseInfo {
 	return store.LeaseInfo{Ref: store.LeaseRef{ID: t.leaseID(), Attempt: t.attempt}, Task: t.id, Run: t.r.spec.ID,
-		RunPolicy: t.r.spec.Policy, Queue: t.b.q.key, Pool: t.b.pool, Fingerprint: t.fp, Depth: t.depth, Parent: t.parent}
+		RunPolicy: t.r.spec.Policy, Queue: t.b.q.key, Pool: t.b.pool, Fingerprint: t.fp, Depth: t.depth, Parent: t.parent, Label: t.label}
 }
 
 // byLease finds the task of a lease. Accepted means the lease is the task's current
@@ -736,10 +777,12 @@ func (s *Store) Finish(_ context.Context, f store.Finish) (store.FinishStatus, e
 	case store.ResultFailed:
 		t.state = store.TaskFailed
 		r.stats.Failed++
+		r.countEnded(t.label, t.state, f.Record.Code)
 		r.active--
 	default:
 		t.state = store.TaskSucceeded
 		r.stats.Succeeded++
+		r.countEnded(t.label, t.state, "")
 		r.active--
 	}
 	s.complete(r)
@@ -781,6 +824,7 @@ func (s *Store) expireDue(now time.Time) {
 		}
 		t.state = store.TaskExpired
 		t.r.stats.Expired++
+		t.r.countEnded(t.label, t.state, "")
 		t.r.active--
 		s.complete(t.r)
 	}
@@ -790,7 +834,7 @@ func (s *Store) expireDue(now time.Time) {
 
 func (s *Store) status(t *task, now time.Time) store.TaskStatus {
 	st := store.TaskStatus{ID: t.id, Run: t.r.spec.ID, Queue: t.b.q.key, Pool: t.b.pool, Fingerprint: t.fp,
-		Depth: t.depth, Parent: t.parent, Spec: t.spec, State: t.state, Attempts: append([]store.Attempt(nil), t.attempts...)}
+		Depth: t.depth, Parent: t.parent, Spec: t.spec, Label: t.label, State: t.state, Attempts: append([]store.Attempt(nil), t.attempts...)}
 	if t.state == store.TaskPending && t.notBefore.After(now) {
 		st.State, st.NextEligibleAt = store.TaskDelayed, t.notBefore
 	}
@@ -827,6 +871,9 @@ func (s *Store) ListTasks(_ context.Context, f store.TaskFilter, page store.Page
 	var match []store.TaskStatus
 	for _, t := range r.tasks {
 		if f.Queue != "" && t.b.q.key != f.Queue {
+			continue
+		}
+		if f.Label != "" && t.label != f.Label {
 			continue
 		}
 		st := s.status(t, now)

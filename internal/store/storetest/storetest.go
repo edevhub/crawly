@@ -671,6 +671,8 @@ func Run(t *testing.T, f Factory) {
 		}
 	})
 
+	runLabels(t, f)
+
 	t.Run("Notifications", func(t *testing.T) {
 		e := newEnv(t, f, store.Limits{})
 		nctx, cancel := context.WithCancel(ctx)

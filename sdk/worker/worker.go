@@ -593,7 +593,7 @@ func (r *runner) revoke(leaseID, reason string) {
 func (r *runner) start(ctx context.Context, a *workerv1.Assignment) {
 	lease, pt := a.GetLease(), a.GetTask()
 	task := &Task{ID: pt.GetTaskId(), RunID: pt.GetRunId(), QueueKey: pt.GetQueueKey(), Handler: pt.GetHandler(),
-		ParentID: pt.GetParentTaskId(), Depth: pt.GetDepth(), Attempt: lease.GetAttempt(),
+		ParentID: pt.GetParentTaskId(), Depth: pt.GetDepth(), Attempt: lease.GetAttempt(), Label: pt.GetLabel(),
 		URL: pt.GetRequest().GetUrl(), Method: pt.GetRequest().GetMethod(), Body: pt.GetRequest().GetBody(),
 		Header: http.Header{}, Context: pt.GetContext(), FetchTimeout: pt.GetFetchTimeout().AsDuration()}
 	if task.Method == "" {
@@ -828,6 +828,12 @@ func taskSpec(parent *Task, nt NewTask, poolFor func(handler string) string) *ta
 		QueueKey: nt.QueueKey, DedupKey: nt.DedupKey, Handler: nt.Handler, Pool: nt.Pool, Priority: nt.Priority, Context: nt.Context}
 	if ts.Handler == "" {
 		ts.Handler = parent.Handler
+	}
+	switch {
+	case nt.Label != "":
+		ts.Label = &nt.Label
+	case nt.NoLabel:
+		ts.Label = new(string)
 	}
 	if ts.Pool == "" {
 		ts.Pool = poolFor(ts.Handler)

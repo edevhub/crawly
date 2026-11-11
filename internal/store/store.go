@@ -226,6 +226,14 @@ type RunStats struct {
 	Attempts, QueueBlocks                 uint64
 	Discovered, Duplicates, OverBudget    uint64
 	ByCode                                map[string]uint64
+	ByLabel                               map[string]LabelStats // by task label; labelled tasks only
+}
+
+// LabelStats are the tasks of one label that have ended, by how they ended.
+type LabelStats struct {
+	Succeeded, Failed, Expired, Cancelled uint64
+	// FailedByCode counts the failed tasks by the code of their last attempt.
+	FailedByCode map[string]uint64
 }
 
 // RunFilter selects runs by state and labels; empty fields match everything.
@@ -263,6 +271,10 @@ type AddRequest struct {
 	Run    RunID
 	Parent *LeaseRef // nil: seeds; set: discovered, depth = parent depth + 1
 	Tasks  []NewTask
+	// MaxLabels caps the distinct labels of the run: a task whose label would be one
+	// more is AddInvalid. 0: no cap. Labels already in the run are
+	// always accepted, and the cap is exact: concurrent batches do not overshoot it.
+	MaxLabels int
 }
 
 // NewTask is a task to be added to a run.
@@ -274,6 +286,7 @@ type NewTask struct {
 	NotBefore   time.Time     // zero: immediately
 	TTL         time.Duration // 0: none
 	Spec        []byte        // serialised TaskSpec, opaque to the store
+	Label       string        // validated by the core, "" for none; counted in RunStats.ByLabel
 	Invalid     bool          // rejected by the core; kept so results stay in order
 }
 
@@ -347,6 +360,7 @@ type LeaseInfo struct {
 	Fingerprint Fingerprint
 	Depth       uint32
 	Parent      TaskID
+	Label       string
 }
 
 // FinishSource says who ends an attempt, which decides how the lease is checked.
@@ -442,6 +456,7 @@ type TaskStatus struct {
 	Depth          uint32
 	Parent         TaskID
 	Spec           []byte
+	Label          string
 	State          TaskState
 	NextEligibleAt time.Time
 	Attempts       []Attempt
@@ -453,6 +468,7 @@ type TaskFilter struct {
 	Queue  QueueKey
 	States []TaskState
 	Code   string
+	Label  string // "": any
 }
 
 // ---- queues

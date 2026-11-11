@@ -42,7 +42,8 @@ tag, own politeness state, stats counters, readiness). There is no run-level cou
 runs ── run_events                     pools
   │                                      │
   └──────── backlogs (queue × run × pool) ── queues (per key)
-                 │        └── backlog_codes
+                 │        ├── backlog_codes
+                 │        └── backlog_labels       run_labels (per run)
               tasks (partitioned by run_created_on) ── attempts (partitioned)
 ```
 
@@ -55,6 +56,8 @@ runs ── run_events                     pools
 | `queues` | Shared politeness state and fairness clock per queue key | Dispatch, finish, block |
 | `backlogs` | Ledger, fairness, own politeness, stats, readiness per (queue, run, pool) | Dispatch, finish, add |
 | `backlog_codes` | Outcome code counts per backlog (`RunStats.by_code`) | Finish |
+| `backlog_labels` | Final task counts per queue, run and task label (`RunStats.by_label`) | Finish, drain, TTL expiry |
+| `run_labels` | The labels a run has accepted, which bounds their number | `AddTasks` that brings a new label |
 | `tasks` | Every task; holds the current lease | ~3 updates per task |
 | `attempts` | One row per finished attempt | Insert only |
 
@@ -211,7 +214,35 @@ CREATE TABLE backlog_codes (
   PRIMARY KEY (queue_key, run_no, code)
 );
 CREATE INDEX backlog_codes_run ON backlog_codes (run_no);
+
+-- Task labels (migration 00006). tasks has a label column, empty for none.
+CREATE TABLE run_labels (
+  run_no bigint NOT NULL REFERENCES runs ON DELETE CASCADE,
+  label  text   NOT NULL,
+  PRIMARY KEY (run_no, label)
+);
+
+CREATE TABLE backlog_labels (
+  queue_key    text   NOT NULL,
+  run_no       bigint NOT NULL,
+  label        text   NOT NULL,
+  succeeded    bigint NOT NULL DEFAULT 0,
+  failed       bigint NOT NULL DEFAULT 0,
+  expired      bigint NOT NULL DEFAULT 0,
+  cancelled    bigint NOT NULL DEFAULT 0,
+  failed_codes jsonb  NOT NULL DEFAULT '{}',   -- code of the last attempt of each failed task
+  PRIMARY KEY (queue_key, run_no, label)
+);
+CREATE INDEX backlog_labels_run ON backlog_labels (run_no);
 ```
+
+The label counters are per queue, like `backlog_codes`, so a `Finish` updates a row of the
+queue it already holds and no counter is shared by all queues of a run. `run_labels` is
+written only when a label is new to a run. `AddTasks` reads it; when the batch brings a label
+the run does not have, it first takes advisory lock `(5, run_no)`, reads the registry again,
+and rejects the tasks whose label would exceed the limit as `INVALID`. Batches with known
+labels never take the lock. A task that loses the insert race to a duplicate does not
+register its label.
 
 Backlog rows are kept after their run ends, for stats, so a queue accumulates one row per
 past run. The hot path never touches those: dispatch and finish read and lock only the
@@ -226,7 +257,8 @@ counting costs no extra row.
   `Finish`, which lowers it;
 - `NULL`: not dispatchable: no pending tasks, or the run is paused or ended.
 
-`GetRun` sums the run's backlogs (`backlogs_run`) and its `backlog_codes`, so its cost grows
+`GetRun` sums the run's backlogs (`backlogs_run`), its `backlog_codes` and its
+`backlog_labels`, so its cost grows
 with the number of queues the run has work on (ADR 0001, Scaling model and limits).
 
 Which limits a backlog is admitted against (shared or own) is not stored: it comes from
@@ -331,12 +363,14 @@ order.
 
 ```
 1. tasks       one row, by primary key decoded from a lease ID   (Finish, ExtendLease, discover parent)
+1b. advisory (5, run_no)  exclusive: AddTasks that bring a label the run does not have
 2. pools       new rows, by name                                 (AddTasks)
    queues      by key: NO KEY UPDATE (Finish, BlockQueue, Maintain), KEY SHARE (AddTasks,
                after inserting new rows in key order), UPDATE (queue cleanup, SKIP LOCKED)
 3. tasks       new rows, by (run_no, fingerprint)                (AddTasks inserts)
 4. backlogs    by (queue_key, run_no, pool_id)
 5. backlog_codes by (queue_key, run_no, code)
+   backlog_labels by (queue_key, run_no, label)
 6. advisory (1, run_no)   shared: AddTasks; exclusive: completion, SealRun, lifecycle
 7. runs        by run_no
 8. advisory (2, 0)        run_events append
@@ -563,7 +597,9 @@ Used for worker completions (`Source = Worker`) and the reaper (`Source = Reaper
    `ready_at = least(ready_at, now() + $retry_in)`. **Other locked backlogs on the queue:**
    lower `ready_at` to their next admission time if the freed slot changes it (this is what
    brings a backlog back from `'infinity'`), or raise it to the end of a new block.
-8. **`backlog_codes`:** `count += 1` for the outcome code.
+8. **`backlog_codes`:** `count += 1` for the outcome code. **`backlog_labels`:** for a task
+   with a label that reached a final state, `succeeded`, `failed` (with its code in
+   `failed_codes`), `expired` or `cancelled` `+= 1`.
 9. **Completion** if the backlog now has `pending = 0 AND in_flight = 0` (see below).
 10. Commit; `NOTIFY` if a backlog became ready.
 
@@ -717,7 +753,7 @@ crawly-frontier migrate -postgres "$URL" status   # lists the migrations
   after the retention period. No bulk `DELETE`. A month is kept while one of its runs is
   not ended or still has pending or in-flight tasks, because their tasks live in that
   partition and a lease of a dropped task could never be finished.
-- `runs`, `run_events`, `backlogs`, `backlog_codes`: deleted with the run after a longer
+- `runs`, `run_events`, `run_labels`, `backlogs`, `backlog_codes`, `backlog_labels`: deleted with the run after a longer
   retention, kept for run comparisons. The delete locks the run before its backlogs, which
   is the reverse of the lock order. It is allowed because it only takes ended runs whose
   backlogs have no pending or in-flight tasks, so nothing else locks those backlogs. The

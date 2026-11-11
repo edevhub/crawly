@@ -136,7 +136,7 @@ func (x KeyRule_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use KeyRule_Kind.Descriptor instead.
 func (KeyRule_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{3, 0}
+	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{4, 0}
 }
 
 type RunEvent_Type int32
@@ -203,7 +203,7 @@ func (x RunEvent_Type) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RunEvent_Type.Descriptor instead.
 func (RunEvent_Type) EnumDescriptor() ([]byte, []int) {
-	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{4, 0}
+	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{5, 0}
 }
 
 type TaskStatus_State int32
@@ -267,7 +267,7 @@ func (x TaskStatus_State) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TaskStatus_State.Descriptor instead.
 func (TaskStatus_State) EnumDescriptor() ([]byte, []int) {
-	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{5, 0}
+	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{6, 0}
 }
 
 type Run struct {
@@ -399,19 +399,23 @@ type RunStats struct {
 	// pending: tasks of backlogs whose next eligible time has passed; delayed: the rest of the
 	// undispatched tasks. Approximate: eligibility is per (queue, run, pool) backlog and
 	// includes politeness and queue blocks as well as not_before_time and backoff.
-	Pending       uint64            `protobuf:"varint,1,opt,name=pending,proto3" json:"pending,omitempty"`
-	Delayed       uint64            `protobuf:"varint,2,opt,name=delayed,proto3" json:"delayed,omitempty"`
-	InFlight      uint64            `protobuf:"varint,3,opt,name=in_flight,json=inFlight,proto3" json:"in_flight,omitempty"`
-	Succeeded     uint64            `protobuf:"varint,4,opt,name=succeeded,proto3" json:"succeeded,omitempty"`
-	Failed        uint64            `protobuf:"varint,5,opt,name=failed,proto3" json:"failed,omitempty"`
-	Expired       uint64            `protobuf:"varint,6,opt,name=expired,proto3" json:"expired,omitempty"` // dropped by TTL or run deadline
-	Attempts      uint64            `protobuf:"varint,7,opt,name=attempts,proto3" json:"attempts,omitempty"`
-	QueueBlocks   uint64            `protobuf:"varint,8,opt,name=queue_blocks,json=queueBlocks,proto3" json:"queue_blocks,omitempty"` // block_queue_for requests received
-	Discovered    uint64            `protobuf:"varint,9,opt,name=discovered,proto3" json:"discovered,omitempty"`
-	Duplicates    uint64            `protobuf:"varint,10,opt,name=duplicates,proto3" json:"duplicates,omitempty"`
-	OverBudget    uint64            `protobuf:"varint,11,opt,name=over_budget,json=overBudget,proto3" json:"over_budget,omitempty"`
-	ByCode        map[string]uint64 `protobuf:"bytes,12,rep,name=by_code,json=byCode,proto3" json:"by_code,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
-	Cancelled     uint64            `protobuf:"varint,13,opt,name=cancelled,proto3" json:"cancelled,omitempty"` // dropped because the run was cancelled
+	Pending     uint64            `protobuf:"varint,1,opt,name=pending,proto3" json:"pending,omitempty"`
+	Delayed     uint64            `protobuf:"varint,2,opt,name=delayed,proto3" json:"delayed,omitempty"`
+	InFlight    uint64            `protobuf:"varint,3,opt,name=in_flight,json=inFlight,proto3" json:"in_flight,omitempty"`
+	Succeeded   uint64            `protobuf:"varint,4,opt,name=succeeded,proto3" json:"succeeded,omitempty"`
+	Failed      uint64            `protobuf:"varint,5,opt,name=failed,proto3" json:"failed,omitempty"`
+	Expired     uint64            `protobuf:"varint,6,opt,name=expired,proto3" json:"expired,omitempty"` // dropped by TTL or run deadline
+	Attempts    uint64            `protobuf:"varint,7,opt,name=attempts,proto3" json:"attempts,omitempty"`
+	QueueBlocks uint64            `protobuf:"varint,8,opt,name=queue_blocks,json=queueBlocks,proto3" json:"queue_blocks,omitempty"` // block_queue_for requests received
+	Discovered  uint64            `protobuf:"varint,9,opt,name=discovered,proto3" json:"discovered,omitempty"`
+	Duplicates  uint64            `protobuf:"varint,10,opt,name=duplicates,proto3" json:"duplicates,omitempty"`
+	OverBudget  uint64            `protobuf:"varint,11,opt,name=over_budget,json=overBudget,proto3" json:"over_budget,omitempty"`
+	ByCode      map[string]uint64 `protobuf:"bytes,12,rep,name=by_code,json=byCode,proto3" json:"by_code,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	Cancelled   uint64            `protobuf:"varint,13,opt,name=cancelled,proto3" json:"cancelled,omitempty"` // dropped because the run was cancelled
+	// Final task counts per task label (TaskSpec.label). Every label the run has accepted
+	// has an entry, with zero counts until a task ends; tasks without a label are not
+	// listed. Counts agree with the task states: a task is counted once, when it ends.
+	ByLabel       map[string]*LabelStats `protobuf:"bytes,15,rep,name=by_label,json=byLabel,proto3" json:"by_label,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -537,6 +541,92 @@ func (x *RunStats) GetCancelled() uint64 {
 	return 0
 }
 
+func (x *RunStats) GetByLabel() map[string]*LabelStats {
+	if x != nil {
+		return x.ByLabel
+	}
+	return nil
+}
+
+// Tasks of one label that have ended, by how they ended. The sum of all labels is at
+// most the run's own counters.
+type LabelStats struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Succeeded uint64                 `protobuf:"varint,1,opt,name=succeeded,proto3" json:"succeeded,omitempty"`
+	Failed    uint64                 `protobuf:"varint,2,opt,name=failed,proto3" json:"failed,omitempty"`
+	Expired   uint64                 `protobuf:"varint,3,opt,name=expired,proto3" json:"expired,omitempty"`     // dropped by TTL or run deadline
+	Cancelled uint64                 `protobuf:"varint,4,opt,name=cancelled,proto3" json:"cancelled,omitempty"` // dropped because the run was cancelled
+	// The outcome codes of the tasks that failed, one per task: the code of its last attempt.
+	FailedByCode  map[string]uint64 `protobuf:"bytes,5,rep,name=failed_by_code,json=failedByCode,proto3" json:"failed_by_code,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LabelStats) Reset() {
+	*x = LabelStats{}
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LabelStats) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LabelStats) ProtoMessage() {}
+
+func (x *LabelStats) ProtoReflect() protoreflect.Message {
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LabelStats.ProtoReflect.Descriptor instead.
+func (*LabelStats) Descriptor() ([]byte, []int) {
+	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *LabelStats) GetSucceeded() uint64 {
+	if x != nil {
+		return x.Succeeded
+	}
+	return 0
+}
+
+func (x *LabelStats) GetFailed() uint64 {
+	if x != nil {
+		return x.Failed
+	}
+	return 0
+}
+
+func (x *LabelStats) GetExpired() uint64 {
+	if x != nil {
+		return x.Expired
+	}
+	return 0
+}
+
+func (x *LabelStats) GetCancelled() uint64 {
+	if x != nil {
+		return x.Cancelled
+	}
+	return 0
+}
+
+func (x *LabelStats) GetFailedByCode() map[string]uint64 {
+	if x != nil {
+		return x.FailedByCode
+	}
+	return nil
+}
+
 // Safety net against crawler traps and runaway discovery. Link-following rules stay in the spider.
 type RunLimits struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -551,7 +641,7 @@ type RunLimits struct {
 
 func (x *RunLimits) Reset() {
 	*x = RunLimits{}
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[2]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -563,7 +653,7 @@ func (x *RunLimits) String() string {
 func (*RunLimits) ProtoMessage() {}
 
 func (x *RunLimits) ProtoReflect() protoreflect.Message {
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[2]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -576,7 +666,7 @@ func (x *RunLimits) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunLimits.ProtoReflect.Descriptor instead.
 func (*RunLimits) Descriptor() ([]byte, []int) {
-	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{2}
+	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *RunLimits) GetDeadlineTime() *timestamppb.Timestamp {
@@ -609,7 +699,7 @@ type KeyRule struct {
 
 func (x *KeyRule) Reset() {
 	*x = KeyRule{}
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[3]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -621,7 +711,7 @@ func (x *KeyRule) String() string {
 func (*KeyRule) ProtoMessage() {}
 
 func (x *KeyRule) ProtoReflect() protoreflect.Message {
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[3]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -634,7 +724,7 @@ func (x *KeyRule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KeyRule.ProtoReflect.Descriptor instead.
 func (*KeyRule) Descriptor() ([]byte, []int) {
-	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{3}
+	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *KeyRule) GetKind() KeyRule_Kind {
@@ -655,7 +745,7 @@ type RunEvent struct {
 
 func (x *RunEvent) Reset() {
 	*x = RunEvent{}
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[4]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -667,7 +757,7 @@ func (x *RunEvent) String() string {
 func (*RunEvent) ProtoMessage() {}
 
 func (x *RunEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[4]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -680,7 +770,7 @@ func (x *RunEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunEvent.ProtoReflect.Descriptor instead.
 func (*RunEvent) Descriptor() ([]byte, []int) {
-	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{4}
+	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *RunEvent) GetType() RunEvent_Type {
@@ -716,7 +806,7 @@ type TaskStatus struct {
 
 func (x *TaskStatus) Reset() {
 	*x = TaskStatus{}
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[5]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -728,7 +818,7 @@ func (x *TaskStatus) String() string {
 func (*TaskStatus) ProtoMessage() {}
 
 func (x *TaskStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[5]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -741,7 +831,7 @@ func (x *TaskStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TaskStatus.ProtoReflect.Descriptor instead.
 func (*TaskStatus) Descriptor() ([]byte, []int) {
-	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{5}
+	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *TaskStatus) GetTask() *v11.Task {
@@ -789,7 +879,7 @@ type Attempt struct {
 
 func (x *Attempt) Reset() {
 	*x = Attempt{}
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[6]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -801,7 +891,7 @@ func (x *Attempt) String() string {
 func (*Attempt) ProtoMessage() {}
 
 func (x *Attempt) ProtoReflect() protoreflect.Message {
-	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[6]
+	mi := &file_crawly_frontier_run_v1_run_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -814,7 +904,7 @@ func (x *Attempt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Attempt.ProtoReflect.Descriptor instead.
 func (*Attempt) Descriptor() ([]byte, []int) {
-	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{6}
+	return file_crawly_frontier_run_v1_run_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Attempt) GetAttempt() uint32 {
@@ -903,7 +993,7 @@ const file_crawly_frontier_run_v1_run_proto_rawDesc = "" +
 	"\x0fSTATE_COMPLETED\x10\x03\x12\x13\n" +
 	"\x0fSTATE_CANCELLED\x10\x04\x12\x11\n" +
 	"\rSTATE_EXPIRED\x10\x05J\x04\b\x02\x10\x03J\x04\b\b\x10\tJ\x04\b\n" +
-	"\x10\vJ\x04\b\v\x10\f\"\xeb\x03\n" +
+	"\x10\vJ\x04\b\v\x10\f\"\x95\x05\n" +
 	"\bRunStats\x12\x18\n" +
 	"\apending\x18\x01 \x01(\x04R\apending\x12\x18\n" +
 	"\adelayed\x18\x02 \x01(\x04R\adelayed\x12\x1b\n" +
@@ -923,8 +1013,22 @@ const file_crawly_frontier_run_v1_run_proto_rawDesc = "" +
 	"\vover_budget\x18\v \x01(\x04R\n" +
 	"overBudget\x12E\n" +
 	"\aby_code\x18\f \x03(\v2,.crawly.frontier.run.v1.RunStats.ByCodeEntryR\x06byCode\x12\x1c\n" +
-	"\tcancelled\x18\r \x01(\x04R\tcancelled\x1a9\n" +
+	"\tcancelled\x18\r \x01(\x04R\tcancelled\x12H\n" +
+	"\bby_label\x18\x0f \x03(\v2-.crawly.frontier.run.v1.RunStats.ByLabelEntryR\abyLabel\x1a9\n" +
 	"\vByCodeEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\x1a^\n" +
+	"\fByLabelEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x128\n" +
+	"\x05value\x18\x02 \x01(\v2\".crawly.frontier.run.v1.LabelStatsR\x05value:\x028\x01\"\x97\x02\n" +
+	"\n" +
+	"LabelStats\x12\x1c\n" +
+	"\tsucceeded\x18\x01 \x01(\x04R\tsucceeded\x12\x16\n" +
+	"\x06failed\x18\x02 \x01(\x04R\x06failed\x12\x18\n" +
+	"\aexpired\x18\x03 \x01(\x04R\aexpired\x12\x1c\n" +
+	"\tcancelled\x18\x04 \x01(\x04R\tcancelled\x12Z\n" +
+	"\x0efailed_by_code\x18\x05 \x03(\v24.crawly.frontier.run.v1.LabelStats.FailedByCodeEntryR\ffailedByCode\x1a?\n" +
+	"\x11FailedByCodeEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\x86\x01\n" +
 	"\tRunLimits\x12?\n" +
@@ -994,7 +1098,7 @@ func file_crawly_frontier_run_v1_run_proto_rawDescGZIP() []byte {
 }
 
 var file_crawly_frontier_run_v1_run_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_crawly_frontier_run_v1_run_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_crawly_frontier_run_v1_run_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_crawly_frontier_run_v1_run_proto_goTypes = []any{
 	(Run_State)(0),                // 0: crawly.frontier.run.v1.Run.State
 	(KeyRule_Kind)(0),             // 1: crawly.frontier.run.v1.KeyRule.Kind
@@ -1002,48 +1106,54 @@ var file_crawly_frontier_run_v1_run_proto_goTypes = []any{
 	(TaskStatus_State)(0),         // 3: crawly.frontier.run.v1.TaskStatus.State
 	(*Run)(nil),                   // 4: crawly.frontier.run.v1.Run
 	(*RunStats)(nil),              // 5: crawly.frontier.run.v1.RunStats
-	(*RunLimits)(nil),             // 6: crawly.frontier.run.v1.RunLimits
-	(*KeyRule)(nil),               // 7: crawly.frontier.run.v1.KeyRule
-	(*RunEvent)(nil),              // 8: crawly.frontier.run.v1.RunEvent
-	(*TaskStatus)(nil),            // 9: crawly.frontier.run.v1.TaskStatus
-	(*Attempt)(nil),               // 10: crawly.frontier.run.v1.Attempt
-	nil,                           // 11: crawly.frontier.run.v1.Run.LabelsEntry
-	nil,                           // 12: crawly.frontier.run.v1.RunStats.ByCodeEntry
-	(*v1.RunPolicy)(nil),          // 13: crawly.frontier.policy.v1.RunPolicy
-	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
-	(*v11.Task)(nil),              // 15: crawly.frontier.task.v1.Task
-	(*v11.Outcome)(nil),           // 16: crawly.frontier.task.v1.Outcome
-	(*v11.FetchInfo)(nil),         // 17: crawly.frontier.task.v1.FetchInfo
+	(*LabelStats)(nil),            // 6: crawly.frontier.run.v1.LabelStats
+	(*RunLimits)(nil),             // 7: crawly.frontier.run.v1.RunLimits
+	(*KeyRule)(nil),               // 8: crawly.frontier.run.v1.KeyRule
+	(*RunEvent)(nil),              // 9: crawly.frontier.run.v1.RunEvent
+	(*TaskStatus)(nil),            // 10: crawly.frontier.run.v1.TaskStatus
+	(*Attempt)(nil),               // 11: crawly.frontier.run.v1.Attempt
+	nil,                           // 12: crawly.frontier.run.v1.Run.LabelsEntry
+	nil,                           // 13: crawly.frontier.run.v1.RunStats.ByCodeEntry
+	nil,                           // 14: crawly.frontier.run.v1.RunStats.ByLabelEntry
+	nil,                           // 15: crawly.frontier.run.v1.LabelStats.FailedByCodeEntry
+	(*v1.RunPolicy)(nil),          // 16: crawly.frontier.policy.v1.RunPolicy
+	(*timestamppb.Timestamp)(nil), // 17: google.protobuf.Timestamp
+	(*v11.Task)(nil),              // 18: crawly.frontier.task.v1.Task
+	(*v11.Outcome)(nil),           // 19: crawly.frontier.task.v1.Outcome
+	(*v11.FetchInfo)(nil),         // 20: crawly.frontier.task.v1.FetchInfo
 }
 var file_crawly_frontier_run_v1_run_proto_depIdxs = []int32{
-	11, // 0: crawly.frontier.run.v1.Run.labels:type_name -> crawly.frontier.run.v1.Run.LabelsEntry
+	12, // 0: crawly.frontier.run.v1.Run.labels:type_name -> crawly.frontier.run.v1.Run.LabelsEntry
 	0,  // 1: crawly.frontier.run.v1.Run.state:type_name -> crawly.frontier.run.v1.Run.State
-	13, // 2: crawly.frontier.run.v1.Run.policy:type_name -> crawly.frontier.policy.v1.RunPolicy
-	6,  // 3: crawly.frontier.run.v1.Run.limits:type_name -> crawly.frontier.run.v1.RunLimits
-	7,  // 4: crawly.frontier.run.v1.Run.key_rule:type_name -> crawly.frontier.run.v1.KeyRule
+	16, // 2: crawly.frontier.run.v1.Run.policy:type_name -> crawly.frontier.policy.v1.RunPolicy
+	7,  // 3: crawly.frontier.run.v1.Run.limits:type_name -> crawly.frontier.run.v1.RunLimits
+	8,  // 4: crawly.frontier.run.v1.Run.key_rule:type_name -> crawly.frontier.run.v1.KeyRule
 	5,  // 5: crawly.frontier.run.v1.Run.stats:type_name -> crawly.frontier.run.v1.RunStats
-	14, // 6: crawly.frontier.run.v1.Run.create_time:type_name -> google.protobuf.Timestamp
-	14, // 7: crawly.frontier.run.v1.Run.seal_time:type_name -> google.protobuf.Timestamp
-	14, // 8: crawly.frontier.run.v1.Run.finish_time:type_name -> google.protobuf.Timestamp
-	12, // 9: crawly.frontier.run.v1.RunStats.by_code:type_name -> crawly.frontier.run.v1.RunStats.ByCodeEntry
-	14, // 10: crawly.frontier.run.v1.RunLimits.deadline_time:type_name -> google.protobuf.Timestamp
-	1,  // 11: crawly.frontier.run.v1.KeyRule.kind:type_name -> crawly.frontier.run.v1.KeyRule.Kind
-	2,  // 12: crawly.frontier.run.v1.RunEvent.type:type_name -> crawly.frontier.run.v1.RunEvent.Type
-	4,  // 13: crawly.frontier.run.v1.RunEvent.run:type_name -> crawly.frontier.run.v1.Run
-	14, // 14: crawly.frontier.run.v1.RunEvent.event_time:type_name -> google.protobuf.Timestamp
-	15, // 15: crawly.frontier.run.v1.TaskStatus.task:type_name -> crawly.frontier.task.v1.Task
-	3,  // 16: crawly.frontier.run.v1.TaskStatus.state:type_name -> crawly.frontier.run.v1.TaskStatus.State
-	14, // 17: crawly.frontier.run.v1.TaskStatus.next_eligible_time:type_name -> google.protobuf.Timestamp
-	10, // 18: crawly.frontier.run.v1.TaskStatus.attempts:type_name -> crawly.frontier.run.v1.Attempt
-	14, // 19: crawly.frontier.run.v1.Attempt.dispatch_time:type_name -> google.protobuf.Timestamp
-	14, // 20: crawly.frontier.run.v1.Attempt.finish_time:type_name -> google.protobuf.Timestamp
-	16, // 21: crawly.frontier.run.v1.Attempt.outcome:type_name -> crawly.frontier.task.v1.Outcome
-	17, // 22: crawly.frontier.run.v1.Attempt.fetch:type_name -> crawly.frontier.task.v1.FetchInfo
-	23, // [23:23] is the sub-list for method output_type
-	23, // [23:23] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	17, // 6: crawly.frontier.run.v1.Run.create_time:type_name -> google.protobuf.Timestamp
+	17, // 7: crawly.frontier.run.v1.Run.seal_time:type_name -> google.protobuf.Timestamp
+	17, // 8: crawly.frontier.run.v1.Run.finish_time:type_name -> google.protobuf.Timestamp
+	13, // 9: crawly.frontier.run.v1.RunStats.by_code:type_name -> crawly.frontier.run.v1.RunStats.ByCodeEntry
+	14, // 10: crawly.frontier.run.v1.RunStats.by_label:type_name -> crawly.frontier.run.v1.RunStats.ByLabelEntry
+	15, // 11: crawly.frontier.run.v1.LabelStats.failed_by_code:type_name -> crawly.frontier.run.v1.LabelStats.FailedByCodeEntry
+	17, // 12: crawly.frontier.run.v1.RunLimits.deadline_time:type_name -> google.protobuf.Timestamp
+	1,  // 13: crawly.frontier.run.v1.KeyRule.kind:type_name -> crawly.frontier.run.v1.KeyRule.Kind
+	2,  // 14: crawly.frontier.run.v1.RunEvent.type:type_name -> crawly.frontier.run.v1.RunEvent.Type
+	4,  // 15: crawly.frontier.run.v1.RunEvent.run:type_name -> crawly.frontier.run.v1.Run
+	17, // 16: crawly.frontier.run.v1.RunEvent.event_time:type_name -> google.protobuf.Timestamp
+	18, // 17: crawly.frontier.run.v1.TaskStatus.task:type_name -> crawly.frontier.task.v1.Task
+	3,  // 18: crawly.frontier.run.v1.TaskStatus.state:type_name -> crawly.frontier.run.v1.TaskStatus.State
+	17, // 19: crawly.frontier.run.v1.TaskStatus.next_eligible_time:type_name -> google.protobuf.Timestamp
+	11, // 20: crawly.frontier.run.v1.TaskStatus.attempts:type_name -> crawly.frontier.run.v1.Attempt
+	17, // 21: crawly.frontier.run.v1.Attempt.dispatch_time:type_name -> google.protobuf.Timestamp
+	17, // 22: crawly.frontier.run.v1.Attempt.finish_time:type_name -> google.protobuf.Timestamp
+	19, // 23: crawly.frontier.run.v1.Attempt.outcome:type_name -> crawly.frontier.task.v1.Outcome
+	20, // 24: crawly.frontier.run.v1.Attempt.fetch:type_name -> crawly.frontier.task.v1.FetchInfo
+	6,  // 25: crawly.frontier.run.v1.RunStats.ByLabelEntry.value:type_name -> crawly.frontier.run.v1.LabelStats
+	26, // [26:26] is the sub-list for method output_type
+	26, // [26:26] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_crawly_frontier_run_v1_run_proto_init() }
@@ -1057,7 +1167,7 @@ func file_crawly_frontier_run_v1_run_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_crawly_frontier_run_v1_run_proto_rawDesc), len(file_crawly_frontier_run_v1_run_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   9,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

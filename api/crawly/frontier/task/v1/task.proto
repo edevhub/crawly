@@ -102,6 +102,17 @@ message TaskSpec {
   // Worker pool that executes the task. Empty: "default". Must match [a-z0-9_]{1,32},
   // otherwise the task is INVALID.
   string pool = 10;
+  // Optional label: a second dimension of the run's statistics (RunStats.by_label) next
+  // to the outcome code, for example the section of a source a page belongs to. Must
+  // match [A-Za-z0-9_.:/-]{1,64}, otherwise the task is INVALID. A run takes a limited
+  // number of distinct labels (a Frontier setting); a task whose label would exceed it is
+  // INVALID. The label is not part of the dedup key: a task that repeats another with
+  // a different label is a duplicate and keeps the label of the first.
+  // Seeds: unset or empty means no label. Discovered tasks: unset inherits the label of
+  // the task that discovered them, so a label is normally a property of a subtree; an
+  // empty value clears it, any other value replaces it. The field has explicit presence
+  // for that reason.
+  optional string label = 11;
 }
 
 // What workers receive.
@@ -120,6 +131,8 @@ message Task {
   // Resolved fetch timeout the worker must honour.
   google.protobuf.Duration fetch_timeout = 11;
   string pool = 12;
+  // The task's label, after inheritance: pass it on by leaving TaskSpec.label unset.
+  string label = 13;
 }
 
 message Request {

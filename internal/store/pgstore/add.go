@@ -141,6 +141,10 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 			return nil, 0, err
 		}
 	}
+	labels, err := s.knownLabels(ctx, tx, m, req.Tasks)
+	if err != nil {
+		return nil, 0, err
+	}
 	deltas := map[backlogKey]*backlogDelta{}
 	delta := func(k backlogKey) *backlogDelta {
 		d, ok := deltas[k]
@@ -173,7 +177,12 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 			out[i].Status = store.AddDuplicate // the ID is the first one's, filled in below
 			delta(key).duplicates++
 			repeats = append(repeats, [2]int{i, j})
+		case nt.Label != "" && !labels[nt.Label] && req.MaxLabels > 0 && len(labels) >= req.MaxLabels:
+			out[i].Status = store.AddInvalid
 		default:
+			if nt.Label != "" {
+				labels[nt.Label] = true // taken for the rest of the batch; recorded below if the task is inserted
+			}
 			first[nt.Fingerprint] = i
 			rows = append(rows, newRow{index: i, id: s.ids.next(), key: key})
 		}
@@ -203,6 +212,7 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 	}
 	var added uint64
 	var lost [][]byte
+	var used []string // labels of the tasks that were inserted
 	for i := range rows {
 		r, nt := &rows[i], &req.Tasks[rows[i].index]
 		d := delta(r.key)
@@ -214,7 +224,13 @@ func (s *Store) addTx(ctx context.Context, tx pgx.Tx, now time.Time, m *runMeta,
 		out[r.index] = store.AddResult{Status: store.AddAdded, TaskID: taskKey{bucket: bucketOf(nt.Queue), day: m.day, id: r.id}.ID()}
 		added++
 		d.added++
+		if nt.Label != "" && !slices.Contains(used, nt.Label) {
+			used = append(used, nt.Label)
+		}
 		d.ready = earliest(d.ready, latest(now, nt.NotBefore))
+	}
+	if err := registerLabels(ctx, tx, m.no, used); err != nil {
+		return nil, 0, err
 	}
 	if len(lost) > 0 {
 		if err := s.existing(ctx, tx, m, lost, known); err != nil {
@@ -417,11 +433,12 @@ func (s *Store) insertTasks(ctx context.Context, tx pgx.Tx, now time.Time, m *ru
 		notBefore  = make([]pgtype.Timestamptz, n)
 		expires    = make([]pgtype.Timestamptz, n)
 		specs      = make([][]byte, n)
+		labels     = make([]string, n)
 	)
 	for i := range rows {
 		nt := &tasks[rows[i].index]
 		ids[i], queues[i], pools[i], fps[i] = rows[i].id, string(nt.Queue), rows[i].key.pool, nt.Fingerprint[:]
-		priorities[i], notBefore[i], specs[i] = nt.Priority, tsz(nt.NotBefore), nt.Spec
+		priorities[i], notBefore[i], specs[i], labels[i] = nt.Priority, tsz(nt.NotBefore), nt.Spec, nt.Label
 		if specs[i] == nil {
 			specs[i] = []byte{}
 		}
@@ -430,15 +447,15 @@ func (s *Store) insertTasks(ctx context.Context, tx pgx.Tx, now time.Time, m *ru
 		}
 	}
 	res, err := tx.Query(ctx, `INSERT INTO tasks (run_created_on, task_id, run_no, queue_key, pool_id, fingerprint, priority,
-			not_before, expires_at, depth, parent_task_id, parent_bucket, spec, created_at)
-		SELECT $1, u.task_id, $2, u.queue_key, u.pool_id, u.fingerprint, u.priority, u.not_before, u.expires_at, $3, $4, $5, u.spec, $6
-		FROM unnest($7::uuid[], $8::text[], $9::smallint[], $10::bytea[], $11::int[], $12::timestamptz[], $13::timestamptz[], $14::bytea[])
-			AS u(task_id, queue_key, pool_id, fingerprint, priority, not_before, expires_at, spec)
+			not_before, expires_at, depth, parent_task_id, parent_bucket, spec, label, created_at)
+		SELECT $1, u.task_id, $2, u.queue_key, u.pool_id, u.fingerprint, u.priority, u.not_before, u.expires_at, $3, $4, $5, u.spec, u.label, $6
+		FROM unnest($7::uuid[], $8::text[], $9::smallint[], $10::bytea[], $11::int[], $12::timestamptz[], $13::timestamptz[], $14::bytea[], $15::text[])
+			AS u(task_id, queue_key, pool_id, fingerprint, priority, not_before, expires_at, spec, label)
 		ORDER BY u.fingerprint
 		ON CONFLICT (run_created_on, run_no, fingerprint) DO NOTHING
 		RETURNING fingerprint`,
 		m.createdOn, m.no, int32(min(depth, 1<<30)), parent, parentBucket, now,
-		ids, queues, pools, fps, priorities, notBefore, expires, specs)
+		ids, queues, pools, fps, priorities, notBefore, expires, specs, labels)
 	if err != nil {
 		return nil, err
 	}

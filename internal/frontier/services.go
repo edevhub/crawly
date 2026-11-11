@@ -72,7 +72,8 @@ func (r runService) AddTasks(stream grpc.BidiStreamingServer[runv1.AddTasksReque
 		if err != nil {
 			return grpcErr(err)
 		}
-		res, err := r.s.store.AddTasks(ctx, store.AddRequest{Run: spec.ID, Tasks: r.s.newTasks(spec, req.GetTasks())})
+		res, err := r.s.store.AddTasks(ctx, store.AddRequest{Run: spec.ID, Tasks: r.s.newTasks(spec, req.GetTasks(), ""),
+			MaxLabels: r.s.cfg.MaxLabelsPerRun})
 		if err != nil {
 			return grpcErr(err)
 		}
@@ -215,7 +216,7 @@ func (r runService) WatchRuns(req *runv1.WatchRunsRequest, stream grpc.ServerStr
 }
 
 func (r runService) ListTasks(ctx context.Context, req *runv1.ListTasksRequest) (*runv1.ListTasksResponse, error) {
-	f := store.TaskFilter{Run: store.RunID(req.GetRunId()), Queue: store.QueueKey(req.GetQueueKey()), Code: req.GetCode()}
+	f := store.TaskFilter{Run: store.RunID(req.GetRunId()), Queue: store.QueueKey(req.GetQueueKey()), Code: req.GetCode(), Label: req.GetLabel()}
 	for _, st := range req.GetStates() {
 		f.States = append(f.States, store.TaskState(st))
 	}
@@ -378,9 +379,21 @@ func runProto(r store.Run) *runv1.Run {
 		KeyRule: &runv1.KeyRule{Kind: rule},
 		Stats: &runv1.RunStats{Pending: st.Pending, Delayed: st.Delayed, InFlight: st.InFlight, Succeeded: st.Succeeded,
 			Failed: st.Failed, Expired: st.Expired, Cancelled: st.Cancelled, Attempts: st.Attempts, QueueBlocks: st.QueueBlocks,
-			Discovered: st.Discovered, Duplicates: st.Duplicates, OverBudget: st.OverBudget, ByCode: st.ByCode},
+			Discovered: st.Discovered, Duplicates: st.Duplicates, OverBudget: st.OverBudget, ByCode: st.ByCode, ByLabel: labelStatsProto(st.ByLabel)},
 		CreateTime: ts(r.CreatedAt), SealTime: ts(r.SealedAt), FinishTime: ts(r.FinishedAt),
 	}
+}
+
+func labelStatsProto(m map[string]store.LabelStats) map[string]*runv1.LabelStats {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]*runv1.LabelStats, len(m))
+	for k, l := range m {
+		out[k] = &runv1.LabelStats{Succeeded: l.Succeeded, Failed: l.Failed, Expired: l.Expired, Cancelled: l.Cancelled,
+			FailedByCode: l.FailedByCode}
+	}
+	return out
 }
 
 func addResults(res []store.AddResult) []*taskv1.AddResult {
@@ -406,7 +419,7 @@ func addResults(res []store.AddResult) []*taskv1.AddResult {
 func taskFromSpec(id store.TaskID, run store.RunID, fp store.Fingerprint, depth uint32, parent store.TaskID, spec *taskv1.TaskSpec) *taskv1.Task {
 	return &taskv1.Task{TaskId: string(id), RunId: string(run), QueueKey: spec.GetQueueKey(), Fingerprint: hex.EncodeToString(fp[:]),
 		Request: spec.GetRequest(), Handler: spec.GetHandler(), Depth: depth, ParentTaskId: string(parent),
-		Context: spec.GetContext(), Pool: spec.GetPool()}
+		Context: spec.GetContext(), Pool: spec.GetPool(), Label: spec.GetLabel()}
 }
 
 func taskStatusProto(t store.TaskStatus) *runv1.TaskStatus {

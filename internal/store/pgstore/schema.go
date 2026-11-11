@@ -15,6 +15,7 @@ const (
 	lockEvents   = 2 // (2, 0): run_events append, so cursors follow commit order
 	lockPolicies = 3 // (3, 0): policy set activation
 	lockSchema   = 4 // (4, 0): schema creation and partition changes
+	lockLabels   = 5 // (5, run_no): AddTasks that bring a label the run does not have
 )
 
 // month is the first day of t's month, in UTC.

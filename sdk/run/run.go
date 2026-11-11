@@ -21,6 +21,8 @@ type (
 	Run = runv1.Run
 	// Stats counts the tasks and attempts of a run.
 	Stats = runv1.RunStats
+	// LabelStats counts the ended tasks of one task label: Stats.ByLabel maps labels to them.
+	LabelStats = runv1.LabelStats
 	// Limits caps what a run may do: a deadline, a task budget and a crawl depth.
 	Limits = runv1.RunLimits
 	// Event is a run lifecycle event or a statistics update, as WatchRuns delivers it.

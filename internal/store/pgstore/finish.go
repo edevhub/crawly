@@ -42,11 +42,12 @@ type leased struct {
 	parent       pgtype.UUID
 	parentBucket *int16
 	fingerprint  store.Fingerprint
+	label        string
 }
 
 const leasedColumns = `run_created_on, task_id, run_no, queue_key, pool_id, state::text, attempt, coalesce(lease_nonce, 0),
 	lease_expires_at, lease_deadline, coalesce(worker_id, ''), coalesce(worker_version, ''), dispatched_at,
-	depth, parent_task_id, parent_bucket, fingerprint`
+	depth, parent_task_id, parent_bucket, fingerprint, label`
 
 func scanLeased(row pgx.Row) (*leased, error) {
 	var (
@@ -58,7 +59,7 @@ func scanLeased(row pgx.Row) (*leased, error) {
 		fp                            []byte
 	)
 	if err := row.Scan(&day, &t.key.id, &t.run, &queue, &t.pool, &t.state, &attempt, &t.nonce, &expires, &deadline,
-		&t.worker.ID, &t.worker.Version, &dispatched, &depth, &t.parent, &t.parentBucket, &fp); err != nil {
+		&t.worker.ID, &t.worker.Version, &dispatched, &depth, &t.parent, &t.parentBucket, &fp, &t.label); err != nil {
 		return nil, err
 	}
 	t.queue = store.QueueKey(queue)
@@ -99,7 +100,7 @@ func (s *Store) info(ctx context.Context, q querier, t *leased) (store.LeaseInfo
 	}
 	return store.LeaseInfo{Ref: t.lease().ref(), Task: t.key.ID(), Run: m.spec.ID, RunPolicy: m.spec.Policy,
 		Queue: t.queue, Pool: pool, Fingerprint: t.fingerprint, Depth: t.depth,
-		Parent: parentID(t.parent, t.parentBucket, t.key.day)}, nil
+		Parent: parentID(t.parent, t.parentBucket, t.key.day), Label: t.label}, nil
 }
 
 // Lease returns the context of the task's current lease, or store.ErrNotFound if the
@@ -247,14 +248,15 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 	batch := &pgx.Batch{}
 	switch {
 	case ended:
-		final := taskCancelled
+		final, column := taskCancelled, "cancelled"
 		if own.state == store.RunExpired {
-			final = taskExpired
+			final, column = taskExpired, "expired"
 			own.expired++
 		} else {
 			own.cancelled++
 		}
 		closeTask(batch, t, final, now)
+		countLabel(batch, string(t.queue), t.run, t.label, column, 1)
 		record, result = store.AttemptRecord{Code: codeRevoked, PolicySet: f.Record.PolicySet}, resultRevoked
 		status = store.FinishStale
 	case f.Result == store.ResultReleased:
@@ -270,10 +272,12 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 	case f.Result == store.ResultFailed:
 		own.failed++
 		closeTask(batch, t, taskFailed, now)
+		countFailed(batch, string(t.queue), t.run, t.label, f.Record.Code)
 		result = resultFailed
 	default:
 		own.succeeded++
 		closeTask(batch, t, taskSucceeded, now)
+		countLabel(batch, string(t.queue), t.run, t.label, "succeeded", 1)
 		result = resultSucceeded
 	}
 	if f.Source == store.SourceReaper && result != resultRevoked {
