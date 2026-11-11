@@ -228,6 +228,12 @@ Discovered tasks are deduplicated per run by a normalised URL (scheme + host + p
 sorted query; scheme and host lowercased, path and query as they are). Set `DedupKey` when
 a site needs special rules: case-insensitive paths, tracking parameters, POST bodies.
 
+A task is limited to 1 MiB (`worker.MaxTaskBytes`): URL, headers, body and `Context`
+together. A handler that returns a larger one fails its own task with code
+`task_too_large`. Any number of tasks can be returned from one handler: the SDK sends them
+in batches bounded by count and by size. Upgrade the workers with the Frontier or before
+it: a worker of an older SDK does not notice a task the Frontier refuses for its size.
+
 ## Scheduling a run
 
 ```go
@@ -293,7 +299,8 @@ func main() {
 
 `CreateRun` is idempotent for the same request, so a scheduler can retry it. `Seed` sends
 tasks in batches; when it fails part of the way it returns the results of the batches
-that were committed together with the error, and seeding again is safe. `Wait` returns the
+that were committed together with the error, and seeding again is safe. A seed over
+1 MiB (`sdk.MaxTaskBytes`) is not sent and its result is `INVALID`. `Wait` returns the
 run once it is completed, cancelled or expired; it reconnects with backoff when the stream
 breaks, which happens on every restart of a Frontier, and fails with `NotFound` when the
 run does not exist. Underneath it is `WatchRuns`, a raw stream that starts with the run's

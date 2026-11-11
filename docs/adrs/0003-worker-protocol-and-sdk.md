@@ -70,6 +70,23 @@ This ADR borrows it.
 - When the store is unavailable for a message (after the store's own retries, or the
   replica's call budget is exhausted), the Frontier closes the stream with `UNAVAILABLE`.
   The SDK reconnects and resends what was not acknowledged, in order. Leases are unaffected.
+- Messages are bounded in bytes, so that no task a spider builds can exceed what a gRPC
+  message carries. A task is limited to 1 MiB as encoded (request, headers, body and
+  context together); the Frontier answers a larger one with `INVALID`. The SDK starts a
+  new `DiscoverBatch` by count and by size, and a handler that returns a task over the
+  limit fails its own task for good with code `task_too_large`, with none of its tasks
+  added. The same bounds apply to seeds.
+- A report the Frontier refuses with `RESOURCE_EXHAUSTED` is final for that report. The
+  bounds above keep the SDK's messages under gRPC's default limit, so this happens only
+  against a Frontier with a lower one. Resent as it is, the report would end every new
+  session; left to its lease, the handler would build the same report on every attempt.
+  The SDK therefore replaces it with `FAILED`, code `report_too_large`, without discovered
+  tasks. The batches the Frontier took before the refusal stay added.
+- The bounds are enforced by each side from its own version on. A worker of an older SDK
+  still sends batches bounded by count only, and does not look at the result of each
+  discovered task, so a task over 1 MiB that a new Frontier answers with `INVALID` is
+  dropped without a sign on that worker. Workers are upgraded with the Frontier, or
+  before it.
 
 ### Leases and heartbeats
 
