@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -43,11 +44,12 @@ type leased struct {
 	parentBucket *int16
 	fingerprint  store.Fingerprint
 	strained     uint32
+	handler      string
 }
 
 const leasedColumns = `run_created_on, task_id, run_no, queue_key, pool_id, state::text, attempt, coalesce(lease_nonce, 0),
 	lease_expires_at, lease_deadline, coalesce(worker_id, ''), coalesce(worker_version, ''), dispatched_at,
-	depth, parent_task_id, parent_bucket, fingerprint, strain_attempts`
+	depth, parent_task_id, parent_bucket, fingerprint, strain_attempts, handler`
 
 func scanLeased(row pgx.Row) (*leased, error) {
 	var (
@@ -59,7 +61,7 @@ func scanLeased(row pgx.Row) (*leased, error) {
 		fp                            []byte
 	)
 	if err := row.Scan(&day, &t.key.id, &t.run, &queue, &t.pool, &t.state, &attempt, &t.nonce, &expires, &deadline,
-		&t.worker.ID, &t.worker.Version, &dispatched, &depth, &t.parent, &t.parentBucket, &fp, &strained); err != nil {
+		&t.worker.ID, &t.worker.Version, &dispatched, &depth, &t.parent, &t.parentBucket, &fp, &strained, &t.handler); err != nil {
 		return nil, err
 	}
 	t.queue = store.QueueKey(queue)
@@ -155,7 +157,7 @@ func (s *Store) ExtendLease(ctx context.Context, ref store.LeaseRef, by time.Dur
 			}
 			return err
 		}
-		if runStates[name].Ended() {
+		if s.parseRunState(name).Ended() {
 			return nil // the run ended: its leases are revoked
 		}
 		if by <= 0 {
@@ -246,7 +248,7 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 		}
 	}
 	status := store.FinishAccepted
-	ended := own.state == store.RunCancelled || own.state == store.RunExpired
+	ended := own.state == store.RunCancelled || own.state == store.RunExpired || own.state == store.RunAborted
 	own.inFlight--
 	own.dirty = true
 	q.inFlight--
@@ -289,7 +291,8 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 	}
 	if !due.IsZero() {
 		own.pending++
-		own.ready = earliest(own.ready, due)
+		l := own.laneOf(t.handler)
+		l.setReady(earliest(l.ready, due))
 	}
 	if result != 0 {
 		recordAttempt(batch, t, now, result, record)
@@ -317,6 +320,15 @@ func (s *Store) finishTx(ctx context.Context, tx pgx.Tx, now time.Time, lk lease
 	refresh(q, bs, now)
 	if err := flush(ctx, tx, now, q, bs); err != nil {
 		return store.FinishUnknown, err
+	}
+	if !ended && f.Result != store.ResultReleased {
+		// After the outcome is applied and the backlogs are written: an abort ends the
+		// run, and what it leaves is drained like a cancelled run's.
+		aborted, err := s.tripAbort(ctx, tx, now, t, f, own.pending == 0 && own.inFlight == 0)
+		if err != nil {
+			return store.FinishUnknown, err
+		}
+		ended = ended || aborted
 	}
 	if own.pending == 0 && own.inFlight == 0 && !ended {
 		if err := s.complete(ctx, tx, t.run, now); err != nil {
@@ -369,15 +381,81 @@ func firstLoaded(bs []*brow) *brow {
 // Early is allowed, late is not.
 func quicken(q *qrow, bs []*brow, now time.Time) {
 	for _, b := range bs {
-		if b.pending == 0 || !b.live || b.ready.IsZero() || b.ready.Equal(forever) || !b.ready.After(now) {
+		if b.pending == 0 || !b.live {
 			continue
 		}
-		if admit, at := admission(q, b, now); admit > 0 {
-			b.setReady(now)
-		} else if at.Before(b.ready) {
-			b.setReady(at)
+		admit, at := admission(q, b, now)
+		for _, l := range b.lanes {
+			if l.ready.IsZero() || l.ready.Equal(forever) || !l.ready.After(now) {
+				continue
+			}
+			if admit > 0 {
+				l.setReady(now)
+			} else if at.Before(l.ready) {
+				l.setReady(at)
+			}
 		}
 	}
+}
+
+// tripAbort applies the abort rules of the run to an attempt that was just applied, and
+// ends the run if one trips. The run's counters sit on its row. A final failure bumps
+// them with one UPDATE that returns the new values, so the row lock orders the outcomes
+// of the run, whichever queues they come from, and nothing else is locked: the run-wide
+// advisory lock of the lifecycle changes is taken only when the completion check is due,
+// before the row, as complete takes it. Of two outcomes that trip a rule at once the
+// second finds the run over (every update names the states that are not). A success
+// takes the row only when there is a streak to reset, and a run without rules never
+// touches its row.
+//
+// A lease that expired is the worker fleet's failure and not the site's, so a reaper's
+// final failure counts toward neither failure limit; it can still trip abort_on_codes.
+func (s *Store) tripAbort(ctx context.Context, tx pgx.Tx, now time.Time, t *leased, f store.Finish, completionDue bool) (bool, error) {
+	m, err := s.meta(ctx, tx, t.run)
+	if err != nil {
+		return false, err
+	}
+	lim := m.spec.Limits
+	failed := f.Result == store.ResultFailed && f.Source != store.SourceReaper && lim.CountsFailures()
+	reset := f.Result == store.ResultSucceeded && lim.MaxConsecutiveFailures > 0
+	codeHit := f.Record.Code != "" && slices.Contains(lim.AbortOnCodes, f.Record.Code)
+	if !failed && !reset && !codeHit {
+		return false, nil
+	}
+	if completionDue {
+		// complete takes this lock after us: taking it first keeps the order of every
+		// lifecycle change (the lock, then the row).
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int, $2::int)", lockRun, lockKey(t.run)); err != nil {
+			return false, err
+		}
+	}
+	var total, streak int64
+	switch {
+	case failed:
+		err = tx.QueryRow(ctx, `UPDATE runs SET failed_count = failed_count + 1, failed_streak = failed_streak + 1
+			WHERE run_no = $1 AND state IN ('open', 'sealed') RETURNING failed_count, failed_streak`, t.run).Scan(&total, &streak)
+		if err != nil {
+			return false, ignoreNoRows(err) // the run is over: nothing to end
+		}
+	case reset:
+		if _, err := tx.Exec(ctx, `UPDATE runs SET failed_streak = 0
+			WHERE run_no = $1 AND failed_streak <> 0 AND state IN ('open', 'sealed')`, t.run); err != nil {
+			return false, err
+		}
+	}
+	rule, ok := lim.Trip(f.Record.Code, uint64(total), uint64(streak)) //nolint:gosec // G115: counters are not negative
+	if !ok {
+		return false, nil
+	}
+	return s.end(ctx, tx, t.run, store.RunAborted, &store.AbortReason{Rule: rule, Code: f.Record.Code, Task: t.key.ID()}, now)
+}
+
+// ignoreNoRows turns "no such row" into nil: the run was deleted, so there is nothing to do.
+func ignoreNoRows(err error) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	return err
 }
 
 // refresh brings the readiness of a queue's locked backlogs up to date after a slot
@@ -386,20 +464,24 @@ func quicken(q *qrow, bs []*brow, now time.Time) {
 func refresh(q *qrow, bs []*brow, now time.Time) {
 	blocked := now.Before(q.blockedUntil)
 	for _, b := range bs {
-		switch {
-		case b.pending == 0:
+		if b.pending == 0 {
 			b.setReady(time.Time{})
-		case !b.live || b.ready.IsZero():
-			// A paused or ended run, or a backlog a resume sweep has yet to reach.
-		case blocked:
-			if b.ready.Equal(forever) || b.ready.Before(q.blockedUntil) {
-				b.setReady(q.blockedUntil)
-			}
-		case b.ready.Equal(forever):
-			if admit, at := admission(q, b, now); admit > 0 {
-				b.setReady(now)
-			} else if at.After(now) {
-				b.setReady(at)
+			continue
+		}
+		for _, l := range b.lanes {
+			switch {
+			case !b.live || l.ready.IsZero():
+				// A paused or ended run, or a lane a resume sweep has yet to reach.
+			case blocked:
+				if l.ready.Equal(forever) || l.ready.Before(q.blockedUntil) {
+					l.setReady(q.blockedUntil)
+				}
+			case l.ready.Equal(forever):
+				if admit, at := admission(q, b, now); admit > 0 {
+					l.setReady(now)
+				} else if at.After(now) {
+					l.setReady(at)
+				}
 			}
 		}
 	}

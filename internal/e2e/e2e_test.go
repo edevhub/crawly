@@ -3,6 +3,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -414,5 +415,179 @@ func TestHealth(t *testing.T) {
 	f.Drain()
 	if got := check(); got != healthpb.HealthCheckResponse_NOT_SERVING {
 		t.Fatalf("a draining replica reports %v", got)
+	}
+}
+
+// TestAbortOnBlock: a site that blocks the crawler ends a sealed run as aborted, with the
+// rule and the task that tripped it, instead of leaving it to wait for the block to end.
+// A second run that meets the block shows it in its stats, and a watcher and Wait both see
+// the abort as the end of the run.
+func TestAbortOnBlock(t *testing.T) { backends(t, testAbortOnBlock) }
+
+func testAbortOnBlock(t *testing.T, start startFunc) { //nolint:thelper // a test body, not a helper: failures must point into it
+	ctx := t.Context()
+	addr := start(t).Addr
+	rc := runClient(t, addr)
+
+	w, err := worker.New(addr, worker.WithInsecure(), worker.WithMaxConcurrentTasks(1), worker.WithShutdownGrace(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ran atomic.Int32
+	register(t, w, "page", worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+		ran.Add(1)
+		return nil, worker.Fail("blocked", errors.New("the site refuses the crawler"), worker.BlockQueue(time.Hour))
+	}))
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- w.Run(ctx) }()
+	t.Cleanup(func() {
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker: %v", err)
+		}
+	})
+
+	// The watcher comes first: it learns of the run when it is created.
+	watch, err := rc.WatchRuns(ctx, &run.WatchRunsRequest{RunId: "crawl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan *run.Event, 32)
+	go func() {
+		defer close(events)
+		for {
+			res, err := watch.Recv()
+			if err != nil {
+				return
+			}
+			events <- res.GetEvent()
+		}
+	}()
+
+	if _, err := rc.CreateRun(ctx, &run.CreateRunRequest{RunId: "crawl", Limits: &run.Limits{AbortOnCodes: []string{"blocked"}}}); err != nil {
+		t.Fatal(err)
+	}
+	specs := make([]*task.Spec, 0, 6)
+	for i := range 6 {
+		specs = append(specs, &task.Spec{Request: &task.Request{Url: fmt.Sprintf("https://blocked.example/%d", i)}, Handler: "page"})
+	}
+	seed(t, ctx, addr, "crawl", specs...) // one batch: the first block must not end the run before the seeds are in
+	if _, err := rc.SealRun(ctx, &run.SealRunRequest{RunId: "crawl"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitCtx, stop := context.WithTimeout(ctx, 20*time.Second)
+	defer stop()
+	final, err := clients[addr].Wait(waitCtx, "crawl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.GetState() != run.StateAborted {
+		t.Fatalf("the run ended %v, want aborted: %v", final.GetState(), final)
+	}
+	why := final.GetAbortReason()
+	if why.GetRule() != run.AbortOnCode || why.GetCode() != "blocked" || why.GetTaskId() == "" {
+		t.Fatalf("abort reason: %v", why)
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		got, err := rc.GetRun(ctx, &run.GetRunRequest{RunId: "crawl"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		st := got.GetRun().GetStats()
+		if st.GetFailed() == 1 && st.GetCancelled() == 5 && st.GetPending() == 0 && st.GetInFlight() == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the aborted run did not drain: %v", st)
+		}
+	}
+	if n := ran.Load(); n != 1 {
+		t.Fatalf("%d tasks ran; the first block should have ended the run", n)
+	}
+	var last *run.Event
+	for ev := range events {
+		last = ev
+		if ev.GetType() == run.EventAborted {
+			break
+		}
+	}
+	if last.GetType() != run.EventAborted || last.GetRun().GetAbortReason().GetTaskId() != why.GetTaskId() {
+		t.Fatalf("the watch did not report the abort: %v", last)
+	}
+
+	// The site is still blocked: a second run on it waits, and its stats say so.
+	if _, err := rc.CreateRun(ctx, &run.CreateRunRequest{RunId: "second"}); err != nil {
+		t.Fatal(err)
+	}
+	seed(t, ctx, addr, "second",
+		&task.Spec{Request: &task.Request{Url: "https://blocked.example/a"}, Handler: "page"},
+		&task.Spec{Request: &task.Request{Url: "https://blocked.example/b"}, Handler: "page"})
+	if _, err := rc.SealRun(ctx, &run.SealRunRequest{RunId: "second"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // long enough for a dispatch that should not happen
+	got, err := rc.GetRun(ctx, &run.GetRunRequest{RunId: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bq := got.GetRun().GetStats().GetBlockedQueues()
+	if got.GetRun().GetState() != run.StateSealed || len(bq) != 1 || bq[0].GetQueueKey() != "blocked.example" ||
+		bq[0].GetReason() != "blocked" || bq[0].GetWaiting() != 2 || bq[0].GetUnblockTime().AsTime().Before(time.Now().Add(30*time.Minute)) {
+		t.Fatalf("the second run: %v", got.GetRun())
+	}
+	if n := ran.Load(); n != 1 {
+		t.Fatalf("a task of the second run ran while the queue was blocked (%d)", n)
+	}
+	if _, err := rc.CancelRun(ctx, &run.CancelRunRequest{RunId: "second"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAbortRevokesLeases: a run ended by a rule revokes the handlers still running its
+// tasks, as a cancel does.
+func TestAbortRevokesLeases(t *testing.T) { backends(t, testAbortRevokesLeases) }
+
+func testAbortRevokesLeases(t *testing.T, start startFunc) { //nolint:thelper // a test body, not a helper: failures must point into it
+	ctx := t.Context()
+	addr := start(t).Addr
+	rc := runClient(t, addr)
+
+	started, revoked := make(chan struct{}, 1), make(chan struct{}, 1)
+	w, err := worker.New(addr, worker.WithInsecure(), worker.WithMaxConcurrentTasks(2), worker.WithShutdownGrace(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	register(t, w, "hang", worker.HandlerFunc(func(ctx context.Context, _ *worker.Task) (*worker.Result, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		revoked <- struct{}{}
+		return nil, ctx.Err()
+	}))
+	register(t, w, "fail", worker.HandlerFunc(func(context.Context, *worker.Task) (*worker.Result, error) {
+		<-started // fail while the other task is running
+		return nil, worker.Fail("gone", errors.New("gone"))
+	}))
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- w.Run(ctx) }()
+	t.Cleanup(func() {
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker: %v", err)
+		}
+	})
+
+	if _, err := rc.CreateRun(ctx, &run.CreateRunRequest{RunId: "r", Limits: &run.Limits{MaxFailed: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	seed(t, ctx, addr, "r",
+		&task.Spec{Request: &task.Request{Url: "https://a.example/hang"}, Handler: "hang"},
+		&task.Spec{Request: &task.Request{Url: "https://b.example/fail"}, Handler: "fail"})
+	select {
+	case <-revoked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the running handler was not revoked when the run was aborted")
+	}
+	got, err := rc.GetRun(ctx, &run.GetRunRequest{RunId: "r"})
+	if err != nil || got.GetRun().GetState() != run.StateAborted || got.GetRun().GetAbortReason().GetRule() != run.AbortMaxFailed {
+		t.Fatalf("%v %v", got, err)
 	}
 }

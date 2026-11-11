@@ -16,12 +16,16 @@ message Hello {
   string worker_id = 1;
   // Spider build version. Informational; recorded on every attempt for lineage.
   string build_version = 2;
-  // Fields 3 (labels) and 4 (handlers) removed: routing is by pool name only.
+  // Fields 3 (labels) and 4 (an earlier handlers field) are retired and not reused.
   reserved 3, 4;
-  // Required. The pool this session serves, e.g. "default" or "browser". A task whose
-  // handler the worker lacks is handed back (Outcome RELEASED, code "no_handler").
-  // Pool names match [a-z0-9_]{1,32}.
+  // Required. The pool this session serves, e.g. "default" or "browser". Pool names match
+  // [a-z0-9_]{1,32}.
   string pool = 5;
+  // The handlers this session can run, i.e. the task handler names the worker registered
+  // for the pool. The frontier gives the session only tasks of these handlers. Empty: the
+  // session is offered every task of its pool and hands back (Outcome RELEASED, code
+  // "no_handler") the ones it cannot run, as workers that predate this field do.
+  repeated string handlers = 6;
 }
 
 message Welcome {
@@ -81,7 +85,7 @@ message LeaseRevoked {
     REASON_UNSPECIFIED = 0;
     REASON_EXPIRED = 1;            // extension came too late
     REASON_FENCED = 2;             // a newer attempt exists
-    REASON_RUN_CANCELLED = 3;
+    REASON_RUN_CANCELLED = 3;      // the run ended before the task did: cancelled, expired or aborted
     REASON_MAX_DURATION = 4;       // Behaviour.max_lease_duration reached
   }
   Reason reason = 2;

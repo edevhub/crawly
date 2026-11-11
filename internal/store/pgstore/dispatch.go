@@ -37,8 +37,9 @@ const (
 	lockRetry = 20 * time.Millisecond
 )
 
-// Dispatch leases up to req.Slots due tasks of the pool, fairly across runs and
-// within the queue limits. It is one transaction per queue it dispatches from.
+// Dispatch leases up to req.Slots due tasks of the pool that the session can run,
+// fairly across runs and within the queue limits. It is one transaction per queue it
+// dispatches from.
 func (s *Store) Dispatch(ctx context.Context, req store.DispatchRequest) (store.DispatchResult, error) {
 	var res store.DispatchResult
 	pool, ok, err := s.lookupPool(ctx, s.db, req.Pool)
@@ -49,15 +50,10 @@ func (s *Store) Dispatch(ctx context.Context, req store.DispatchRequest) (store.
 	if err != nil {
 		return res, err
 	}
-	rows, err := s.db.Query(ctx, `SELECT queue_key FROM (
-			SELECT queue_key, ready_at FROM backlogs WHERE pool_id = $1 AND ready_at <= $2 ORDER BY ready_at LIMIT $3) c
-		GROUP BY queue_key ORDER BY min(ready_at) LIMIT $4`, pool, now, candidateBacklogs, candidateQueues)
+	run := newHandlerSet(req.Handlers)
+	keys, err := s.candidates(ctx, pool, run, now)
 	if err != nil {
-		return res, wrap(err)
-	}
-	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return res, wrap(err)
+		return res, err
 	}
 	slots := req.Slots
 	for _, key := range keys {
@@ -68,7 +64,7 @@ func (s *Store) Dispatch(ctx context.Context, req store.DispatchRequest) (store.
 		err := s.tx(ctx, func(tx pgx.Tx, at time.Time) error {
 			var err error
 			now = latest(now, at)
-			got, err = s.dispatchQueue(ctx, tx, at, store.QueueKey(key), pool, req, slots)
+			got, err = s.dispatchQueue(ctx, tx, at, store.QueueKey(key), pool, run, req, slots)
 			return err
 		})
 		if err != nil {
@@ -78,17 +74,16 @@ func (s *Store) Dispatch(ctx context.Context, req store.DispatchRequest) (store.
 		slots -= len(got)
 	}
 
-	// When to come back: the earliest readiness in the pool that is a time.
-	var next pgtype.Timestamptz
-	err = s.db.QueryRow(ctx, `SELECT ready_at FROM backlogs WHERE pool_id = $1 AND ready_at < 'infinity'
-		ORDER BY ready_at LIMIT 1`, pool).Scan(&next)
+	// When to come back: the earliest readiness among the lanes the session can run
+	// that is a time.
+	next, err := s.nextReady(ctx, pool, run)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return res, nil // nothing is waiting for a time: a notification brings the next round
 	case err != nil:
 		return res, wrap(err)
 	}
-	switch at := timeOf(next); {
+	switch at := next; {
 	case at.After(now):
 		res.NextReadyAt = at
 	case slots <= 0:
@@ -101,8 +96,94 @@ func (s *Store) Dispatch(ctx context.Context, req store.DispatchRequest) (store.
 	return res, nil
 }
 
+// handlerSet is the handlers a session can run, as the lane rows name them. A nil set
+// runs every handler.
+type handlerSet struct {
+	names []string // the session's handlers, and "" for tasks whose handler is unknown
+}
+
+func newHandlerSet(handlers []string) *handlerSet {
+	if len(handlers) == 0 {
+		return nil
+	}
+	return &handlerSet{names: append(slices.Clone(handlers), "")}
+}
+
+// runs reports whether the session can run the lane's tasks.
+func (h *handlerSet) runs(l *lane) bool {
+	return h == nil || slices.Contains(h.names, l.handler)
+}
+
+// candidatesByHandlerSQL: one probe of lanes_ready per handler, each bounded, then the
+// earliest queues of what they found.
+const candidatesByHandlerSQL = `SELECT queue_key FROM (
+		SELECT l.queue_key, l.ready_at FROM unnest($5::text[]) AS h(handler)
+		CROSS JOIN LATERAL (SELECT queue_key, ready_at FROM lanes
+			WHERE pool_id = $1 AND handler = h.handler AND ready_at <= $2 ORDER BY ready_at LIMIT $6) l
+		ORDER BY l.ready_at LIMIT $3) c
+	GROUP BY queue_key ORDER BY min(ready_at) LIMIT $4`
+
+// claimSQL leases the best $11 due tasks of a backlog's handlers: one range of
+// tasks_claim_h per handler, merged by priority. The picked rows are materialised
+// first: as a plain sub-select the planner may run the LIMIT again for every outer row
+// and claim more than n.
+const claimSQL = `WITH picked AS MATERIALIZED (
+		SELECT p.task_id FROM unnest($12::text[]) AS h(handler)
+		CROSS JOIN LATERAL (
+			SELECT task_id, priority FROM tasks
+			WHERE run_created_on = $1 AND run_no = $2 AND queue_key = $3 AND pool_id = $4 AND handler = h.handler
+				AND state = 'pending' AND not_before <= $5 AND (expires_at IS NULL OR expires_at > $5)
+			ORDER BY priority DESC, task_id LIMIT $11 FOR UPDATE SKIP LOCKED) p
+		ORDER BY p.priority DESC, p.task_id LIMIT $11)
+	UPDATE tasks t SET state = 'in_flight', attempt = t.attempt + 1, lease_nonce = $6,
+		worker_id = $7, worker_version = $8, dispatched_at = $5, lease_expires_at = $9, lease_deadline = $10
+	FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id
+	RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.fingerprint, t.priority, t.spec, t.strain_attempts`
+
+// candidates are the queues the session may dispatch from, the one with the earliest
+// ready lane first. Each handler is probed in the readiness index on its own, so a
+// session never reads past lanes it cannot run.
+func (s *Store) candidates(ctx context.Context, pool int16, h *handlerSet, now time.Time) ([]string, error) {
+	var rows pgx.Rows
+	var err error
+	// Each handler's probe reads at most its share of the bound.
+	each := candidateBacklogs
+	if h != nil {
+		each = max(candidateBacklogs/len(h.names), 8)
+	}
+	if h == nil {
+		rows, err = s.db.Query(ctx, `SELECT queue_key FROM (
+				SELECT queue_key, ready_at FROM lanes WHERE pool_id = $1 AND ready_at <= $2 ORDER BY ready_at LIMIT $3) c
+			GROUP BY queue_key ORDER BY min(ready_at) LIMIT $4`, pool, now, candidateBacklogs, candidateQueues)
+	} else {
+		rows, err = s.db.Query(ctx, candidatesByHandlerSQL, pool, now, candidateBacklogs, candidateQueues, h.names, each)
+	}
+	if err != nil {
+		return nil, wrap(err)
+	}
+	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	return keys, wrap(err)
+}
+
+// nextReady is the earliest readiness that is a time among the lanes the session can
+// run, or pgx.ErrNoRows when there is none.
+func (s *Store) nextReady(ctx context.Context, pool int16, h *handlerSet) (time.Time, error) {
+	var next pgtype.Timestamptz
+	var err error
+	if h == nil {
+		err = s.db.QueryRow(ctx, `SELECT ready_at FROM lanes WHERE pool_id = $1 AND ready_at < 'infinity'
+			ORDER BY ready_at LIMIT 1`, pool).Scan(&next)
+	} else {
+		err = s.db.QueryRow(ctx, `SELECT l.ready_at FROM unnest($2::text[]) AS h(handler)
+			CROSS JOIN LATERAL (SELECT ready_at FROM lanes
+				WHERE pool_id = $1 AND handler = h.handler AND ready_at < 'infinity' ORDER BY ready_at LIMIT 1) l
+			ORDER BY l.ready_at LIMIT 1`, pool, h.names).Scan(&next)
+	}
+	return timeOf(next), err
+}
+
 // dispatchQueue claims up to slots tasks of the pool from one queue.
-func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key store.QueueKey, pool int16,
+func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key store.QueueKey, pool int16, run *handlerSet,
 	req store.DispatchRequest, slots int) ([]store.Assignment, error) {
 	// The queue, or pass over it if another operation holds it.
 	q, err := lockQueue(ctx, tx, key, true)
@@ -122,6 +203,25 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 		q.strain = first.eff.Adaptive.Decayed(q.strain, now)
 	}
 
+	// The lanes this session can run. Another pool's lanes are judged by its own
+	// sessions, so the first refusal below does not depend on this session's handlers;
+	// but a lane that none of them can run is not worth waiting for.
+	served, err := s.servedHandlers(ctx, tx, now, pool, bs)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range bs {
+		for _, l := range b.lanes {
+			l.mine = b.pool == pool && run.runs(l)
+		}
+	}
+	runnable := func(b *brow) func(*lane) bool {
+		if b.pool == pool {
+			return func(l *lane) bool { return l.mine }
+		}
+		return func(l *lane) bool { return l.handler == "" || served[b.pool][l.handler] || served[b.pool][""] }
+	}
+
 	var out []store.Assignment
 	var heldUntil time.Time // set when another pool has first refusal on the queue
 	notify := map[int16]bool{}
@@ -131,9 +231,9 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 		var best *brow
 		var bestStart float64
 		var bestAdmit int
-		mine := false
+		ownPool := false
 		for _, b := range bs {
-			if !evaluated(b, now) || b.short || b.pending == 0 {
+			if !b.live || b.pending == 0 || b.short || !b.readyLanes(now, runnable(b)) {
 				continue
 			}
 			admit, _ := admission(q, b, now)
@@ -141,7 +241,7 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 				continue
 			}
 			if b.pool == pool {
-				mine = true
+				ownPool = true
 			}
 			// The start tag is clamped to the queue's clock at pick time, so a backlog
 			// that could not be picked for a while cannot bank credit.
@@ -150,15 +250,15 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 				best, bestStart, bestAdmit = b, start, admit
 			}
 		}
-		if best == nil || !mine {
+		if best == nil || !ownPool {
 			break
 		}
 		if best.pool != pool {
 			// Another pool holds the lowest start tag: it has first refusal, for a
 			// period counted from when its turn came.
 			since := now
-			if !best.ready.Equal(forever) {
-				since = best.ready
+			if r := best.earliestReady(now); !r.Equal(forever) {
+				since = r
 			}
 			_, eligible := admission(q, best, now)
 			if end := latest(since, eligible).Add(sched.RefusalPeriod(best.eff.Queue)); now.Before(end) {
@@ -175,7 +275,13 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 		if best.pending < int64(want) {
 			want = int(best.pending)
 		}
-		got, err := s.claim(ctx, tx, now, key, best, req, want)
+		var handlers []string
+		for _, l := range best.lanes {
+			if l.mine && l.waiting(now) {
+				handlers = append(handlers, l.handler)
+			}
+		}
+		got, err := s.claim(ctx, tx, now, key, best, handlers, req, want)
 		if err != nil {
 			return nil, err
 		}
@@ -202,18 +308,28 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 			// is held by another transaction. Leave it out of this round and note when
 			// its next task is due, so the backlog is not selected again before then.
 			best.short = true
-			if best.due, err = s.nextDue(ctx, tx, now, key, best); err != nil {
-				return nil, err
+			for _, l := range best.lanes {
+				if !l.mine || !l.waiting(now) {
+					continue
+				}
+				l.short = true
+				if l.due, err = s.nextDue(ctx, tx, now, key, best, l.handler); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
 
-	// Readiness, for every backlog this round looked at: early is allowed, late is not.
+	// Readiness, for every lane this round looked at: early is allowed, late is not.
 	for _, b := range bs {
-		if !evaluated(b, now) {
+		if !b.live || b.pending+int64(b.inFlight) == 0 {
 			continue
 		}
-		b.setReady(readiness(q, b, now, pool, dispatched, heldUntil))
+		for _, l := range b.lanes {
+			if l.waiting(now) {
+				l.setReady(readiness(q, b, l, now, pool, dispatched, heldUntil))
+			}
+		}
 	}
 	if err := flush(ctx, tx, now, q, bs); err != nil {
 		return nil, err
@@ -221,23 +337,61 @@ func (s *Store) dispatchQueue(ctx context.Context, tx pgx.Tx, now time.Time, key
 	return out, s.wake(ctx, tx, notify)
 }
 
-// evaluated reports whether a dispatch round looks at the backlog: its run can be
-// dispatched from, and its readiness has come or waits for an event.
-func evaluated(b *brow, now time.Time) bool {
-	return b.live && b.pending+int64(b.inFlight) > 0 && !b.ready.IsZero() && (!b.ready.After(now) || b.ready.Equal(forever))
+// servedWindow is how recently a replica must have reported a handler for it to count
+// as served when another pool's first refusal is decided. The reports come far more
+// often than this.
+const servedWindow = 5 * time.Minute
+
+// servedHandlers returns, for each pool that has a live backlog with pending tasks in
+// the queue besides the dispatching pool's, the handlers that have had a session
+// lately. The handler "" is a session that can run any. Nil when there is no such pool.
+func (s *Store) servedHandlers(ctx context.Context, tx pgx.Tx, now time.Time, pool int16, bs []*brow) (map[int16]map[string]bool, error) {
+	if !slices.ContainsFunc(bs, func(b *brow) bool { return b.pool != pool && b.live && b.pending > 0 }) {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `SELECT p.pool_id, h.handler FROM pool_handlers h JOIN pools p ON p.name = h.pool
+		WHERE h.seen_at > $1`, now.Add(-servedWindow))
+	if err != nil {
+		return nil, err
+	}
+	out := map[int16]map[string]bool{}
+	var id int16
+	var handler string
+	_, err = pgx.ForEachRow(rows, []any{&id, &handler}, func() error {
+		if out[id] == nil {
+			out[id] = map[string]bool{}
+		}
+		out[id][handler] = true
+		return nil
+	})
+	return out, err
 }
 
-// readiness is the value written back for a backlog a dispatch round looked at.
-func readiness(q *qrow, b *brow, now time.Time, pool int16, dispatched bool, heldUntil time.Time) time.Time {
+// earliestReady is the earliest readiness among the backlog's lanes that wait at now:
+// forever when they all wait for an event.
+func (b *brow) earliestReady(now time.Time) time.Time {
+	r := forever
+	for _, l := range b.lanes {
+		if l.waiting(now) && l.ready.Before(r) {
+			r = l.ready
+		}
+	}
+	return r
+}
+
+// readiness is the value written back for a lane a dispatch round looked at. A lane
+// whose session found nothing it could claim and nothing coming is marked gone.
+func readiness(q *qrow, b *brow, l *lane, now time.Time, pool int16, dispatched bool, heldUntil time.Time) time.Time {
 	switch {
 	case b.pending == 0:
 		return time.Time{} // nothing to dispatch
 	case now.Before(q.blockedUntil):
 		return q.blockedUntil
-	case b.short && b.due.IsZero():
-		return time.Time{} // every pending task has expired: Maintain removes them
-	case b.short:
-		return b.due
+	case l.short && l.due.IsZero():
+		l.gone = true // every pending task of the handler has expired: Maintain removes them
+		return time.Time{}
+	case l.short:
+		return l.due
 	}
 	admit, at := admission(q, b, now)
 	switch {
@@ -247,12 +401,12 @@ func readiness(q *qrow, b *brow, now time.Time, pool int16, dispatched bool, hel
 		return forever // refused by concurrency: a Finish lowers it
 	case b.pool == pool && !heldUntil.IsZero():
 		return heldUntil // waits for another pool's first refusal
-	case dispatched || b.ready.Equal(forever):
+	case dispatched || l.ready.Equal(forever):
 		// Admitted and not served. A first-refusal period on this backlog counts from
 		// the queue's last dispatch.
 		return now
 	}
-	return b.ready
+	return l.ready
 }
 
 // before breaks ties between backlogs with the same start tag: the older run first,
@@ -270,7 +424,7 @@ func before(a, b *brow) bool {
 func (s *Store) heal(ctx context.Context, tx pgx.Tx, key store.QueueKey, bs []*brow) error {
 	var stale []*brow
 	for _, b := range bs {
-		if !b.live && !b.ready.IsZero() {
+		if !b.live && slices.ContainsFunc(b.lanes, func(l *lane) bool { return !l.ready.IsZero() }) {
 			stale = append(stale, b)
 		}
 	}
@@ -288,8 +442,12 @@ func (s *Store) heal(ctx context.Context, tx pgx.Tx, key store.QueueKey, bs []*b
 	return nil
 }
 
-// claim leases up to n due tasks of the backlog, highest priority first.
-func (s *Store) claim(ctx context.Context, tx pgx.Tx, now time.Time, key store.QueueKey, b *brow, req store.DispatchRequest, n int) ([]store.Assignment, error) {
+// claim leases up to n due tasks of the backlog's lanes for the handlers, highest
+// priority first. Each lane is read through the claim index on its own and the best n
+// of them are kept, so the order is the one of a single backlog and nothing is read
+// past the tasks that are taken.
+func (s *Store) claim(ctx context.Context, tx pgx.Tx, now time.Time, key store.QueueKey, b *brow, handlers []string,
+	req store.DispatchRequest, n int) ([]store.Assignment, error) {
 	lease := b.eff.Lease
 	expires := now.Add(lease.Duration)
 	deadline := latest(now.Add(lease.MaxDuration), expires)
@@ -298,18 +456,8 @@ func (s *Store) claim(ctx context.Context, tx pgx.Tx, now time.Time, key store.Q
 	if err != nil {
 		return nil, err
 	}
-	// The picked rows are materialised first: as a plain sub-select the planner may
-	// run the LIMIT again for every outer row and claim more than n.
-	rows, err := tx.Query(ctx, `WITH picked AS MATERIALIZED (
-			SELECT task_id FROM tasks
-			WHERE run_created_on = $1 AND run_no = $2 AND queue_key = $3 AND pool_id = $4
-				AND state = 'pending' AND not_before <= $5 AND (expires_at IS NULL OR expires_at > $5)
-			ORDER BY priority DESC, task_id LIMIT $11 FOR UPDATE SKIP LOCKED)
-		UPDATE tasks t SET state = 'in_flight', attempt = t.attempt + 1, lease_nonce = $6,
-			worker_id = $7, worker_version = $8, dispatched_at = $5, lease_expires_at = $9, lease_deadline = $10
-		FROM picked WHERE t.run_created_on = $1 AND t.task_id = picked.task_id
-		RETURNING t.task_id, t.attempt, t.depth, t.parent_task_id, t.parent_bucket, t.fingerprint, t.priority, t.spec, t.strain_attempts`,
-		b.meta.createdOn, b.run, string(key), b.pool, now, nonce, req.Worker.ID, req.Worker.Version, expires, deadline, n)
+	rows, err := tx.Query(ctx, claimSQL,
+		b.meta.createdOn, b.run, string(key), b.pool, now, nonce, req.Worker.ID, req.Worker.Version, expires, deadline, n, handlers)
 	if err != nil {
 		return nil, err
 	}
@@ -362,14 +510,15 @@ func parentID(id pgtype.UUID, bucket *int16, day uint16) store.TaskID {
 	return taskKey{bucket: uint8(*bucket), day: day, id: id.Bytes}.ID() //nolint:gosec // G115: a bucket is below 256
 }
 
-// nextDue is when the backlog's next claimable task is due: the earliest not_before
-// among its pending tasks that have not expired, or zero if there is none.
-func (s *Store) nextDue(ctx context.Context, q querier, now time.Time, key store.QueueKey, b *brow) (time.Time, error) {
+// nextDue is when the next claimable task of the backlog's handler is due: the
+// earliest not_before among its pending tasks that have not expired, or zero if there
+// is none.
+func (s *Store) nextDue(ctx context.Context, q querier, now time.Time, key store.QueueKey, b *brow, handler string) (time.Time, error) {
 	var due pgtype.Timestamptz
 	err := q.QueryRow(ctx, `SELECT not_before FROM tasks
-		WHERE run_created_on = $1 AND run_no = $2 AND queue_key = $3 AND pool_id = $4
+		WHERE run_created_on = $1 AND run_no = $2 AND queue_key = $3 AND pool_id = $4 AND handler = $6
 			AND state = 'pending' AND (expires_at IS NULL OR expires_at > $5)
-		ORDER BY not_before LIMIT 1`, b.meta.createdOn, b.run, string(key), b.pool, now).Scan(&due)
+		ORDER BY not_before LIMIT 1`, b.meta.createdOn, b.run, string(key), b.pool, now, handler).Scan(&due)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, nil
 	}

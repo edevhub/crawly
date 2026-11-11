@@ -364,8 +364,10 @@ func (s *Store) BlockQueue(ctx context.Context, key store.QueueKey, until time.T
 		}
 		// A block that was lifted or shortened leaves readiness late: bring it back.
 		for _, b := range bs {
-			if b.live && b.ready.After(now) && !b.ready.Equal(forever) {
-				b.setReady(now)
+			for _, l := range b.lanes {
+				if b.live && l.ready.After(now) && !l.ready.Equal(forever) {
+					l.setReady(now)
+				}
 			}
 		}
 		refresh(q, bs, now)

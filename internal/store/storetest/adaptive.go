@@ -14,7 +14,7 @@ var adaptive = sched.Adaptive{Enabled: true, MaxInterval: 8 * time.Second, Decre
 
 // finishWith ends an attempt; strain marks it as a sign of strain on the site. Without
 // it a success is an answer of the site.
-func (e *env) finishWith(a store.Assignment, result store.TaskResult, strain bool) {
+func (e *env) finishStrain(a store.Assignment, result store.TaskResult, strain bool) {
 	e.t.Helper()
 	e.finishFull(store.Finish{Lease: a.Lease.Ref, Result: result, Strain: strain, Answered: !strain && result == store.ResultSucceeded})
 }
@@ -76,7 +76,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 				t.Fatalf("dispatched %d, want 1", len(as))
 			}
 			e.clock.Advance(100 * time.Millisecond)
-			e.finishWith(as[0], store.ResultRetry, true)
+			e.finishStrain(as[0], store.ResultRetry, true)
 			e.wantInterval(want)
 			e.clock.Advance(9 * time.Second)
 		}
@@ -96,7 +96,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 		// A success dispatched in this epoch is a recovery step: the rate grows by a
 		// quarter of the base rate each time (1/8, 3/8, 5/8, 7/8, 9/8 requests a second).
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(held[0], store.ResultSucceeded, false)
+		e.finishStrain(held[0], store.ResultSucceeded, false)
 		for _, want := range []time.Duration{2666 * time.Millisecond, 1600 * time.Millisecond, 1142 * time.Millisecond, 0} {
 			e.wantIntervalNear(want)
 			e.clock.Advance(10 * time.Second)
@@ -105,7 +105,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 				t.Fatalf("dispatched %d, want 1", len(as))
 			}
 			e.clock.Advance(100 * time.Millisecond)
-			e.finishWith(as[0], store.ResultSucceeded, false)
+			e.finishStrain(as[0], store.ResultSucceeded, false)
 		}
 		e.wantInterval(0)
 	})
@@ -121,14 +121,14 @@ func adaptivePacing(t *testing.T, f Factory) {
 		}
 		e.clock.Advance(100 * time.Millisecond)
 		// Requests that failed together are one step, not three.
-		e.finishWith(first[0], store.ResultRetry, true)
-		e.finishWith(first[1], store.ResultRetry, true)
+		e.finishStrain(first[0], store.ResultRetry, true)
+		e.finishStrain(first[1], store.ResultRetry, true)
 		e.wantInterval(2 * time.Second)
 		if q := e.queue(); q.Strain.Steps != 1 {
 			t.Fatalf("%d steps for failures that came together", q.Strain.Steps)
 		}
 		// A success of the same epoch does not recover what the step just took.
-		e.finishWith(first[2], store.ResultSucceeded, false)
+		e.finishStrain(first[2], store.ResultSucceeded, false)
 		e.wantInterval(2 * time.Second)
 		// A failure that is not a sign of strain changes nothing.
 		e.clock.Advance(10 * time.Second)
@@ -137,7 +137,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 			t.Fatalf("dispatched %d, want 1 on a slowed queue", len(next))
 		}
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(next[0], store.ResultRetry, false)
+		e.finishStrain(next[0], store.ResultRetry, false)
 		e.wantInterval(2 * time.Second)
 	})
 
@@ -151,7 +151,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 		// The other run's failure slows the queue.
 		first := e.dispatch("default", 1)
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(first[0], store.ResultRetry, true)
+		e.finishStrain(first[0], store.ResultRetry, true)
 		e.seed(fast, "q", "default", 20)
 		e.wantIntervalNear(2 * time.Second)
 		// The run that overrode the limits waits for the queue's interval, with one request at a time.
@@ -164,7 +164,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 		if more := e.dispatch("default", 5); len(more) != 0 {
 			t.Fatalf("a run with limits of its own dispatched %d, one request is in flight", len(more))
 		}
-		e.finishWith(as[0], store.ResultSucceeded, false)
+		e.finishStrain(as[0], store.ResultSucceeded, false)
 		e.clock.Advance(500 * time.Millisecond)
 		if more := e.dispatch("default", 5); len(more) != 0 {
 			t.Fatalf("a run with limits of its own dispatched %d inside the queue's interval", len(more))
@@ -177,7 +177,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 		e.seed(r, "q", "default", 5)
 		as := e.dispatch("default", 5)
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(as[0], store.ResultRetry, true)
+		e.finishStrain(as[0], store.ResultRetry, true)
 		if q := e.queue(); q.Strain.Interval != 0 || q.Strain.Steps != 0 {
 			t.Fatalf("adaptive pacing is off, yet: %+v", q.Strain)
 		}
@@ -193,7 +193,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 		e.seed(r, "q", "default", 5)
 		as := e.dispatch("default", 5)
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(as[0], store.ResultRetry, true)
+		e.finishStrain(as[0], store.ResultRetry, true)
 		e.wantInterval(2 * time.Second)
 		if as := e.dispatch("default", 5); len(as) != 0 {
 			t.Fatalf("dispatched %d inside the slowed interval", len(as))
@@ -216,7 +216,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 		e.seed(r, "q", "default", 10)
 		as := e.dispatch("default", 1)
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(as[0], store.ResultRetry, true)
+		e.finishStrain(as[0], store.ResultRetry, true)
 		// The policy's interval has passed since the dispatch, the new one has not passed
 		// since the failure.
 		e.clock.Advance(1100 * time.Millisecond)
@@ -238,21 +238,21 @@ func adaptivePacing(t *testing.T, f Factory) {
 		e.seed(r, "q", "default", 20)
 		as := e.dispatch("default", 1)
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(as[0], store.ResultRetry, true) // 2 s, next at 2.1 s
+		e.finishStrain(as[0], store.ResultRetry, true) // 2 s, next at 2.1 s
 		e.clock.Advance(2 * time.Second)
 		as = e.dispatch("default", 5) // at 2.1 s: 1.33 s after the first success
 		if len(as) != 1 {
 			t.Fatalf("dispatched %d", len(as))
 		}
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(as[0], store.ResultSucceeded, false)
+		e.finishStrain(as[0], store.ResultSucceeded, false)
 		e.clock.Advance(1900 * time.Millisecond) // 4.1 s: the next slot of the slowed queue
 		as = e.dispatch("default", 5)
 		if len(as) != 1 {
 			t.Fatalf("dispatched %d", len(as))
 		}
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(as[0], store.ResultSucceeded, false) // back at the policy: the burst is back
+		e.finishStrain(as[0], store.ResultSucceeded, false) // back at the policy: the burst is back
 		e.wantInterval(0)
 		e.clock.Advance(300 * time.Millisecond) // 4.5 s: the slot the policy's burst allows, 4.43 s
 		if got := e.dispatch("default", 5); len(got) == 0 {
@@ -269,7 +269,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 		e.seed(shared, "q", "default", 1)
 		first := e.dispatch("default", 1)
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(first[0], store.ResultRetry, true)
+		e.finishStrain(first[0], store.ResultRetry, true)
 		e.seed(o1, "q", "default", 10)
 		e.seed(o2, "q", "default", 10)
 		e.clock.Advance(2 * time.Second)
@@ -290,7 +290,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 		e.seed(r, "q", "default", 10)
 		as := e.dispatch("default", 1)
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(as[0], store.ResultRetry, true)
+		e.finishStrain(as[0], store.ResultRetry, true)
 		e.wantInterval(2 * time.Second)
 		e.clock.Advance(3 * time.Second)
 		as = e.dispatch("default", 1)
@@ -318,7 +318,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 				t.Fatalf("attempt %d: %d dispatched, %+v, want %d strain attempts", i+1, len(as), as, want)
 			}
 			e.clock.Advance(100 * time.Millisecond)
-			e.finishWith(as[0], store.ResultRetry, strain)
+			e.finishStrain(as[0], store.ResultRetry, strain)
 			if strain {
 				want++
 			}
@@ -334,7 +334,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 			e.clock.Advance(10 * time.Second)
 			as := e.dispatch("default", 1)
 			e.clock.Advance(100 * time.Millisecond)
-			e.finishWith(as[0], store.ResultRetry, true)
+			e.finishStrain(as[0], store.ResultRetry, true)
 		}
 		e.wantInterval(8 * time.Second)
 		// A strain failure of a task whose retry only the extended budget grants.
@@ -354,7 +354,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 			e.clock.Advance(time.Minute)
 			as := e.dispatchOne()
 			e.clock.Advance(100 * time.Millisecond)
-			e.finishWith(as, store.ResultRetry, true)
+			e.finishStrain(as, store.ResultRetry, true)
 		}
 		e.clock.Advance(time.Minute)
 		if !extended() {
@@ -368,12 +368,12 @@ func adaptivePacing(t *testing.T, f Factory) {
 		e.seed(r, "q", "default", 5)
 		as := e.dispatch("default", 1)
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(as[0], store.ResultRetry, true)
+		e.finishStrain(as[0], store.ResultRetry, true)
 		e.wantInterval(2 * time.Second)
 		e.pol.Default.Adaptive.Enabled = false
 		e.clock.Advance(10 * time.Second)
 		as = e.dispatch("default", 1)
-		e.finishWith(as[0], store.ResultSucceeded, false)
+		e.finishStrain(as[0], store.ResultSucceeded, false)
 		e.pol.Default.Adaptive.Enabled = true
 		e.wantInterval(0) // not what an earlier outage left
 	})
@@ -384,7 +384,7 @@ func adaptivePacing(t *testing.T, f Factory) {
 		e.seed(r, "q", "default", 5)
 		as := e.dispatch("default", 1)
 		e.clock.Advance(100 * time.Millisecond)
-		e.finishWith(as[0], store.ResultRetry, true)
+		e.finishStrain(as[0], store.ResultRetry, true)
 		e.wantInterval(2 * time.Second)
 		e.clock.Advance(adaptive.MaxOutage + time.Minute)
 		e.wantInterval(0)

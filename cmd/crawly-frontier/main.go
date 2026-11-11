@@ -89,7 +89,7 @@ func main() {
 	flag.DurationVar(&cfg.retainTasks, "retain-tasks", 0,
 		"PostgreSQL only: how long tasks and attempts are kept, counted from the creation of their run; 0 keeps them for ever")
 	flag.DurationVar(&cfg.noHandlerGrace, "no-handler-grace", time.Hour,
-		`how long a task waits for a worker that has its handler, e.g. during a rolling deploy, before it fails with code "no_handler"`)
+		`how long a task waits while no worker session has its handler, e.g. during a rolling deploy, before it fails with code "no_handler"`)
 	flag.Parse()
 	if err := run(cfg, log); err != nil {
 		log.Error("frontier stopped", "err", err)
@@ -101,7 +101,7 @@ func main() {
 func openStore(ctx context.Context, cfg config, pol store.Policies, log *slog.Logger) (store.Store, func(), error) {
 	if cfg.postgres == "" {
 		log.Warn("the store is in memory: the state is lost on restart")
-		return memstore.New(pol, memstore.WithRetention(cfg.retainRuns)), func() {}, nil
+		return memstore.New(pol, memstore.WithRetention(cfg.retainRuns), memstore.WithLogger(log)), func() {}, nil
 	}
 	opts := []pgstore.Option{pgstore.WithLogger(log), pgstore.WithMigrationsTable(cfg.migrationsTable),
 		pgstore.WithRetention(cfg.retainTasks, cfg.retainRuns)}
