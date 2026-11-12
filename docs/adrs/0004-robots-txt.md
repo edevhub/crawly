@@ -1,7 +1,7 @@
 # ADR 0004: robots.txt: gate, parser and policy
 
-- **Status:** Draft, for review. Revision 4, after two rounds of reliability review and
-  one design review. The section "Points to confirm" lists the choices that are still
+- **Status:** Draft, for review. Revision 5, after two rounds of reliability review and
+  two of design review. The section "Points to confirm" lists the choices that are still
   open; each is written into the text below as proposed.
 - **Date:** 2026-11-11
 - **Related:** [ADR 0001: Frontier storage architecture](0001-frontier-storage-architecture.md),
@@ -51,13 +51,12 @@ Four constraints shape the design:
   that every SDK worker has built in. Its result is recorded on the origin.
 - Held tasks are judged in batches when the rules arrive. Allowed tasks join their
   backlog and disallowed ones end `SKIPPED`.
-- The design is complete here and is built in two steps, with a benchmark of the claim
-  path between them (see "Delivery").
+- The design is built in two steps (see "Delivery").
 - A background step, not the arrival of new tasks, keeps the gate moving. A held task
   waits for what makes any task wait (a paused run, a blocked queue), and ends after the
   policy's `hold_grace` when robots.txt cannot be fetched.
-- A run can bring the rules itself or opt out. The queue's policy can forbid that, and
-  an operator can pin the rules of an origin.
+- A run can opt out. The queue's policy can forbid that, and an operator can pin the
+  rules of an origin.
 
 ```
 AddTasks ──► fresh rules for the origin? ──yes──► judge ──► added | ROBOTS_DISALLOWED
@@ -74,6 +73,7 @@ AddTasks ──► fresh rules for the origin? ──yes──► judge ──�
                end held tasks when the fetch keeps failing
                     │
    dispatch: compare the rules' version, judge again ──► assign | SKIPPED | hold
+             (the slot of a task that is not assigned goes to the queue's next task)
 ```
 
 ### The record of an origin
@@ -87,9 +87,8 @@ The store keeps one record per origin, shared by every run and every queue.
 | `status`, `final_url`, `hops` | What the fetch saw, for the operator |
 | `fetch_time` | When the robots task that brought the result was dispatched, on the store's clock |
 | `rules_digest` | A digest of the rules in force: the groups of the file or the pin, with their `Allow`, `Disallow` and `Crawl-delay` lines in a normal form. `NONE` has the digest of an empty file |
-| `rules_version` | Increases when `rules_digest` changes, when rules become known or unknown, and with a hold an operator asked for |
+| `rules_version` | Increases when `rules_digest` changes and when rules become known or unknown |
 | `task`, `arm_time` | The robots task of the origin that has not ended, if there is one, with its run, queue and pool, and when it was armed |
-| `queues` | The queues the origin's tasks were added to, the last few |
 | `last_file` | `FAILED` only: the last `FILE` or `NONE` result before it, with its `fetch_time` |
 | `pin`, `pin_expire_time` | Rules set by an operator, and until when |
 
@@ -127,9 +126,8 @@ Derived from the record and the queue's policy, the rules of an origin on a queu
 |---|---|---|
 | **pinned** | a pin that has not ended | judged by the pin |
 | **fresh** | `FILE` or `NONE`, and `fetch_time + lifetime` has not passed | judged |
-| **stale** | `FILE` or `NONE`, and `fetch_time + lifetime` has passed | judged by the old rules; a robots task is armed |
-| **kept** | `FAILED` with a `last_file` | judged by `last_file` (RFC 9309 allows a cached file while the file is unreachable); a robots task is armed at each `retry` |
-| **unknown** | no record, `FAILED` without `last_file`, or an operator asked for a hold | held |
+| **stale** | `FILE` or `NONE` whose lifetime has passed, or `FAILED` with a `last_file` | judged by the last file (RFC 9309 allows a cached file while the file is unreachable); a robots task is armed, after a `FAILED` result at each `retry` |
+| **unknown** | no record, or `FAILED` without `last_file` | held |
 
 Rules that were known once do not become unknown because a refresh is late. A refresh
 waits behind the same things as any task (a blocked queue, a paused run, other runs'
@@ -142,36 +140,35 @@ until the refresh that was armed at that point has run, and that is a limitation
 A page task is judged at three points. All three ask the same question of the same
 matcher.
 
-1. **When it is added**, if the rules are pinned, fresh, stale or kept. An allowed task joins
+1. **When it is added**, if the rules are pinned, fresh or stale. An allowed task joins
    its backlog. A disallowed one is refused with `AddResult.STATUS_ROBOTS_DISALLOWED`
    and the code that says why (see "Codes"). It never becomes a task, takes nothing from
    the run's budget and leaves no dedup record, so the same URL can be added once the
-   rules change, as long as the task is still held or pending: a skipped task gives
-   its dedup record back (see "Dedup, budget and counts").
-2. **In the background, when the rules change.** The held tasks of the origin are
+   rules change.
+2. **In the background, when the rules arrive.** The held tasks of the origin are
    judged in bounded batches: the store hands the core a batch, the core judges, and the
    store moves each task to its backlog or ends it `SKIPPED`, in one transaction per
    batch. This step needs no worker and no credit.
-
-   The pending tasks of the origin are judged the same way when `rules_version`
-   changes, which is when the rules changed and not when the file was fetched again.
-   Two sets of rules are not ordered as stricter or looser, so every change counts.
-   The store finds them without an index of their own: it walks the backlogs of the
-   queues the record names, in bounded batches, and takes the tasks of the origin. On
-   a queue that covers several origins the walk reads the other origins' tasks too.
-   When the origin was reached through more queues than the record keeps, the tasks on
-   the others are left to point 3. When an operator asks for a hold, the pending tasks
-   are moved to held by the same walk. A backlog that became disallowed therefore ends
-   without being dispatched.
-3. **When it is dispatched**, as the last check. Every assignment comes out of the claim
-   with the `rules_version` of its origin's record. The core compares it with its own copy and
+3. **When it is dispatched**, as the last check, and the only place where a change of
+   rules reaches a pending task. Every assignment comes out of the claim with the
+   `rules_version` of its origin's record. The core compares it with its own copy and
    reloads the copy when they differ, so the check costs no store access otherwise. A
    task that is disallowed ends `SKIPPED`. A task whose rules became unknown goes back
-   to held. In both cases the politeness slot the claim took is **not** given back: a
-   refund that lands after another claim would let two requests out inside one interval,
-   and a lost slot only makes the queue slower. Point 2 keeps this case rare. Until
-   the second step of the delivery, point 3 is the only place where a change of rules
-   reaches a pending task, one lost slot per task.
+   to held.
+
+   **The slot is passed on.** The politeness slot the claim took is not given back to
+   the queue: a refund that lands after another claim would let two requests out inside
+   one interval. The replica that holds the slot uses it for the queue's next task
+   instead. The call that skips or holds the task asks the store, in the same
+   transaction, for the next task the session may take from that queue, without taking
+   a slot or a place in the queue's concurrency: the task that was not assigned never
+   left, so one request leaves for one slot. This repeats for a bounded number of
+   tasks per slot, and the slot is lost when the bound is reached or the queue has no
+   other task for the session. A backlog that became disallowed, after a pin or a new
+   file, therefore ends at the speed of the dispatch loop and not at the queue's pace,
+   and the tasks of other origins and runs on the queue keep their turns. Pending
+   tasks are not judged in the background: that would need the tasks of an origin
+   indexed or its queues walked, to save what passing the slot on saves already.
 
 The decision at add is made against the record the store holds, not against the
 replica's copy. The core sends, per task, its judgement and the `rules_version` it
@@ -186,8 +183,7 @@ does not send a whole batch round again.
   own. A held task is not in a backlog, takes no politeness slot, and is counted in
   `RunStats.held`. In the same transaction the store arms a robots task for the origin
   (see below).
-- A run that brought rules for the origin, or does not obey robots.txt there, has
-  nothing held: its tasks are judged against its own rules, or not at all.
+- A run that does not obey robots.txt there has nothing held and nothing judged.
 - The gate opens through point 2 above. It is idempotent: the background step releases
   every held task whose origin has rules, whenever it finds one. A crash between writing
   the record and judging the held tasks therefore loses nothing.
@@ -199,13 +195,22 @@ is a run, queue and pool that has tasks held on the origin.
 1. The origin has rules: judge and release the held tasks.
 2. The origin has no rules and no robots task, and the last `FAILED` result is older than
    `retry`: arm a robots task with a holder whose run is not paused.
-3. The origin's robots task was not dispatched within `arm_wait` of `arm_time`, or its
-   run is paused: drop it and arm one with the next holder. Holders are taken in turn.
-   A holder whose pool has a worker with `crawly.robots`, whose queue is not blocked
-   and whose run is not paused comes before one that lacks any of the three. When
-   there is no other holder, the task stays where it is. The fetch of an origin
-   therefore does not depend on one run's weight or limits, on one pool's workers, or
-   on one queue's block, as long as another holder is free of them.
+3. The origin's robots task waits behind an obstacle that another holder is free of:
+   drop it and arm one with that holder. There are four obstacles, and each has its
+   own test:
+   - its run is paused, and another holder's run is not;
+   - no worker of its pool has `crawly.robots`, and another holder's pool has one;
+   - its queue is blocked, and another holder is on a queue that is not;
+   - its run's turn does not come: `arm_wait` has passed since `arm_time`, and in that
+     time the queue dispatched a task of another run that holds tasks on the origin.
+     The task moves to that run.
+
+   A task is never moved to a holder that shares its obstacle, and time in which the
+   queue dispatched nothing does not count: a queue that is blocked for days, or whose
+   interval is longer than `arm_wait`, moves nothing. When no holder is free of the
+   obstacle, the task stays where it is and waits as the page tasks of that queue or
+   run wait. Each move brings the task past the obstacle it was moved for, so the
+   number of moves per origin is bounded by the number of holders and not by time.
 4. The fetch keeps failing: when every result since a task was held is `FAILED` and the
    task has been held for `hold_grace`, it ends `SKIPPED` with `robots_unreachable`.
 5. Nobody can fetch: when the origin has had no rules for `hold_grace` and no worker of
@@ -217,6 +222,10 @@ is a run, queue and pool that has tasks held on the origin.
    whose handler nobody has in the same way (ADR 0003). It is never read from one
    replica's sessions. A pool without the handler gets the rules from another pool's
    fetch when there is one (step 3), and its tasks are released by step 1.
+6. Nobody sends the right identity: when the robots task was handed back for the grace
+   period because every worker that got it would have sent another `User-Agent` (see
+   "What the worker is told"), the held tasks of that queue end `SKIPPED` with
+   `robots_token_mismatch`.
 
 What is left makes a held task wait and not end: a paused run and a blocked queue. Those
 make the page tasks of the run and the queue wait too, and a pause or a block is a
@@ -243,14 +252,14 @@ delayed, held or in-flight page tasks.
   an ordinary page task with its own dedup, and the matcher always allows it.
 - It is never held and never judged.
 - It takes nothing from `RunLimits.max_tasks`, has depth 0 and no parent, and is counted
-  in `RunStats.robots` only: not in the run's task counters, not in `by_code`, and not
+  in `RunStats.robots_fetches` only: not in the run's task counters, not in `by_code`, and not
   towards `max_failed` and `max_consecutive_failures`. `ListTasks` shows it.
 - At most one robots task per origin exists that has not ended. The record names it
   (`task`), and no run arms another while it is there: a second run that needs the same
   rules waits for the first run's result. The record is cleared in the transaction that
-  ends the task, whatever ends it, the end of its run included. A task that is not
-  dispatched within `arm_wait` is dropped and armed again with the next holder (see
-  "Liveness"), so there is still one task per origin, and it moves.
+  ends the task, whatever ends it, the end of its run included. A task that waits behind
+  an obstacle another holder is free of is dropped and armed with that holder (see
+  "Liveness"), so there is still one task per origin.
 - A robots task does not keep a run alive. A run completes when it has no page tasks
   left, and a robots task it still has is dropped with the run's other tasks. A result
   that arrives for a dropped task is discarded, as for any revoked lease.
@@ -286,7 +295,8 @@ delayed, held or in-flight page tasks.
 | `RobotsResult` with 5xx, 429, timeout or connection failure | `FAILED` | A `Retry-After` blocks the queue, capped like any block. The next task is armed after `retry` |
 | The attempt is lost (worker crash, lease expiry, panic) | none | The task is retried like any task, up to `max_attempts`. After the last attempt: `FAILED` |
 | The task expires by TTL, or its run ends or is paused | none | The record is cleared, and the background step arms a task in a run that still holds tasks |
-| It is not dispatched within `arm_wait`: no worker of the pool has the handler, the queue is blocked, or the run's turn does not come | none | The task is dropped and armed with the next holder. Held tasks whose pool has no handler end with `robots_no_handler` after `hold_grace` if no other pool brought the rules |
+| It waits behind a paused run, a pool without the handler, a blocked queue or other runs' turns | none | The task moves to a holder that is free of the obstacle, if there is one. Held tasks whose pool has no handler end with `robots_no_handler` after `hold_grace` if no other pool brought the rules |
+| Every worker that gets it would send another `User-Agent` | none | The task is handed back without an attempt. Held tasks end with `robots_token_mismatch` after the grace period |
 | A replica of an older build takes the result | none | The older build drops `RobotsResult` and ends the task. The background step arms a new one |
 
 Treating 429 as `FAILED` is stricter than RFC 9309, which counts every 4xx as "the file
@@ -304,40 +314,21 @@ Every refusal and skip that robots.txt causes has a code:
 | `robots_crawl_delay` | The origin asks for a delay above the policy's ceiling |
 | `robots_unreachable` | Every fetch of robots.txt failed for `hold_grace` |
 | `robots_no_handler` | No worker of the pool had the `crawly.robots` handler for `hold_grace` |
-| `robots_token_mismatch` | A worker was about to send a `User-Agent` that does not name the queue's product token. It is the code of a failed attempt and not of a skip |
+| `robots_token_mismatch` | For the grace period, every worker that was given the task would have sent a `User-Agent` that does not name the queue's product token |
 
-- A refusal at add carries the code in `AddResult.code`, and a skipped task carries it
-  as the code of its state.
-- Both are counted per code in `RunStats.robots.by_code`, in the transaction that
-  refuses or skips. The count does not depend on which of the three points judged the
-  task, so it does not depend on whether another run fetched the rules first.
-
-### Dedup, budget and counts
-
-- **Dedup.** A task that ends `SKIPPED` with one of the codes above gives its dedup
-  record back in the same transaction, as a refusal at add never takes one. The URL
-  can be added again in the same run. Without this, an origin whose robots.txt is
-  unreachable for a little longer than `hold_grace` would lose every page found in
-  that time for the rest of the run, although the site recovered. The Frontier does
-  not add the task again by itself: `ListTasks` filters by state and code, and the
-  scheduler adds what it wants to try again.
-- **Budget.** A held task is a task and counts for `RunLimits.max_tasks` from the
-  moment it is added. A skipped task keeps counting: the budget is a count of tasks
-  the run created, as it is for failed tasks. A refusal at add creates no task and
-  counts for nothing.
-- **Counts are events.** `RunStats.robots.by_code` counts refusals and skips, not
-  distinct URLs. A disallowed link that is found on a thousand pages is refused a
-  thousand times and counted a thousand times, because a refusal leaves nothing behind
-  to recognise the next one by. `RunStats.robots` keeps refusals and skips apart, and
-  `skipped` counts tasks. `abort_on_codes` asks whether a code occurred, so it does not
-  depend on the difference.
+- A refusal at add carries the code in `AddResult.code`. Refusals never were tasks, so
+  they have a counter of their own, `RunStats.refused`, per code.
+- A skip is the outcome of a task. It carries the code as the code of its state and is
+  counted in `RunStats.by_code` with the other outcomes, and in `RunStats.skipped`.
+- Both are counted in the transaction that refuses or skips. The count does not depend
+  on which of the three points judged the task.
 
 ### Ending a run on robots.txt
 
 The Frontier does not end a run because of robots.txt by itself. A run that must end
 when one of the codes above occurs lists the code in `RunLimits.abort_on_codes`.
 
-- `abort_on_codes` is evaluated on the counts above as well as on recorded attempts, in
+- `abort_on_codes` is evaluated on refusals and skips as well as on recorded attempts, in
   the same transaction, on all three paths. A run that lists `robots_forbidden` ends
   `ABORTED` whether its first task was refused at add, skipped in the background or
   skipped at dispatch.
@@ -345,38 +336,62 @@ when one of the codes above occurs lists the code in `RunLimits.abort_on_codes`.
   `max_consecutive_failures`. A page the site does not want fetched is not an error of
   the crawl.
 
+### Dedup, budget and counts
+
+- **A skipped task keeps its row and its dedup.** There is one task per URL and run,
+  with its parent, depth and context, counted once for `RunLimits.max_tasks`. In the
+  PostgreSQL store dedup is the unique constraint on the task row, and nothing is
+  rewritten when a task is skipped. A lookup by URL finds that one task.
+- **An add revives it.** When an add hits a task that was skipped with one of the codes
+  above, the task is judged as an add is: it goes back to held when the rules are
+  unknown, joins its backlog when they allow it, and stays skipped when they do not.
+  The add reports it as it reports a duplicate, with the task's state. The cost is one
+  conditional update on the duplicate path of the add. Without this, an origin whose
+  robots.txt is unreachable for a little longer than `hold_grace` would lose every
+  page found in that time for the rest of the run, although the site recovered.
+- The Frontier does not revive a task by itself when the rules arrive: that would need
+  the skipped tasks indexed by origin. Somebody adds the URL again, and since the pages
+  that linked to it are done, that is the scheduler: `ListTasks` filters by state and
+  code. A scheduler that ends the run on `robots_unreachable` instead lists the code in
+  `abort_on_codes`, and the next run picks the pages up.
+- **Budget.** A held task is a task and counts for `max_tasks` from the moment it is
+  added. A skipped task keeps counting, and a revived one is not counted again. A
+  refusal at add creates no task and counts for nothing.
+- **Refusals are events.** `RunStats.refused` counts refusals and not distinct URLs. A
+  disallowed link that is found on a thousand pages is refused a thousand times,
+  because a refusal leaves nothing behind to recognise the next one by.
+  `abort_on_codes` asks whether a code occurred, so it does not depend on the
+  difference.
+
 ### Crawl-delay
 
 `Crawl-delay` is not part of RFC 9309, but sites use it and crawlers are expected to
 honour it.
 
-- The delay is that of the group that matches the queue's product token.
+- The delay is that of the group that matches the queue's product token. A pin's
+  `Crawl-delay` applies like that of a fetched file.
 - **A delay is never undercut.** An origin whose delay cannot be applied is treated as
   disallowing everything, with the code `robots_crawl_delay`. It loses its own tasks
   and nothing else.
-- **A queue of one host.** When the queue's key is the host of the origin, the delay is
-  a floor under the queue's interval, up to `max_crawl_delay`. A delay above the
-  ceiling cannot be applied.
+- **A delay the queue satisfies already** needs nothing: when the interval the queue's
+  limits resolve to is at least the delay, the origin is crawled at the queue's pace.
+- **A queue of one host.** When the queue's key is the host of the origin, a longer
+  delay is a floor under the queue's interval, up to `max_crawl_delay`. A delay above
+  the ceiling cannot be applied. The floor is one number on the queue's limiter row,
+  with the time the origin's rules stop being fresh; when the host has several origins
+  (two schemes, several ports), it is the longest of their delays. It ends with the
+  freshness of the rules, so a host that is no longer crawled keeps no floor. The row
+  is written in the dispatch transaction, which holds it already, and never when
+  tasks are added.
 - **A queue of several origins.** When the key is anything else, such as a registered
-  domain or an explicit key, the floor would slow every other origin of the queue. One
+  domain or an explicit key, a floor would slow every other origin of the queue: one
   subdomain with a delay of a minute would slow its siblings sixty-fold on a queue
-  that allows one request per second. The ceiling for these queues is therefore a
-  setting of its own, `max_shared_crawl_delay`, and its default is zero: a delay that
-  is longer than the queue's own interval cannot be applied, and a delay that the
-  queue's interval satisfies already needs no floor. An operator who wants delayed
-  subdomains crawled keys the queue by host or raises the ceiling, and accepts what it
-  does to the queue. Whether a queue is of one host is read from the task: the core
-  compares the queue's key with the host of the task's origin.
-- **Where it lives.** The queue's limiter row keeps the delays of the origins whose tasks
-  were dispatched on the queue: origin, delay and the time the origin's rules stop being
-  fresh. A queue of one host has one entry per scheme and port. A shared queue with a
-  raised ceiling keeps the longest few; when more origins have delays than the row
-  keeps, a delay that was dropped applies again with the next dispatch of that origin,
-  and until then the floor can be below it. That is a limitation of raising the
-  ceiling. The floor of the queue is the longest delay that has not run out. An
-  origin's entry ends with the freshness of its rules, so an origin that is no longer
-  crawled stops slowing the queue after one lifetime. The row is written in the
-  dispatch transaction, which holds it already, and never when tasks are added.
+  that allows one request per second. There is no floor on such a queue. A delay that
+  is longer than the queue's interval cannot be applied, and the origin is disallowed.
+  The skip says what the operator can do: key the queue by host, or slow the queue in
+  the policy, which is what a higher ceiling would have done. Whether a queue is of
+  one host is read from the task: the core compares the queue's key with the host of
+  the task's origin.
 - **Where it applies.** In the store's limiter step. The resolved limits stay static and
   cacheable (ADR 0001); the floor is state of the queue, like a block. While the floor
   is above the policy's interval, the queue's burst and concurrency are 1: a site that
@@ -407,37 +422,35 @@ message Robots {
     MODE_OBEY = 1;         // fetch, hold, judge
     MODE_IGNORE = 2;       // no fetch, no hold, no judgement
   }
-  // For origins without an entry in `files`.
   Mode mode = 1;
-  // Origin to the content of its robots.txt, as the scheduler has it. For these origins
-  // the run is judged by this content and nothing is fetched or held for it. An empty
-  // content allows everything.
-  map<string, string> files = 2;
 }
 ```
 
-- The rules a run brings are robots.txt text. There is one parser and one matcher, and
-  a scheduler that fetched the file itself passes it on as it is.
-- A key of `files` is an origin: scheme and host in lower case, an internationalised
-  host in its ASCII form, the port left out when it is the scheme's default. `CreateRun`
-  rejects a key that is not an `http` or `https` origin, an entry above the parse limit
-  and a setting above the size limit of a run, so a mistyped origin does not fall back
-  to fetched rules without anyone noticing.
-- A run's rules are for that run only. They are never written to the origin's record, so
-  one scheduler cannot change what another run is allowed to fetch.
-- `Crawl-delay` in a run's file is ignored. A run that wants a slower pace on a queue
-  sets its own limits there, as it does today.
-- `MODE_IGNORE` with no files is the opt-out.
+- `MODE_IGNORE` is the opt-out, for a scheduler that knows better: a crawl of the
+  operator's own sites, or one under an agreement with the site.
+- A run does not bring rules of its own. Rules that are supplied and not fetched are
+  what a pin is, and "the scheduler knows better" is what `MODE_IGNORE` is (see
+  alternative 8).
 - A run without a stored setting is read as `MODE_IGNORE`. That is every run created
   before the upgrade, and every run created through a replica of an older build while
   the upgrade lasts: the older build does not write the setting, whatever the scheduler
   sent. Such a run finishes as it started. A run created through a replica of this
   build always has a stored setting, and "unspecified" is stored as `MODE_OBEY`.
-- A pin overrides both: while an operator has pinned an origin, every run is judged by
-  the pin there, a run with `MODE_IGNORE` or its own file included.
 - The test harness (`sdk/crawlytest`) runs with `robots: {obey: false}` in its default
   policy, so a test's fixtures see no request for `/robots.txt` that the test did not
   ask for. A test of the gate turns it on and serves the file.
+
+**Who decides.** Three settings decide whether a task is judged, in this order:
+
+1. The queue's `obey`. `false`: nothing is fetched, held or judged on the queue.
+2. The queue's `enforce`. `true`: every run is judged there.
+3. The run's mode.
+
+A pin, which comes with the second step of the delivery, sets *which* rules judge and
+sits on top: on a queue that obeys, every run is judged by the pin, a run with
+`MODE_IGNORE` included. On a queue with `obey: false` a pin does nothing, like any
+rules there. The policy is the operator's too, and a queue that judges nothing is
+stopped with `BlockQueue`.
 
 ### What the policy says
 
@@ -447,14 +460,13 @@ it is read from the global policies only, and a run that sets it is rejected.
 | Field | Default | Meaning |
 |---|---|---|
 | `obey` | `true` | `false`: nothing is fetched, held or judged on this queue, for any run |
-| `enforce` | `false` | `true`: robots.txt is obeyed on this queue whatever the run says. A run's `MODE_IGNORE` and its `files` do not apply here |
+| `enforce` | `false` | `true`: robots.txt is obeyed on this queue whatever the run says. A run's `MODE_IGNORE` does not apply here |
 | `product_token` | none | The token matched against `User-agent` lines. Without it only the `*` groups apply. The workers are told the token and send it (see "What the worker is told") |
 | `lifetime` | 24h | How long a result is fresh. RFC 9309 says a cached file should not be used for longer than 24 hours |
 | `forbidden` | `ALLOW` | What a 401 or 403 on robots.txt means: `ALLOW` (RFC 9309) or `DISALLOW` |
-| `max_crawl_delay` | 1m | The ceiling for `Crawl-delay` on a queue whose key is the origin's host |
-| `max_shared_crawl_delay` | 0 | The ceiling on any other queue. Zero: a delay above the queue's own interval is not applied, and the origin is disallowed |
+| `max_crawl_delay` | 1m | The ceiling for the `Crawl-delay` floor on a queue whose key is the origin's host |
 | `retry` | 5m | The interval between robots tasks for an origin whose fetch failed |
-| `arm_wait` | 1m | How long a robots task may wait to be dispatched before it is armed with another holder |
+| `arm_wait` | 1m | How long a robots task waits while its queue dispatches other runs' tasks before it moves to one of those runs |
 | `hold_grace` | 1h | How long a task is held while every fetch fails, or while no worker has the handler |
 
 - The product token is one per queue. Two crawlers with different identities that share
@@ -473,18 +485,28 @@ field with the queue's product token and the fact that the task was judged.
 
 - **The token.** The SDK's HTTP adapter sends the token as the `User-Agent` when the
   handler set none. When the handler set one that does not name the token, the adapter
-  makes no request and the attempt fails for good with `robots_token_mismatch`: a
-  request under another identity would obey the wrong group without anyone noticing.
-  The `crawly.robots` handler follows the same rule, so the file is fetched under the
-  identity it is matched with. The failure is counted like any failed attempt, and a
-  run can list the code in `abort_on_codes`. A queue without a `product_token` puts no
-  demand on the `User-Agent`.
+  makes no request: a request under another identity would obey the wrong group
+  without anyone noticing. The task is handed back without an attempt, as a task is
+  whose handler the worker lacks (ADR 0003), and another worker gets it. It fails with
+  `robots_token_mismatch` only when every hand-over in the grace period (the one of
+  `no_handler`) ended that way; the task keeps the time of the first such hand-back,
+  and an attempt clears it. A wrong token is an error of configuration and not of the
+  page: workers of an older configuration during a rolling change of the token cost
+  nothing, and a typo in a policy leaves the grace period to correct it before a task
+  fails. In that time the queue spins, so the hand-backs are a metric of their own
+  and `ListSessions` shows the sessions that handed back and the `User-Agent` they
+  would have sent. The `crawly.robots` handler follows the same rule, so the file is
+  fetched under the identity it is matched with. A queue without a `product_token`
+  puts no demand on the `User-Agent`.
 - **Redirects inside a task.** On a judged task the adapter follows no redirect inside
-  the task, whatever `WithSameHostRedirects` and `WithCrossHostRedirects` say: the
-  target becomes a discovered task, as it does by default, and is judged when it is
-  added. A site that needs a redirect followed in place, such as one that sets a cookie
-  and returns to the same URL, is crawled by a run that brings the rules or opts out,
-  or on a queue that does not obey.
+  the task, whatever `WithSameHostRedirects` and `WithCrossHostRedirects` say, with one
+  exception: a hop whose target is the task's own URL. That path and query were judged
+  when the task was dispatched, so the worker needs no rules for it, and it is the
+  case the options exist for, a redirect that sets a cookie and returns. Such hops
+  count against the adapter's limit of hops, and each is a request outside the queue's
+  pace, as it is today for a handler that sets the option. Every other target becomes
+  a discovered task and is judged when it is added. The adapter logs once per handler
+  when it overrides an option this way.
 - **A handler's own requests.** A handler that makes requests of its own, beyond the
   URL of its task, makes them unjudged. The Frontier cannot see them. The contract of
   a handler on an obeying queue is to add such URLs as tasks; the token is available
@@ -493,7 +515,7 @@ field with the queue's product token and the fact that the task was judged.
   task, and what they report becomes the rules of that origin for every run, the runs
   of other pools included. A worker is trusted today with the outcomes of its own
   tasks only, so this is a new crossing, while the Frontier has no roles yet. What
-  does not depend on a worker's report is a pin and a run's own files. An operator who
+  does not depend on a worker's report is a pin. An operator who
   does not trust every pool with this pins the origins that matter or turns `obey` off
   on the queues the pool serves.
 
@@ -555,12 +577,20 @@ and run against every store:
   the judgement and the add.
 - A crash between recording a result and judging the held tasks loses nothing: the next
   background round releases them.
-- A robots task that is not dispatched within `arm_wait` moves to the next holder: from
-  a pool without the handler to one with it, from a blocked queue to a free one, from
-  a paused run, and from a run whose turn does not come.
+- A robots task moves to a holder that is free of its obstacle: from a pool without
+  the handler to one with it, from a blocked queue to a free one, from a paused run,
+  and from a run whose turn does not come. It does not move when every holder shares
+  the obstacle, and not while its queue dispatches nothing.
 - Held tasks end with `robots_unreachable` and `robots_no_handler` after `hold_grace`,
   per pool, and the transaction that ends the last one completes a sealed run.
-- A skipped task gives its dedup record back, and the URL can be added again.
+- An add that hits a skipped task revives it: to held, to its backlog, or not at all,
+  and it is counted once for the budget.
+- The slot of a task that is skipped or held at dispatch goes to the queue's next task,
+  up to the bound, and the interval of the queue is kept under concurrent claims.
+- A task whose worker would send another `User-Agent` is handed back without an
+  attempt and fails after the grace period.
+- A `Crawl-delay` floor on a queue of one host, with adaptive pacing above and below
+  it, and an origin that is disallowed for a delay on a shared queue.
 - At most one robots task per origin exists, under concurrent adds and concurrent
   background rounds.
 - Results are ordered by dispatch time: a late result of an older task does not
@@ -579,7 +609,8 @@ fixture site, and one end-to-end test runs a crawl through the gate.
 
 - Metrics, labelled as the other Frontier metrics are (by policy, never by queue key or
   origin): robots fetches by result; held tasks and the age of the oldest; the time
-  tasks spent held; refusals and skips by code; records by result; compiled files in
+  tasks spent held; refusals and skips by code; hand-backs for a wrong
+  `User-Agent`; records by result; compiled files in
   memory, hits and misses; matcher time.
 - Log lines: the first hold of a run on an origin; a result recorded, with status and
   hops; a robots task that ended without a result; held tasks ended after `hold_grace`,
@@ -589,7 +620,7 @@ fixture site, and one end-to-end test runs a crawl through the gate.
 - `QueueService.ListRobots`: the records, filtered by result, by queue and by "has held
   tasks", with the held count and the runs holding.
 - `QueueService.GetRobots(origin, queue_key)`: the record, how the queue's policy reads
-  it (fresh, stale, kept, unknown), the group that matches the queue's product token,
+  it (pinned, fresh, stale, unknown), the group that matches the queue's product token,
   the delay, the sitemaps.
 - `QueueService.CheckRobots(url, queue_key)`: what the matcher answers and which rule
   decided, for an operator who wants to know why a page is not crawled.
@@ -597,14 +628,12 @@ fixture site, and one end-to-end test runs a crawl through the gate.
 **What the operator can do.**
 
 - `RefreshRobots(origin)`: the rules become stale now, so a robots task is armed and the
-  old rules hold until its result is there. With `hold: true` they become unknown now:
-  the pending tasks of the origin are moved to held in the background, and tasks are
-  held until the new result is there (second step of the delivery).
+  old rules hold until its result is there.
 - `PinRobots(origin, content, expire_time)`: the operator sets the rules of an origin
   for every run, whatever the run's setting. Nothing is fetched while the pin lasts. Pinning
-  `Disallow: /` stops the crawl of an origin at once, and the background step ends its
-  pending tasks. `UnpinRobots` removes the pin. Both are in the second step of the
-  delivery.
+  `Disallow: /` stops the crawl of an origin on the queues that obey: its pending tasks
+  end as they come up for dispatch, and their slots go to the queue's other tasks.
+  `UnpinRobots` removes the pin. Both are in the second step of the delivery.
 - `BlockQueue` stays what it is: a stop for a queue and a time. A pin is for an origin
   and is about what may be fetched.
 
@@ -612,14 +641,15 @@ fixture site, and one end-to-end test runs a crawl through the gate.
 
 - `AddResult.STATUS_ROBOTS_DISALLOWED` and `AddResult.code`.
 - `TaskStatus.STATE_HELD` and `STATE_SKIPPED`.
-- `RunStats.held`, `RunStats.skipped` (all skipped tasks) and `RunStats.robots`: files
-  fetched, and refusals and skips by code. `skipped` is the total; `robots.by_code`
-  breaks it down and adds the refusals, which never were tasks.
+- `RunStats.held`, `RunStats.skipped`, `RunStats.refused` (per code) and
+  `RunStats.robots_fetches`. Skips are in `RunStats.by_code` with the other outcomes.
 - `Run.robots` (`Robots`), set at `CreateRun`.
 - `Policy.robots`, the block above.
 - `Complete.robots` (`RobotsResult`), sent by the `crawly.robots` handler only. It is
   not kept with the attempt; the record keeps the body.
 - `Assignment.robots`: the queue's product token, and that the task was judged.
+- `Session` in `ListSessions`: hand-backs for a wrong `User-Agent`, and the last one
+  it would have sent.
 - `QueueService`: `GetRobots`, `ListRobots`, `CheckRobots`, `RefreshRobots`,
   `PinRobots`, `UnpinRobots`.
 
@@ -665,25 +695,21 @@ runs again.
 
 ### Delivery
 
-The design above is one design. It is built in two steps, because it adds two task
-states, a table, a column on tasks and a background step to a store whose claim path
-has no benchmark yet.
+The design is built in two steps, because it adds two task states, a table, a column
+on tasks and a background step to a store whose claim path has no benchmark yet.
 
-1. **First step.** The parser and matcher; the record; the hold, the robots task and
-   its handler; the liveness step with its conformance tests; judging at add, on
-   release and at dispatch; the codes, the dedup and budget rules; what the worker is
-   told; `GetRobots`, `ListRobots`, `CheckRobots` and `RefreshRobots` without `hold`.
-   In this step no `Crawl-delay` floor exists: an origin whose delay is longer than
-   its queue's interval is disallowed with `robots_crawl_delay`, which is the rule for
-   a delay that cannot be applied. A change of rules reaches pending tasks at dispatch.
-2. **Second step**, after a benchmark of the claim path on the PostgreSQL store, with
-   and without the first step and its origin column. The `Crawl-delay` floor in the
-   limiter row; judging pending tasks in the background when the rules change;
-   `RefreshRobots` with `hold`; `PinRobots` and `UnpinRobots`.
+1. **First step.** Everything above except the pin: the parser and matcher; the
+   record; the hold, the robots task and its handler; the liveness step with its
+   conformance tests; judging at add, on release and at dispatch, with the slot passed
+   on; the codes, the dedup and budget rules; the `Crawl-delay` floor on a queue of one
+   host; what the worker is told; `GetRobots`, `ListRobots`, `CheckRobots` and
+   `RefreshRobots`. Three settings decide in this step: `obey`, `enforce` and the
+   run's mode. The step ends with a benchmark of the claim path on the PostgreSQL
+   store, with and without the origin column and the version the claim returns.
+2. **Second step.** `PinRobots` and `UnpinRobots`.
 
-Nothing in the first step is changed by the second: the second adds to the record, the
-limiter row and the background step. `max_crawl_delay` is accepted in the policy from
-the first step and applies from the second.
+Nothing in the first step is changed by the second: a pin adds two fields to the record
+and one more source of rules for the matcher.
 
 ## Scaling and limits
 
@@ -697,25 +723,30 @@ the first step and applies from the second.
 - **Judging.** One match against the compiled rules of one origin. No store access when
   the replica's copy has the `rules_version` the claim returned.
 - **Fetches.** One robots task per origin at a time, whatever the number of runs, and
-  one per lifetime while the origin is crawled. A task that waits is moved once per
-  `arm_wait`, which costs two row writes per origin and move.
-- **Judging pending tasks** happens when the rules change, not with every fetch. It
-  walks the backlogs of the queues the record names, without an index of its own.
+  one per lifetime while the origin is crawled. A task moves at most once per holder
+  and obstacle, two row writes each.
+- **A change of rules** reaches pending tasks as they are dispatched. No index and no
+  scan serves it, and the slot of a skipped task is used by the next.
 - **The background step** is bounded per round, like the other steps of `Maintain`, and
   several replicas can run it at once.
 - Limitation: one record per origin. A site that answers robots.txt differently by
   client or by address is judged by the answer one run's workers got, for every run.
 - Limitation: one product token per queue.
 - Limitation: on a queue of several origins, an origin with a delay longer than the
-  queue's interval is not crawled unless the operator raises `max_shared_crawl_delay`,
-  and then it slows every origin of the queue, up to that ceiling.
+  queue's interval is not crawled until the operator keys the queue by host or slows
+  the queue.
 - Limitation: the workers of one pool set the rules of an origin for every run.
 - Limitation: requests a handler makes beyond its task's URL are not judged.
-- Limitation: a task skipped because robots.txt was unreachable is not added again by
-  the Frontier.
-- Limitation: on a judged task, redirects are not followed in place.
-- Limitation: a task claimed and then skipped or held again costs the queue one
-  interval.
+- Limitation: a task skipped because robots.txt was unreachable is revived by an add
+  and not by the Frontier.
+- Limitation: on a judged task, the only redirect followed in place is one back to the
+  task's own URL.
+- Limitation: a wrong product token in a policy makes the queue spin for the grace
+  period before its tasks fail.
+- Limitation: a slot is lost when more tasks in a row are skipped at dispatch than
+  one slot is passed on to.
+- Limitation: a backlog that became disallowed ends as it is dispatched, so only while
+  a session takes tasks from the queue.
 - Limitation: stale rules stay in force until the refresh has run, however long the
   refresh waits behind a block, a pause or other runs.
 - Limitation: a held task waits as long as its run is paused or its queue is blocked.
@@ -748,12 +779,37 @@ the first step and applies from the second.
 7. **Interpreting the result when it is recorded** (storing "disallow all" for a 403).
    Rejected: `forbidden`, `lifetime` and the product token belong to a queue, and an
    origin can be reached through several queues.
-8. **Structured rules in the run** instead of robots.txt text. Rejected: a second format
-   with the same meaning, and a translation step for every scheduler that already has
-   the file.
+8. **Rules brought by the run**, as robots.txt text or as structured rules per origin.
+   Left out: it overlaps with the pin (rules that are supplied and not fetched) and
+   with `MODE_IGNORE` (the scheduler knows better), and it adds a size limit, the
+   validation of origin keys and one more layer to "who decides".
 9. **A third-party parser.** Rejected: the matcher's answer, `Crawl-delay` and the
    limits above are part of the Frontier's contract with its operators, and the format
    is small enough to own.
+
+10. **Judging pending tasks in the background when the rules change.** It ends a
+    disallowed backlog without a session. Rejected: it needs the tasks of an origin
+    indexed, which ADR 0002 names as the first bottleneck, or a walk of the origin's
+    queues that reads other origins' tasks, and passing the slot on removes the cost
+    it was there to save.
+11. **Releasing the dedup record of a skipped task.** A URL added again would be a new
+    task: without its parent and depth, counted twice for the budget, a second row
+    for a lookup by URL, and in PostgreSQL a rewrite of an indexed column per skip.
+    Rejected for reviving the task.
+12. **A floor on a queue of several origins**, by default or behind a ceiling of its
+    own. Rejected: one subdomain slows its siblings, and a higher ceiling is what
+    slowing the queue in the policy is already. **Pacing each origin inside a queue**
+    is the right behaviour and was rejected for now: the claim would order by origin,
+    which needs the index on tasks that ADR 0002 warns against.
+13. **Failing an attempt that would be sent under another identity**, or sending it
+    and reporting the difference. Rejected: the first charges an error of
+    configuration to every task of the queue for good, the second obeys the wrong
+    group without notice. **Sessions that declare their token, with dispatch
+    filtering on it**, would be the cleanest and was rejected for now: it is a second
+    filter in the claim.
+14. **Giving the worker the rules, to judge redirects itself.** Rejected: it exports
+    the matcher, adds a cache and a call on the worker's side, and makes two judges
+    that have to agree across versions.
 
 ## Consequences
 
@@ -780,31 +836,28 @@ the first step and applies from the second.
 3. **401 and 403.** The default follows RFC 9309 (allow). `forbidden: DISALLOW` is the
    stricter choice.
 4. **429.** Read as a failed fetch and not as "no file", which is stricter than the RFC.
-5. **`Crawl-delay` that cannot be applied.** The origin is treated as disallowed, and
-   the run ends only if it lists `robots_crawl_delay`. The ceiling is one minute on a
-   queue of one host and zero on a queue of several origins, so a subdomain cannot
-   slow its siblings unless the operator allows it.
-6. **`enforce`.** A queue's policy overrides a run's opt-out without rejecting the run.
-7. **Product token.** One per queue, from the policy. A run cannot set its own.
-8. **Counters.** The robots task is outside the run's task counters, budget and failure
-   rules, in `RunStats.robots`.
-9. **A run's own files.** robots.txt text keyed by origin, for that run only, with
-   `Crawl-delay` ignored.
-10. **The pin.** An operator can set the rules of an origin for every run, a run that
-    opted out included.
-11. **Late refresh.** Rules that were known stay in force until the refresh has run.
-    The stricter choice, holding the backlog once the rules are a given time past their
-    lifetime, takes back work that was admitted and was left out.
-12. **`hold_grace`.** It ends held tasks only when every fetch fails or no worker has
-    the handler. A paused run or a blocked queue makes them wait.
-13. **A skip gives the dedup record back.** The other choice, a later add that revives
-    the skipped task, keeps one task per URL and was left out because a refusal at add
-    leaves nothing to revive.
-14. **Token mismatch fails the attempt.** The softer choice is to send the request and
-    report the difference in a metric and in `ListSessions`.
-15. **No redirects in place on a judged task.** The other choice is to state the gap
-    and leave `WithSameHostRedirects` as it is.
-16. **Trust.** Any pool that crawls an origin can set its rules for every run, until
+5. **`enforce`.** A queue's policy overrides a run's opt-out without rejecting the run.
+6. **Product token.** One per queue, from the policy. A run cannot set its own.
+7. **Counters.** The robots task is outside the run's task counters, budget and failure
+   rules.
+8. **The pin and `obey: false`.** A pin applies to every run on the queues that obey
+   and does nothing on a queue that does not.
+9. **Late refresh.** Rules that were known stay in force until the refresh has run.
+   The stricter choice, holding the backlog once the rules are a given time past their
+   lifetime, takes back work that was admitted and was left out.
+10. **`hold_grace`.** It ends held tasks only when every fetch fails or no worker can
+    fetch. A paused run or a blocked queue makes them wait.
+11. **Trust.** Any pool that crawls an origin can set its rules for every run, until
     roles exist.
-17. **Budget.** Held and skipped tasks count for `max_tasks`.
-18. **Delivery in two steps**, with the benchmark between them.
+12. **Passing the slot on** replaces the judging of pending tasks in the background.
+    It is the one new mechanism on the dispatch path, and the first step's benchmark
+    and the conformance test of the interval decide whether it stands.
+13. **Reviving any robots skip.** An add revives a task skipped with any of the codes,
+    a disallowed one included when the rules changed since, and not only one skipped
+    as unreachable or without a handler.
+
+Decided in review and written in above: a skipped task is revived by an add; a wrong
+`User-Agent` hands the task back and fails it after a grace; a redirect back to the
+task's own URL is followed in place and no other; there is no `Crawl-delay` floor on a
+queue of several origins, and the floor on a queue of one host is in the first step;
+held and skipped tasks count for `max_tasks`; a run brings no rules of its own.
