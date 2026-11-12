@@ -1,7 +1,7 @@
 # ADR 0004: robots.txt: gate, parser and policy
 
-- **Status:** Draft, for review. Revision 5, after two rounds of reliability review and
-  two of design review. The section "Points to confirm" lists the choices that are still
+- **Status:** Draft, for review. Revision 6, after two rounds of reliability review and
+  three of design review. The section "Points to confirm" lists the choices that are still
   open; each is written into the text below as proposed.
 - **Date:** 2026-11-11
 - **Related:** [ADR 0001: Frontier storage architecture](0001-frontier-storage-architecture.md),
@@ -51,7 +51,8 @@ Four constraints shape the design:
   that every SDK worker has built in. Its result is recorded on the origin.
 - Held tasks are judged in batches when the rules arrive. Allowed tasks join their
   backlog and disallowed ones end `SKIPPED`.
-- The design is built in two steps (see "Delivery").
+- A spike of the claim path comes first, with a threshold, and the design is then built
+  in two steps (see "Delivery").
 - A background step, not the arrival of new tasks, keeps the gate moving. A held task
   waits for what makes any task wait (a paused run, a blocked queue), and ends after the
   policy's `hold_grace` when robots.txt cannot be fetched.
@@ -162,11 +163,17 @@ matcher.
    instead. The call that skips or holds the task asks the store, in the same
    transaction, for the next task the session may take from that queue, without taking
    a slot or a place in the queue's concurrency: the task that was not assigned never
-   left, so one request leaves for one slot. This repeats for a bounded number of
-   tasks per slot, and the slot is lost when the bound is reached or the queue has no
-   other task for the session. A backlog that became disallowed, after a pin or a new
-   file, therefore ends at the speed of the dispatch loop and not at the queue's pace,
-   and the tasks of other origins and runs on the queue keep their turns. Pending
+   left, so one request leaves for one slot. Passing a slot on costs the site no
+   request, so the bound on it protects the dispatch loop only: one slot is passed on
+   for up to 500 tasks or 250 ms, whichever comes first (`-robots-pass-limit`,
+   `-robots-pass-time`), one short transaction per task. The slot is lost when the
+   bound is reached or the queue has no other task for the session. A backlog that
+   became disallowed, after a pin or a new file, therefore drains at up to 500 tasks
+   per interval of the queue, and its run can complete when it has drained: 100,000
+   tasks on a queue with an interval of 3 s take about ten minutes, where one task per
+   slot would take three and a half days. The time bound caps the rate where the store
+   is slow, at whatever the store does in 250 ms per interval. The tasks of other
+   origins and runs on the queue keep their turns. Pending
    tasks are not judged in the background: that would need the tasks of an origin
    indexed or its queues walked, to save what passing the slot on saves already.
 
@@ -244,7 +251,13 @@ delayed, held or in-flight page tasks.
 
 - A task of one run, on the queue and in the pool of the page task that needed the
   rules. It is fetched through the same workers and the same egress as that run's pages,
-  and it waits for the queue's pace and for a queue block like any other request.
+  and it waits for a queue block like any other request.
+- It is paced by the queue's limits only, never by limits the run set for itself. A
+  run with slow limits of its own would otherwise set the pace of the fetch for every
+  run that waits for it: on a queue of one host the other runs' tasks are held, so
+  nothing else is dispatched there and no other run's turn shows that the task is
+  late. The fetch is the origin's business and not the run's. The run's own limits
+  apply again to its page tasks once they are released.
 - It is at the head of its run's backlog on the queue: it is dispatched before any page
   task of the run there.
 - It has a fingerprint of its own, outside the run's dedup: it leaves no dedup record
@@ -350,10 +363,16 @@ when one of the codes above occurs lists the code in `RunLimits.abort_on_codes`.
   robots.txt is unreachable for a little longer than `hold_grace` would lose every
   page found in that time for the rest of the run, although the site recovered.
 - The Frontier does not revive a task by itself when the rules arrive: that would need
-  the skipped tasks indexed by origin. Somebody adds the URL again, and since the pages
-  that linked to it are done, that is the scheduler: `ListTasks` filters by state and
-  code. A scheduler that ends the run on `robots_unreachable` instead lists the code in
-  `abort_on_codes`, and the next run picks the pages up.
+  the skipped tasks indexed by origin. Somebody has to add the URL again, and who can
+  depends on the run:
+  - A worker that finds the same URL on another page revives it, in any run. That is
+    the path that works without anyone's help, and it depends on the site linking to
+    the page again.
+  - The scheduler can add it only while the run is not sealed: a sealed run answers
+    `RUN_CLOSED` to new seeds, and schedulers usually seal right after seeding.
+    `ListTasks` filters by state and code for a scheduler that keeps its run open.
+  - For a sealed run the path is the next run. A scheduler that would rather end the
+    run than lose part of it lists `robots_unreachable` in `abort_on_codes`.
 - **Budget.** A held task is a task and counts for `max_tasks` from the moment it is
   added. A skipped task keeps counting, and a revived one is not counted again. A
   refusal at add creates no task and counts for nothing.
@@ -487,7 +506,11 @@ field with the queue's product token and the fact that the task was judged.
   handler set none. When the handler set one that does not name the token, the adapter
   makes no request: a request under another identity would obey the wrong group
   without anyone noticing. The task is handed back without an attempt, as a task is
-  whose handler the worker lacks (ADR 0003), and another worker gets it. It fails with
+  whose handler the worker lacks (ADR 0003). It waits the delay of such a hand-back
+  (five seconds by default) before it is dispatched again, and it can come back to
+  the session that handed it back: dispatch does not filter on the token (alternative
+  13). Each return costs one hand-over and no request, and the delay bounds it to one
+  per task and delay. It fails with
   `robots_token_mismatch` only when every hand-over in the grace period (the one of
   `no_handler`) ended that way; the task keeps the time of the first such hand-back,
   and an attempt clears it. A wrong token is an error of configuration and not of the
@@ -577,6 +600,8 @@ and run against every store:
   the judgement and the add.
 - A crash between recording a result and judging the held tasks loses nothing: the next
   background round releases them.
+- A robots task is dispatched at the queue's pace when its run has slower limits of
+  its own.
 - A robots task moves to a holder that is free of its obstacle: from a pool without
   the handler to one with it, from a blocked queue to a free one, from a paused run,
   and from a run whose turn does not come. It does not move when every holder shares
@@ -695,18 +720,31 @@ runs again.
 
 ### Delivery
 
-The design is built in two steps, because it adds two task states, a table, a column
-on tasks and a background step to a store whose claim path has no benchmark yet.
+The design adds two task states, a table, a column on tasks and a background step to a
+store whose claim path has no benchmark yet. It is built in this order:
 
-1. **First step.** Everything above except the pin: the parser and matcher; the
+1. **A spike of the claim path, before anything else.** The three changes the dispatch
+   path gets, and nothing more: the origin column on tasks with its index over held
+   tasks, the `rules_version` the claim returns, and the call that passes a slot on.
+   It is measured with the benchmark of ADR 0002 ("Capacity"), on its reference
+   instance, against the same build without the changes. It passes when:
+   - dispatch costs at most 10% more backend CPU, and the ceiling per vCPU is at most
+     10% lower;
+   - dispatch p99 stays under the 50 ms that ADR 0002 names as its signal;
+   - a queue whose whole backlog is disallowed drains at the bound, 500 tasks per
+     interval, without the dispatch rate of the other queues dropping by more than
+     the same 10%.
+
+   If it does not pass, the design comes back here before the first step is built.
+   The origin column and the version in the claim are the parts to change.
+2. **First step.** Everything above except the pin: the parser and matcher; the
    record; the hold, the robots task and its handler; the liveness step with its
    conformance tests; judging at add, on release and at dispatch, with the slot passed
    on; the codes, the dedup and budget rules; the `Crawl-delay` floor on a queue of one
    host; what the worker is told; `GetRobots`, `ListRobots`, `CheckRobots` and
    `RefreshRobots`. Three settings decide in this step: `obey`, `enforce` and the
-   run's mode. The step ends with a benchmark of the claim path on the PostgreSQL
-   store, with and without the origin column and the version the claim returns.
-2. **Second step.** `PinRobots` and `UnpinRobots`.
+   run's mode.
+3. **Second step.** `PinRobots` and `UnpinRobots`.
 
 Nothing in the first step is changed by the second: a pin adds two fields to the record
 and one more source of rules for the matcher.
@@ -744,7 +782,7 @@ and one more source of rules for the matcher.
 - Limitation: a wrong product token in a policy makes the queue spin for the grace
   period before its tasks fail.
 - Limitation: a slot is lost when more tasks in a row are skipped at dispatch than
-  one slot is passed on to.
+  one slot is passed on to, 500 or what fits in 250 ms.
 - Limitation: a backlog that became disallowed ends as it is dispatched, so only while
   a session takes tasks from the queue.
 - Limitation: stale rules stay in force until the refresh has run, however long the
@@ -850,8 +888,8 @@ and one more source of rules for the matcher.
 11. **Trust.** Any pool that crawls an origin can set its rules for every run, until
     roles exist.
 12. **Passing the slot on** replaces the judging of pending tasks in the background.
-    It is the one new mechanism on the dispatch path, and the first step's benchmark
-    and the conformance test of the interval decide whether it stands.
+    It is the one new mechanism on the dispatch path, and the spike and the
+    conformance test of the interval decide whether it stands.
 13. **Reviving any robots skip.** An add revives a task skipped with any of the codes,
     a disallowed one included when the rules changed since, and not only one skipped
     as unreachable or without a handler.
